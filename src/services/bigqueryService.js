@@ -1,4 +1,4 @@
-import bigquery from "../db/bigqueryClient.js";
+import bigquery from "../bigquery/bigquery.js";
 
 // ✅ Allowed tables
 const allowedTables = ["item_master", "location_master"];
