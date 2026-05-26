@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import express from "express";
+import cors from "cors";
 import fs from "fs";
 import path from "path";
 
@@ -11,6 +12,9 @@ import bomDownloadRoutes from "./src/routes/bomDownload.routes.js";
 import bigqueryRoutes from "./src/routes/bigqueryRoutes.js";
 import engineeringChanges from "./src/DummyResponse/engineeringchanges.js";
 import engineeringChangeDetailById from "./src/DummyResponse/engineeringChangeDetailDummy.js"
+
+import tableRoutes from "./src/routes/tableRoutes.js";
+
 
 const app = express();
 
@@ -28,6 +32,20 @@ if (!fs.existsSync(REPORT_DIR)) fs.mkdirSync(REPORT_DIR, { recursive: true });
 
 // Existing routes
 
+
+// using cors to overcome browser restrictions
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true,
+  })
+);
+
+
+/* =============================
+   ✅ BigQuery APIs - GCP to UI
+============================= */
 console.log("✅ BigQuery routes loaded");
 
 
@@ -99,6 +117,26 @@ app.get("/api/engineering-changes/detail", (req, res) => {
   });
 });
 
+// BOM editing from exsisting records - PostgraSQL to UI 
+app.use("/api/tables", tableRoutes);
+
+/* =============================
+   ✅ Health Check
+============================= */
+app.get("/health", (req, res) => {
+  res.json({ status: "UP" });
+});
+
+/* =============================
+   ✅ Root
+============================= */
+app.get("/", (req, res) => {
+  res.send("✅ BOM API Server Running");
+});
+
+/* =============================
+   ✅ Start Server
+============================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
