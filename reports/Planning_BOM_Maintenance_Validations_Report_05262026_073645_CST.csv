@@ -1,0 +1,151 @@
+Report Name,Validation Report for Planning BOM Maintenance Application UI
+Report Time,5/26/2026, 07:36:45 CST
+Trnx Type,ONETIME,Run By,APPL_TEAM
+
+Summary,BOM_PARAMETERS,BOM_PRODUCED,BOM_CONSUMED,ITEM_BOM_ROUTING
+Validated Count,998,997,1000,998
+Success Count,994,991,994,927
+Error Count,4,6,6,71
+One Time Load,No
+
+Error Details are below:
+ERR_LOG_ID,ENG_CHANGE_ID,File name,ROW NUMBER,BOM_ID,Validation_sequence,Validation_description,Validation_ERROR_DETAILS,Remediation message
+1,EC6441590,BOM_PARAMETERS,361,BOM2_Item359_Location 23,1001,Check if BOMID exists in both BOM Produced and Item BOM Routing,"This BOMID = BOM2_Item359_Location 23 does not exist in ( bom_produced.bom_id 
+and/or item_bom_routing.bom_id )","RM: . Please ADD the missing bom_id records to bom_produced.bom_id  and/or item_bom_routing.bom_id
+RS:  Allow users to add the missing bom_id records to bom_produced.bom_id  and/or item_bom_routing.bom_id using ADD buttons"
+2,EC6441590,BOM_PARAMETERS,555,BOM1_Item554_Location 18,1001,Check if BOMID exists in both BOM Produced and Item BOM Routing,"This BOMID = BOM1_Item554_Location 18 does not exist in ( bom_produced.bom_id 
+and/or item_bom_routing.bom_id )","RM: . Please ADD the missing bom_id records to bom_produced.bom_id  and/or item_bom_routing.bom_id
+RS:  Allow users to add the missing bom_id records to bom_produced.bom_id  and/or item_bom_routing.bom_id using ADD buttons"
+3,EC6441590,BOM_PARAMETERS,141,BOM6_Item139_Location 2,1002,Check for any duplicate BOMIDs,There are duplicate values for this BOMID = BOM6_Item139_Location 2,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+4,EC6441590,BOM_PARAMETERS,697,BOM3_Item696_Location 16,1002,Check for any duplicate BOMIDs,There are duplicate values for this BOMID = BOM3_Item696_Location 16,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+5,EC6441590,BOM_PRODUCED,493,BOM5_Item390_Location 16,1005,Check if BOMID exists in both BOM Parameters and Item BOM Routing,This BOMID = BOM5_Item390_Location 16 does not exist in ( bom_parameters.bom_id and/or item_bom_routing.bom_id ),"RM: . Please ADD the missing bom_id records to bom_parameters.bom_id  and/or item_bom_routing.bom_id
+RS:  Allow users to add the missing bom_id records to bom_parameters.bom_id  and/or item_bom_routing.bom_id using ADD buttons"
+6,EC6441590,BOM_PRODUCED,424,BOM6_Item335_Location 5,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM6_Item335_Location 5,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+7,EC6441590,BOM_PRODUCED,455,BOM6_Item363_Location 1,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM6_Item363_Location 1,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+8,EC6441590,BOM_PRODUCED,456,BOM6_Item363_Location 1,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM6_Item363_Location 1,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+9,EC6441590,BOM_PRODUCED,493,BOM5_Item390_Location 16,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM5_Item390_Location 16,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+10,EC6441590,BOM_PRODUCED,494,BOM5_Item390_Location 16,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM5_Item390_Location 16,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+11,EC6441590,BOM_PRODUCED,495,BOM5_Item390_Location 16,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM5_Item390_Location 16,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+12,EC6441590,BOM_PRODUCED,727,BOM6_Item580_Location 1,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM6_Item580_Location 1,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+13,EC6441590,BOM_PRODUCED,728,BOM6_Item580_Location 1,1006,Check for any duplicate BOMIDs (accounting for if there are Co-Products attached),There are duplicate values for this BOMID = BOM6_Item580_Location 1,"RM: Please DELETE this extra bom_id record
+RS:  Allow users to DELETE the extra bom_id records using DELETE buttons"
+14,EC6441590,BOM_PRODUCED,1027,BOM1_Item127_Location 18,1008,Check that every Quantity Produced Per value is equal to 1 (or greater than zero in the case of Co-Products),"This item= BOM1_Item127_Location 18, location= BOM1_Item127_Location 18 combination with erp_bom_qty_produced_per = BOM1_Item127_Location 18  is less than zero or greater than 1","RM: Please MODIFY the erp_bom_qty_produced_per to  (> 0 or <= 1 ) for this item, location combination
+RS:  Show the Relevant CoProduct Records in a Popup or new window  & Allow users to update this erp_bom_qty_produced_per values using MODIFY/UPDATE button"
+15,EC6441590,BOM_PRODUCED,87,BOM2_Item065_Location 7,1009,Check if Item is marked as ACTIVE within Item Master (for bom_produced),"This item = BOM2_Item065_Location 7 or bom item =  is not with  item_master.ITEM_STATUS = ACTIVE.
+ = Text after the first _ (underscore) and second _(underscore) in bom_produced.bom_id","RS:  Show all the record details from bom_parameters, bom_produced, bom_consumed and item_bom_routing for this INACTIVE (item or bom item) in a popup window or new window/form"
+16,EC6441590,BOM_PRODUCED,86,BOM2_Item065_Location 7,1008,Check that every Quantity Produced Per value is equal to 1 (or greater than zero in the case of Co-Products),"This item= 2, location= 2 combination with erp_bom_qty_produced_per = 2  is less than zero or greater than 1","RM: Please MODIFY the erp_bom_qty_produced_per to  (> 0 or <= 1 ) for this item, location combination
+RS:  Show the Relevant CoProduct Records in a Popup or new window  & Allow users to update this erp_bom_qty_produced_per values using MODIFY/UPDATE button"
+17,EC6441590,BOM_PRODUCED,88,BOM2_Item065_Location 7,1008,Check that every Quantity Produced Per value is equal to 1 (or greater than zero in the case of Co-Products),"This item= 0, location= 0 combination with erp_bom_qty_produced_per = 0  is less than zero or greater than 1","RM: Please MODIFY the erp_bom_qty_produced_per to  (> 0 or <= 1 ) for this item, location combination
+RS:  Show the Relevant CoProduct Records in a Popup or new window  & Allow users to update this erp_bom_qty_produced_per values using MODIFY/UPDATE button"
+18,EC6441590,BOM_CONSUMED,480,BOM3_Item206_Location 23,1010,Check that every Quantity Consumed Per is greater than 0,"This item, location combination with erp_bom_quantity_consumed_per = 0  is less than zero","RM: Please MODIFY the erp_bom_quantity_consumed_per to  (> 0 ) for this item, location combination
+RS:  Show the Relevant Records in a Popup or new window  & Allow users to update this erp_bom_quantity_consumed_per value using MODIFY/UPDATE button"
+19,EC6441590,BOM_CONSUMED,481,BOM3_Item206_Location 23,1010,Check that every Quantity Consumed Per is greater than 0,"This item, location combination with erp_bom_quantity_consumed_per = 0  is less than zero","RM: Please MODIFY the erp_bom_quantity_consumed_per to  (> 0 ) for this item, location combination
+RS:  Show the Relevant Records in a Popup or new window  & Allow users to update this erp_bom_quantity_consumed_per value using MODIFY/UPDATE button"
+20,EC6441590,BOM_CONSUMED,482,BOM3_Item206_Location 23,1010,Check that every Quantity Consumed Per is greater than 0,"This item, location combination with erp_bom_quantity_consumed_per = 0  is less than zero","RM: Please MODIFY the erp_bom_quantity_consumed_per to  (> 0 ) for this item, location combination
+RS:  Show the Relevant Records in a Popup or new window  & Allow users to update this erp_bom_quantity_consumed_per value using MODIFY/UPDATE button"
+21,EC6441590,BOM_CONSUMED,840,BOM2_Item359_Location 23,1011,Check that every BOMID exists in BOM Produced,This BOMID = BOM2_Item359_Location 23 does not exist in ( bom_produced.bom_id),
+22,EC6441590,BOM_CONSUMED,1303,BOM1_Item554_Location 18,1011,Check that every BOMID exists in BOM Produced,This BOMID = BOM1_Item554_Location 18 does not exist in ( bom_produced.bom_id),
+23,EC6441590,BOM_CONSUMED,1733,BOM2_Item737_Location 4,1011,Check that every BOMID exists in BOM Produced,This BOMID = BOM2_Item737_Location 4 does not exist in ( bom_produced.bom_id),
+24,EC6441590,BOM_CONSUMED,1619,BOM5_Item684_Location 7,1012,Check for any duplicate combinations of BOMID and Consumed item,"There are duplicate values for this BOMID = BOM5_Item684_Location 7, item = <> and location = <>","RM: Please DELETE this extra bom_id records 
+RS:  Allow users to DELETE the extra (bom_id, item, location) records using DELETE buttons"
+25,EC6441590,BOM_CONSUMED,1874,BOM5_Item733_Location 1,1013,Check for any recursive records (item shown in the BOMID is the same as the item in the consumed item column),"This item=Item733, location=Item733, bomid = Item733 is a recursive consumption","RM: Please MODIFY/UPDATE the Consumed Item for this  bom_id, item, location combination  or Please DELETE this bom_id, item, location combination from bom_consumed to avoid recursive consumption
+RS:  Show the Relevant Records in a Popup or new window  & Allow users to update/delete records"
+26,EC6441590,ITEM_BOM_ROUTING,510,PRIMARY_Item175_Location 5,1017,Check Co-Product mapping,"This item= Item1052, location= Location 5 combination with erp_co_product_association= 1 does not exist in bom_produced with  erp_bom_qty_produced_per < 1","RM: Please ADD the missing CoProduct Record
+RS: Allow update/add"
+27,EC6441590,ITEM_BOM_ROUTING,1528,BOM1_Item554_Location 18,1018,Check if each BOMID exists in both BOM Parameters and BOM Produced,"This BOMID = BOM1_Item554_Location 18 does not exist in ( bom_produced.bom_id 
+and/or bom_parameters.bom_id )","RM: . Please ADD the missing bom_id records
+RS:  Allow users to add records"
+28,EC6441590,ITEM_BOM_ROUTING,2027,BOM2_Item737_Location 4,1018,Check if each BOMID exists in both BOM Parameters and BOM Produced,"This BOMID = BOM2_Item737_Location 4 does not exist in ( bom_produced.bom_id 
+and/or bom_parameters.bom_id )","RM: . Please ADD the missing bom_id records
+RS:  Allow users to add records"
+29,EC6441590,ITEM_BOM_ROUTING,334,BOM2_Item114_Location 2,1019,Check duplicate combinations,"There are duplicate values for this BOMID = BOM2_Item114_Location 2, item = <> and routing_id = <>","RM: Please DELETE duplicate records
+RS: Allow delete"
+30,EC6441590,ITEM_BOM_ROUTING,334,BOM2_Item114_Location 2,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item114_Location 2 and erp_item_bom_routing_priority = <>,
+31,EC6441590,ITEM_BOM_ROUTING,575,BOM6_Item202_Location 20,1019,Check duplicate combinations,"There are duplicate values for this BOMID = BOM6_Item202_Location 20, item = <> and routing_id = <>","RM: Please DELETE duplicate records
+RS: Allow delete"
+32,EC6441590,ITEM_BOM_ROUTING,575,BOM6_Item202_Location 20,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item202_Location 20 and erp_item_bom_routing_priority = <>,
+33,EC6441590,ITEM_BOM_ROUTING,99,BOM4_Item032_Location 25,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item032_Location 25 and erp_item_bom_routing_priority = <>,
+34,EC6441590,ITEM_BOM_ROUTING,100,BOM4_Item032_Location 25,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item032_Location 25 and erp_item_bom_routing_priority = <>,
+35,EC6441590,ITEM_BOM_ROUTING,172,BOM1_Item057_Location 1,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item057_Location 1 and erp_item_bom_routing_priority = <>,
+36,EC6441590,ITEM_BOM_ROUTING,372,BOM1_Item127_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item127_Location 18 and erp_item_bom_routing_priority = <>,
+37,EC6441590,ITEM_BOM_ROUTING,489,BOM5_Item166_Location 17,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item166_Location 17 and erp_item_bom_routing_priority = <>,
+38,EC6441590,ITEM_BOM_ROUTING,616,BOM6_Item216_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item216_Location 18 and erp_item_bom_routing_priority = <>,
+39,EC6441590,ITEM_BOM_ROUTING,618,PRIMARY_Item217_Location 25,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item217_Location 25 and erp_item_bom_routing_priority = <>,
+40,EC6441590,ITEM_BOM_ROUTING,635,BOM6_Item223_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item223_Location 18 and erp_item_bom_routing_priority = <>,
+41,EC6441590,ITEM_BOM_ROUTING,649,BOM4_Item228_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item228_Location 3 and erp_item_bom_routing_priority = <>,
+42,EC6441590,ITEM_BOM_ROUTING,662,BOM2_Item233_Location 13,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item233_Location 13 and erp_item_bom_routing_priority = <>,
+43,EC6441590,ITEM_BOM_ROUTING,663,BOM2_Item233_Location 13,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item233_Location 13 and erp_item_bom_routing_priority = <>,
+44,EC6441590,ITEM_BOM_ROUTING,666,BOM3_Item234_Location 20,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item234_Location 20 and erp_item_bom_routing_priority = <>,
+45,EC6441590,ITEM_BOM_ROUTING,721,BOM5_Item257_Location 6,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item257_Location 6 and erp_item_bom_routing_priority = <>,
+46,EC6441590,ITEM_BOM_ROUTING,812,BOM1_Item288_Location 24,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item288_Location 24 and erp_item_bom_routing_priority = <>,
+47,EC6441590,ITEM_BOM_ROUTING,1039,BOM2_Item373_Location 22,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item373_Location 22 and erp_item_bom_routing_priority = <>,
+48,EC6441590,ITEM_BOM_ROUTING,1061,BOM1_Item379_Location 14,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item379_Location 14 and erp_item_bom_routing_priority = <>,
+49,EC6441590,ITEM_BOM_ROUTING,1187,BOM2_Item429_Location 15,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item429_Location 15 and erp_item_bom_routing_priority = <>,
+50,EC6441590,ITEM_BOM_ROUTING,1238,BOM4_Item445_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item445_Location 3 and erp_item_bom_routing_priority = <>,
+51,EC6441590,ITEM_BOM_ROUTING,1286,BOM2_Item464_Location 11,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item464_Location 11 and erp_item_bom_routing_priority = <>,
+52,EC6441590,ITEM_BOM_ROUTING,1306,BOM1_Item470_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item470_Location 3 and erp_item_bom_routing_priority = <>,
+53,EC6441590,ITEM_BOM_ROUTING,1392,BOM1_Item505_Location 24,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item505_Location 24 and erp_item_bom_routing_priority = <>,
+54,EC6441590,ITEM_BOM_ROUTING,1393,BOM1_Item505_Location 24,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item505_Location 24 and erp_item_bom_routing_priority = <>,
+55,EC6441590,ITEM_BOM_ROUTING,1506,PRIMARY_Item546_Location 12,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item546_Location 12 and erp_item_bom_routing_priority = <>,
+56,EC6441590,ITEM_BOM_ROUTING,1516,BOM3_Item549_Location 8,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item549_Location 8 and erp_item_bom_routing_priority = <>,
+57,EC6441590,ITEM_BOM_ROUTING,1517,BOM3_Item549_Location 8,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item549_Location 8 and erp_item_bom_routing_priority = <>,
+58,EC6441590,ITEM_BOM_ROUTING,1563,BOM5_Item565_Location 21,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item565_Location 21 and erp_item_bom_routing_priority = <>,
+59,EC6441590,ITEM_BOM_ROUTING,1564,BOM5_Item565_Location 21,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item565_Location 21 and erp_item_bom_routing_priority = <>,
+60,EC6441590,ITEM_BOM_ROUTING,1569,BOM6_Item566_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item566_Location 3 and erp_item_bom_routing_priority = <>,
+61,EC6441590,ITEM_BOM_ROUTING,1649,BOM3_Item598_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item598_Location 3 and erp_item_bom_routing_priority = <>,
+62,EC6441590,ITEM_BOM_ROUTING,1666,BOM1_Item603_Location 13,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item603_Location 13 and erp_item_bom_routing_priority = <>,
+63,EC6441590,ITEM_BOM_ROUTING,1670,BOM2_Item604_Location 20,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item604_Location 20 and erp_item_bom_routing_priority = <>,
+64,EC6441590,ITEM_BOM_ROUTING,1706,BOM2_Item618_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item618_Location 18 and erp_item_bom_routing_priority = <>,
+65,EC6441590,ITEM_BOM_ROUTING,1770,BOM6_Item643_Location 19,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item643_Location 19 and erp_item_bom_routing_priority = <>,
+66,EC6441590,ITEM_BOM_ROUTING,1792,BOM3_Item654_Location 21,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item654_Location 21 and erp_item_bom_routing_priority = <>,
+67,EC6441590,ITEM_BOM_ROUTING,1797,BOM4_Item655_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item655_Location 3 and erp_item_bom_routing_priority = <>,
+68,EC6441590,ITEM_BOM_ROUTING,1798,BOM4_Item655_Location 3,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item655_Location 3 and erp_item_bom_routing_priority = <>,
+69,EC6441590,ITEM_BOM_ROUTING,1808,PRIMARY_Item658_Location 24,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item658_Location 24 and erp_item_bom_routing_priority = <>,
+70,EC6441590,ITEM_BOM_ROUTING,1818,BOM5_Item663_Location 9,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item663_Location 9 and erp_item_bom_routing_priority = <>,
+71,EC6441590,ITEM_BOM_ROUTING,1819,BOM5_Item663_Location 9,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item663_Location 9 and erp_item_bom_routing_priority = <>,
+72,EC6441590,ITEM_BOM_ROUTING,1827,PRIMARY_Item665_Location 23,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item665_Location 23 and erp_item_bom_routing_priority = <>,
+73,EC6441590,ITEM_BOM_ROUTING,1845,BOM6_Item671_Location 16,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item671_Location 16 and erp_item_bom_routing_priority = <>,
+74,EC6441590,ITEM_BOM_ROUTING,1887,PRIMARY_Item686_Location 21,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item686_Location 21 and erp_item_bom_routing_priority = <>,
+75,EC6441590,ITEM_BOM_ROUTING,1919,BOM3_Item696_Location 16,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item696_Location 16 and erp_item_bom_routing_priority = <>,
+76,EC6441590,ITEM_BOM_ROUTING,1923,BOM5_Item698_Location 5,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item698_Location 5 and erp_item_bom_routing_priority = <>,
+77,EC6441590,ITEM_BOM_ROUTING,1927,BOM6_Item699_Location 12,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item699_Location 12 and erp_item_bom_routing_priority = <>,
+78,EC6441590,ITEM_BOM_ROUTING,1942,BOM4_Item704_Location 23,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item704_Location 23 and erp_item_bom_routing_priority = <>,
+79,EC6441590,ITEM_BOM_ROUTING,1985,PRIMARY_Item721_Location 17,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item721_Location 17 and erp_item_bom_routing_priority = <>,
+80,EC6441590,ITEM_BOM_ROUTING,2021,PRIMARY_Item735_Location 15,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item735_Location 15 and erp_item_bom_routing_priority = <>,
+81,EC6441590,ITEM_BOM_ROUTING,2026,BOM1_Item736_Location 22,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item736_Location 22 and erp_item_bom_routing_priority = <>,
+82,EC6441590,ITEM_BOM_ROUTING,2081,BOM2_Item758_Location 2,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item758_Location 2 and erp_item_bom_routing_priority = <>,
+83,EC6441590,ITEM_BOM_ROUTING,2123,BOM3_Item773_Location 7,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item773_Location 7 and erp_item_bom_routing_priority = <>,
+84,EC6441590,ITEM_BOM_ROUTING,2135,PRIMARY_Item777_Location 11,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item777_Location 11 and erp_item_bom_routing_priority = <>,
+85,EC6441590,ITEM_BOM_ROUTING,2157,BOM2_Item786_Location 24,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item786_Location 24 and erp_item_bom_routing_priority = <>,
+86,EC6441590,ITEM_BOM_ROUTING,2161,BOM3_Item787_Location 6,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM3_Item787_Location 6 and erp_item_bom_routing_priority = <>,
+87,EC6441590,ITEM_BOM_ROUTING,2260,BOM6_Item825_Location 23,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item825_Location 23 and erp_item_bom_routing_priority = <>,
+88,EC6441590,ITEM_BOM_ROUTING,2272,BOM2_Item828_Location 19,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item828_Location 19 and erp_item_bom_routing_priority = <>,
+89,EC6441590,ITEM_BOM_ROUTING,2374,BOM2_Item863_Location 15,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item863_Location 15 and erp_item_bom_routing_priority = <>,
+90,EC6441590,ITEM_BOM_ROUTING,2388,BOM6_Item867_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item867_Location 18 and erp_item_bom_routing_priority = <>,
+91,EC6441590,ITEM_BOM_ROUTING,2412,PRIMARY_Item875_Location 24,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item875_Location 24 and erp_item_bom_routing_priority = <>,
+92,EC6441590,ITEM_BOM_ROUTING,2425,BOM6_Item881_Location 16,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item881_Location 16 and erp_item_bom_routing_priority = <>,
+93,EC6441590,ITEM_BOM_ROUTING,2429,PRIMARY_Item882_Location 23,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item882_Location 23 and erp_item_bom_routing_priority = <>,
+94,EC6441590,ITEM_BOM_ROUTING,2444,BOM5_Item887_Location 8,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item887_Location 8 and erp_item_bom_routing_priority = <>,
+95,EC6441590,ITEM_BOM_ROUTING,2552,BOM1_Item925_Location 1,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM1_Item925_Location 1 and erp_item_bom_routing_priority = <>,
+96,EC6441590,ITEM_BOM_ROUTING,2569,PRIMARY_Item931_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item931_Location 18 and erp_item_bom_routing_priority = <>,
+97,EC6441590,ITEM_BOM_ROUTING,2617,BOM2_Item947_Location 5,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM2_Item947_Location 5 and erp_item_bom_routing_priority = <>,
+98,EC6441590,ITEM_BOM_ROUTING,2643,BOM4_Item956_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item956_Location 18 and erp_item_bom_routing_priority = <>,
+99,EC6441590,ITEM_BOM_ROUTING,2661,BOM4_Item963_Location 18,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item963_Location 18 and erp_item_bom_routing_priority = <>,
+100,EC6441590,ITEM_BOM_ROUTING,2702,BOM5_Item978_Location 23,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item978_Location 23 and erp_item_bom_routing_priority = <>,
+101,EC6441590,ITEM_BOM_ROUTING,2727,BOM6_Item986_Location 4,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM6_Item986_Location 4 and erp_item_bom_routing_priority = <>,
+102,EC6441590,ITEM_BOM_ROUTING,2744,BOM5_Item992_Location 21,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM5_Item992_Location 21 and erp_item_bom_routing_priority = <>,
+103,EC6441590,ITEM_BOM_ROUTING,2754,PRIMARY_Item994_Location 10,1020,Check duplicate priority,There are duplicate values for this BOMID = PRIMARY_Item994_Location 10 and erp_item_bom_routing_priority = <>,
+104,EC6441590,ITEM_BOM_ROUTING,2766,BOM4_Item998_Location 13,1020,Check duplicate priority,There are duplicate values for this BOMID = BOM4_Item998_Location 13 and erp_item_bom_routing_priority = <>,
+105,EC6441590,ITEM_BOM_ROUTING,2694,BOM3_Item976_Location 9,1021,Check priority integer,The bom_id = <> with erp_item_bom_routing_priority = 0.234 is not a integer,"RM: Please MODIFY the erp_item_bom_routing_priority to Integer
+RS: Allow update"
+106,EC6441590,ITEM_BOM_ROUTING,2695,BOM3_Item976_Location 9,1021,Check priority integer,The bom_id = <> with erp_item_bom_routing_priority = 0.4567 is not a integer,"RM: Please MODIFY the erp_item_bom_routing_priority to Integer
+RS: Allow update"
