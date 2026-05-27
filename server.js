@@ -10,7 +10,7 @@ import sampleRoute from "./src/routes/route.js";
 import bomExplosionRoute from "./src/routes/createbomliteRoute.js";
 import bomDownloadRoutes from "./src/routes/bomDownload.routes.js";
 import bigqueryRoutes from "./src/routes/bigqueryRoutes.js";
-import bomRoutes from "./src/routes/bomRoutes.js";
+import bomRoutes from "./src/routes/createbomliteRoute.js";
 import tableRoutes from "./src/routes/tableRoutes.js";
 
 const app = express();
