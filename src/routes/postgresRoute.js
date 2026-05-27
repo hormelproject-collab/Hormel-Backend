@@ -1,5 +1,5 @@
 import express from "express";
-import pool from "../postgres/postgres.js";
+import pool from "../db/postgresClient.js";
 
 const router = express.Router();
 
