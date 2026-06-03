@@ -288,3 +288,74 @@ export const fetchResourceComponentMetadata = async ({
     generatedMappings,
   };
 };
+
+export const fetchExistingBomSearchRows = async () => {
+  const { projectId, dataset } = getBigQueryConfig();
+
+  const query = `
+    WITH base_produced AS (
+      SELECT
+        CAST(bp.bom_id AS STRING) AS bom_id,
+        CAST(bp.item AS STRING) AS produced_item,
+        CAST(bp.location AS STRING) AS location,
+        SAFE_CAST(bp.erp_bom_qty_produced_per AS FLOAT64) AS qty_produced_per,
+        ROW_NUMBER() OVER (
+          PARTITION BY CAST(bp.bom_id AS STRING)
+          ORDER BY
+            CASE
+              WHEN SAFE_CAST(bp.erp_bom_qty_produced_per AS FLOAT64) = 1 THEN 0
+              ELSE 1
+            END,
+            CAST(bp.item AS STRING)
+        ) AS rn
+      FROM \`${projectId}.${dataset}.bom_produced\` bp
+      WHERE bp.bom_id IS NOT NULL
+    ),
+
+    produced_one_per_bom AS (
+      SELECT
+        bom_id,
+        produced_item,
+        location
+      FROM base_produced
+      WHERE rn = 1
+    ),
+
+    routing_with_resource AS (
+      SELECT DISTINCT
+        CAST(ibr.bom_id AS STRING) AS bom_id,
+        CAST(ibr.routing_id AS STRING) AS routing_id,
+        CAST(rr.resource AS STRING) AS resource
+      FROM \`${projectId}.${dataset}.item_bom_routing\` ibr
+      LEFT JOIN \`${projectId}.${dataset}.routing_rescons\` rr
+        ON TRIM(CAST(ibr.routing_id AS STRING)) = TRIM(CAST(rr.routing_id AS STRING))
+      WHERE ibr.bom_id IS NOT NULL
+    )
+
+    SELECT DISTINCT
+      pob.location AS location,
+      pob.produced_item AS produced_item,
+      COALESCE(CAST(im.item_description AS STRING), CAST(im.item_desc AS STRING), '') AS produced_item_desc,
+      pob.bom_id AS bom_id,
+      COALESCE(rwr.resource, '') AS resource,
+      COALESCE(
+        CAST(ir.item_releaseflag AS STRING),
+        CAST(ir.item_release_flag AS STRING),
+        CAST(ir.release_flag AS STRING),
+        CAST(ir.release AS STRING),
+        ''
+      ) AS item_release_flag
+    FROM produced_one_per_bom pob
+    LEFT JOIN routing_with_resource rwr
+      ON TRIM(pob.bom_id) = TRIM(rwr.bom_id)
+    LEFT JOIN \`${projectId}.${dataset}.item_master\` im
+      ON TRIM(CAST(pob.produced_item AS STRING)) = TRIM(CAST(im.item AS STRING))
+    LEFT JOIN \`${projectId}.${dataset}.item_releaseflag\` ir
+      ON TRIM(CAST(pob.produced_item AS STRING)) = TRIM(CAST(ir.item AS STRING))
+    WHERE pob.bom_id IS NOT NULL
+    ORDER BY pob.location, pob.produced_item, pob.bom_id, resource
+  `;
+
+  const [rows] = await bigquery.query({ query });
+  return rows;
+};

@@ -1,5 +1,5 @@
 Report Name,Validation Report for Planning BOM Maintenance Application UI
-Report Time,6/1/2026, 06:49:13 CST
+Report Time,6/3/2026, 11:49:33 CST
 Trnx Type,ONETIME,Run By,APPL_TEAM
 
 Summary,BOM_PARAMETERS,BOM_PRODUCED,BOM_CONSUMED,ITEM_BOM_ROUTING
@@ -10,3 +10,8 @@ One Time Load,No
 
 Error Details are below:
 ERR_LOG_ID,ENG_CHANGE_ID,File name,ROW NUMBER,BOM_ID,Validation_sequence,Validation_description,Validation_ERROR_DETAILS,Remediation message
+1,EC3996250,MANUAL_ENTRY,1,BOM1_Item000_Location 1,RM&RF,,,
+2,EC3996250,MANUAL_ENTRY,1,BOM1_Item000_Location 1,RM&RF,,,
+3,EC3996250,MANUAL_ENTRY,1,BOM1_Item000_Location 1,RM&RF,,,
+4,EC3996250,MANUAL_ENTRY,1,BOM1_Item000_Location 1,RM&RF,,,
+5,EC3996250,MANUAL_ENTRY,1,BOM1_Item000_Location 1,RM&RF,,,
