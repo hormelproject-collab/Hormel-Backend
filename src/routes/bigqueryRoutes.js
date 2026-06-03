@@ -3,12 +3,13 @@ import {
   fetchFromTable,
   fetchItemMasterWithReleaseFlag,
   fetchLocationsBySelectedItems,
+  fetchResourceComponentMetadata,
 } from "../services/bigqueryService.js";
 
 const router = express.Router();
 
 /* =========================================================
-   1) Dedicated API: item_master + item_releaseflag
+   1) Existing API: item_master + item_releaseflag
 ========================================================= */
 router.get("/item-master-with-releaseflag", async (req, res) => {
   try {
@@ -30,7 +31,7 @@ router.get("/item-master-with-releaseflag", async (req, res) => {
 });
 
 /* =========================================================
-   2) Dedicated API: selected item(s) -> bom_produced -> location_master
+   2) Existing API: selected item(s) -> bom_produced -> location_master
 ========================================================= */
 router.post("/locations-by-items", async (req, res) => {
   try {
@@ -83,7 +84,44 @@ router.post("/by-items", async (req, res) => {
   }
 });
 
-/* keep generic route */
+/* =========================================================
+   3) NEW API: Resource & Component Step metadata
+   Does NOT alter any existing API
+========================================================= */
+router.post("/resource-component-metadata", async (req, res) => {
+  try {
+    const { items, locations } = req.body || {};
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        error: "items must be a non-empty array",
+      });
+    }
+
+    if (!Array.isArray(locations) || locations.length === 0) {
+      return res.status(400).json({
+        error: "locations must be a non-empty array",
+      });
+    }
+
+    const data = await fetchResourceComponentMetadata(items, locations);
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching resource component metadata:", error);
+    return res.status(500).json({
+      error: "Failed to fetch resource component metadata",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================================================
+   Keep existing generic route
+========================================================= */
 router.get("/:table", async (req, res) => {
   try {
     const tableName = req.params.table;
