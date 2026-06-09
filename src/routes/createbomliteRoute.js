@@ -1,867 +1,442 @@
 import express from "express";
-import path from "path";
-import fs from "fs";
-
-import { validateWithGCP } from "../bigquery/GCPvalidation.js";
-import { generateFailureReport } from "../reportGenerator/failureReportGenerator.js";
-import { validationRules } from "../postgres/ValidationRules.js";
+import crypto from "crypto";
+import pool from "../db/postgresClient.js";
+import { validateManualEntryPayload } from "../bigquery/manualentryValidation.js";
 
 const router = express.Router();
-
-function getChicagoTimeStamp() {
-  const now = new Date();
-  const chicago = now.toLocaleString("en-US", {
-    timeZone: "America/Chicago",
-    hour12: false,
-  });
-
-  return chicago.replace(/[/,: ]/g, "_");
-}
 
 /* =========================================================
    Helpers
 ========================================================= */
-function isBlank(value) {
-  return value === undefined || value === null || String(value).trim() === "";
+const norm = (v) => String(v ?? "").trim();
+const ensureArray = (v) => (Array.isArray(v) ? v : []);
+
+function getEcNumber() {
+  const d = new Date();
+
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+
+  return `EC-${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
 }
 
-function isPositiveNumber(value) {
-  return typeof value === "number" && !Number.isNaN(value) && value > 0;
+function generateUniqueBigInt() {
+  const ts = Date.now().toString();
+  const rand = Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, "0");
+  return `${ts}${rand}`;
 }
 
-function isNonNegativeNumber(value) {
-  return typeof value === "number" && !Number.isNaN(value) && value >= 0;
+function generateRandomSixDigit() {
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-function isIntegerNumber(value) {
-  return typeof value === "number" && !Number.isNaN(value) && Number.isInteger(value);
+async function getExistingColumns(client, tableName) {
+  const result = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      ORDER BY ordinal_position
+    `,
+    [tableName]
+  );
+
+  return result.rows.map((row) =>
+    String(row.column_name).trim().toLowerCase()
+  );
 }
 
-function toNumber(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
-}
-
-function ensureArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function normalizeText(value) {
-  return String(value ?? "").trim();
-}
-
-function applyTemplate(template, values = {}) {
-  let out = String(template || "");
-
-  const map = {};
-  Object.entries(values || {}).forEach(([k, v]) => {
-    map[String(k).toLowerCase()] = v;
+function buildInsertQuery(tableName, candidateData, allowedColumns) {
+  const entries = Object.entries(candidateData).filter(([key, value]) => {
+    return (
+      allowedColumns.includes(String(key).toLowerCase()) &&
+      value !== undefined
+    );
   });
 
-  return out.replace(/<([^>]+)>/g, (_, key) => {
-    return map[String(key).toLowerCase()] ?? "";
-  });
-}
+  if (entries.length === 0) {
+    throw new Error(`No matching columns found for insert into ${tableName}`);
+  }
 
-function getRule(seq) {
-  return validationRules?.[seq] || {};
-}
-
-function buildManualMessage({
-  seq,
-  values = {},
-  fallbackValidation = "",
-  fallbackErrorDetails = "",
-  fallbackRemediationMessage = "",
-}) {
-  const rule = getRule(seq);
-
-  const validation =
-    applyTemplate(rule?.desc || "", values) || fallbackValidation || "";
-
-  const errorDetails =
-    applyTemplate(rule?.error || "", values) || fallbackErrorDetails || "";
-
-  const remediationMessage =
-    applyTemplate(rule?.rm || "", values) || fallbackRemediationMessage || "";
+  const columns = entries.map(([key]) => key);
+  const values = entries.map(([, value]) => value);
+  const placeholders = entries.map((_, index) => `$${index + 1}`);
 
   return {
-    seq,
-    validationSequence: seq,
-    validation,
-    errorDetails,
-    remediationMessage,
-    desc: validation,
-    error: errorDetails,
-    rm: remediationMessage,
+    query: `
+      INSERT INTO ${tableName} (${columns.join(", ")})
+      VALUES (${placeholders.join(", ")})
+      RETURNING *
+    `,
     values,
   };
 }
 
-function buildManualErrorRow({
-  seq,
-  values = {},
-  fallbackValidation = "",
-  fallbackErrorDetails = "",
-  fallbackRemediationMessage = "",
-  record = null,
-  bomId = "",
-  item = "",
-  location = "",
-  routingId = "",
-  field = "",
-  table = "MANUAL_ENTRY",
-}) {
+async function insertDynamic(client, tableName, row) {
+  const allowedColumns = await getExistingColumns(client, tableName);
+  const { query, values } = buildInsertQuery(tableName, row, allowedColumns);
+  const result = await client.query(query, values);
+  return result.rows?.[0] ?? null;
+}
+
+function getUserDetails(payload) {
+  const records = ensureArray(payload?.records);
+  const record0 = records[0] || {};
+
   return {
-    table,
-    bomId: bomId || "NULL",
-    gcpRecId: "NULL",
-    csvRecId: record != null ? String(record) : "NULL",
-    item: item || "",
-    location: location || "",
-    routingId: routingId || "",
-    recordId: `${table}__${record ?? "NULL"}__${bomId || "NULL"}__${item || ""}__${location || ""}__${routingId || ""}__${field || ""}`,
-    field,
-    messages: [
-      buildManualMessage({
-        seq,
-        values,
-        fallbackValidation,
-        fallbackErrorDetails,
-        fallbackRemediationMessage,
-      }),
-    ],
+    user_name:
+      norm(payload?.user?.name) ||
+      norm(record0?.user?.name) ||
+      norm(payload?.userName) ||
+      "APPL_TEAM",
+    user_email:
+      norm(payload?.user?.email) ||
+      norm(record0?.user?.email) ||
+      norm(payload?.userEmail) ||
+      "",
+    user_id:
+      norm(payload?.user?.id) ||
+      norm(record0?.user?.id) ||
+      norm(payload?.userId) ||
+      "",
   };
 }
 
-/* =========================================================
-   Detect if incoming payload is manual-entry JSON
-   or existing CSV/GCP-shaped payload
-========================================================= */
-function detectInputMode(payload) {
-  if (
-    payload &&
-    typeof payload === "object" &&
-    !Array.isArray(payload) &&
-    typeof payload.entryMode === "string"
-  ) {
-    const mode = payload.entryMode.toLowerCase();
-    if (mode === "manual" || mode === "csv") {
-      return mode;
-    }
-  }
 
-  const records = Array.isArray(payload)
-    ? payload
-    : Array.isArray(payload?.records)
-    ? payload.records
-    : Array.isArray(payload?.data)
-    ? payload.data
-    : null;
+function collectNotes(payload) {
+  const uniqueNotes = Array.from(
+    new Set(
+      ensureArray(payload?.records)
+        .map((r) => norm(r?.notes))
+        .filter(Boolean)
+    )
+  );
 
-  if (Array.isArray(records) && records.length > 0) {
-    const first = records[0];
-
-    if (
-      first &&
-      typeof first === "object" &&
-      ("engineeringChange" in first ||
-        "producedItem" in first ||
-        "locations" in first ||
-        "bomId" in first)
-    ) {
-      return "manual";
-    }
-  }
-
-  return "csv";
+  return uniqueNotes[0] || "";
 }
 
-/* =========================================================
-   Normalize payload so route can support:
-   - req.body as array
-   - req.body.records
-   - req.body.data
-========================================================= */
-function extractRecords(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload?.records)) return payload.records;
-  if (Array.isArray(payload?.data)) return payload.data;
-  return payload;
-}
 
 /* =========================================================
-   Normalize validation response for UI
-   NOTE: CSV flow kept as-is
+   Build DB rows from normalized validator tables
 ========================================================= */
-function normalizeValidationForUI(validation) {
-  const errorDetails =
-    validation?.failureDetails ||
-    validation?.errorDetails ||
-    validation?.errors ||
-    (Array.isArray(validation?.errorList)
-      ? validation.errorList.map((msg, index) => ({
-          code: validation?.errorCodes?.[index] || "VALIDATION_ERROR",
-          message: msg,
-          remediation: "Please correct the data and resubmit.",
-        }))
-      : []);
+function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes) {
+  const now = new Date().toISOString();
 
-  const remediationDetails =
-    validation?.remediationDetails ||
-    validation?.remediation ||
-    (Array.isArray(errorDetails)
-      ? errorDetails.map((item) => ({
-          record: item.record ?? item.rowNumber ?? null,
-          location: item.location ?? null,
-          component: item.component ?? null,
-          coProduct: item.coProduct ?? null,
-          field: item.field ?? null,
-          remediation:
-            item.remediation || "Please correct the data and resubmit.",
-        }))
-      : []);
+  const bomParametersRows = ensureArray(normalizedTables?.bom_parameters).map((row) => ({
+    rec_id: generateUniqueBigInt(),
+    bom_id: row.bom_id,
+    produced_item: row.produced_item,
+    engineering_change_id: ecNumber,
+    eng_change_id: ecNumber,
+    change_type: "Add BOM",
+    notes,
+    created_by: userDetails.user_name,
+    updated_by: userDetails.user_name,
+    created_at: now,
+    updated_at: now,
+  }));
 
-  const errorCodes =
-    validation?.errorCodes?.length
-      ? [...new Set(validation.errorCodes)]
-      : Array.isArray(errorDetails)
-      ? [...new Set(errorDetails.map((e) => e.code).filter(Boolean))]
-      : ["VALIDATION_ERROR"];
+  const bomProducedRows = ensureArray(normalizedTables?.bom_produced).map((row) => ({
+    rec_id: generateUniqueBigInt(),
+    bom_id: row.bom_id,
+    item: row.item,
+    location: row.location,
+    erp_bom_qty_produced_per: row.erp_bom_qty_produced_per,
+    is_coproduct: row.is_coproduct,
+    engineering_change_id: ecNumber,
+    eng_change_id: ecNumber,
+    change_type: "Add BOM",
+    created_by: userDetails.user_name,
+    updated_by: userDetails.user_name,
+    created_at: now,
+    updated_at: now,
+  }));
 
-  const errorList =
-    validation?.errorList?.length
-      ? validation.errorList
-      : Array.isArray(errorDetails)
-      ? errorDetails.map((e) => e.message).filter(Boolean)
-      : ["Validation failed"];
+  const bomConsumedRows = ensureArray(normalizedTables?.bom_consumed).map((row) => ({
+    rec_id: generateUniqueBigInt(),
+    bom_id: row.bom_id,
+    item: row.item,
+    location: row.location,
+    erp_bom_quantity_consumed_per: row.erp_bom_quantity_consumed_per,
+    co_product_flag: row.co_product_flag,
+    engineering_change_id: ecNumber,
+    eng_change_id: ecNumber,
+    change_type: "Add BOM",
+    created_by: userDetails.user_name,
+    updated_by: userDetails.user_name,
+    created_at: now,
+    updated_at: now,
+  }));
 
-  return {
-    errorCodes,
-    errorList,
-    errorDetails,
-    remediationDetails,
-  };
-}
 
-/* =========================================================
-   Manual Entry Validations Only
-   Returns the structure Summary.jsx expects:
-   errorList: [{ messages: [{ validationSequence, validation,
-                              errorDetails, remediationMessage }] }]
-========================================================= */
-function validateManualEntry(payload) {
-  const records = extractRecords(payload);
-  const failures = [];
-
-  if (!Array.isArray(records) || records.length === 0) {
-    failures.push(
-      buildManualErrorRow({
-        seq: "RM&RF",
-        record: 1,
-        field: "records",
-        fallbackValidation: "Manual entry payload must be a non-empty array",
-        fallbackErrorDetails:
-          "No manual-entry records were received in the request body.",
-        fallbackRemediationMessage:
-          "Send a non-empty manual entry records array in the request body.",
-      })
-    );
+  const itemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map((row) => {
+    const derivedResource = norm(row.resource) ||
+      norm(String(row.routing_id || "").split("_").slice(3).join("_"));
 
     return {
-      isValid: false,
-      errorCodes: ["RM&RF"],
-      errorList: failures,
-      failureDetails: failures,
+      rec_id: generateUniqueBigInt(),
+      bom_id: row.bom_id,
+      item: row.item,
+      location: row.location,
+      routing_id: row.routing_id,
+      resource: derivedResource,
+      priority: row.priority,
+      erp_item_bom_routing_priority: row.priority,
+      erp_co_product_association: row.erp_co_product_association,
+      engineering_change_id: ecNumber,
+      eng_change_id: ecNumber,
+      change_type: "Add BOM",
+      created_by: userDetails.user_name,
+      updated_by: userDetails.user_name,
+      created_at: now,
+      updated_at: now,
     };
-  }
-
-  records.forEach((record, recordIndex) => {
-    const recNo = recordIndex + 1;
-    const bomId = normalizeText(record?.bomId);
-    const item = normalizeText(record?.producedItem?.item);
-    const locations = ensureArray(record?.locations);
-
-    /* -----------------------------------------------------
-       Top-level validations
-    ----------------------------------------------------- */
-    if (isBlank(record?.bomId)) {
-      failures.push(
-        buildManualErrorRow({
-          seq: "RM&RF",
-          record: recNo,
-          bomId,
-          item,
-          field: "bomId",
-          values: { value: record?.bomId ?? "" },
-          fallbackValidation: "BOM ID is required",
-          fallbackErrorDetails: `Record ${recNo}: bomId is required.`,
-          fallbackRemediationMessage: "Provide bomId and resubmit.",
-        })
-      );
-    }
-
-    if (!record?.engineeringChange || typeof record.engineeringChange !== "object") {
-      failures.push(
-        buildManualErrorRow({
-          seq: "RM&RF",
-          record: recNo,
-          bomId,
-          item,
-          field: "engineeringChange",
-          fallbackValidation: "Engineering Change is required",
-          fallbackErrorDetails: `Record ${recNo}: engineeringChange is required.`,
-          fallbackRemediationMessage:
-            "Provide engineeringChange object with required fields.",
-        })
-      );
-    } else {
-      if (isBlank(record.engineeringChange.ecNumber)) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            field: "engineeringChange.ecNumber",
-            fallbackValidation: "Engineering Change Number is required",
-            fallbackErrorDetails:
-              `Record ${recNo}: engineeringChange.ecNumber is required.`,
-            fallbackRemediationMessage:
-              "Provide engineeringChange.ecNumber and resubmit.",
-          })
-        );
-      }
-
-      if (isBlank(record.engineeringChange.creationDate)) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            field: "engineeringChange.creationDate",
-            fallbackValidation: "Engineering Change Creation Date is required",
-            fallbackErrorDetails:
-              `Record ${recNo}: engineeringChange.creationDate is required.`,
-            fallbackRemediationMessage:
-              "Provide engineeringChange.creationDate in valid format and resubmit.",
-          })
-        );
-      }
-    }
-
-    if (!record?.producedItem || typeof record.producedItem !== "object") {
-      failures.push(
-        buildManualErrorRow({
-          seq: "RM&RF",
-          record: recNo,
-          bomId,
-          field: "producedItem",
-          fallbackValidation: "Produced Item is required",
-          fallbackErrorDetails: `Record ${recNo}: producedItem is required.`,
-          fallbackRemediationMessage:
-            "Provide producedItem object with required fields.",
-        })
-      );
-    } else {
-      if (isBlank(record.producedItem.item)) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            field: "producedItem.item",
-            fallbackValidation: "Produced Item Code is required",
-            fallbackErrorDetails:
-              `Record ${recNo}: producedItem.item is required.`,
-            fallbackRemediationMessage:
-              "Provide producedItem.item and resubmit.",
-          })
-        );
-      }
-
-      if (isBlank(record.producedItem.status)) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            field: "producedItem.status",
-            fallbackValidation: "Produced Item Status is required",
-            fallbackErrorDetails:
-              `Record ${recNo}: producedItem.status is required.`,
-            fallbackRemediationMessage:
-              "Provide producedItem.status and resubmit.",
-          })
-        );
-      }
-    }
-
-    if (!Array.isArray(locations) || locations.length === 0) {
-      failures.push(
-        buildManualErrorRow({
-          seq: "RM&RF",
-          record: recNo,
-          bomId,
-          item,
-          field: "locations",
-          fallbackValidation: "At least one location is required",
-          fallbackErrorDetails:
-            `Record ${recNo}: at least one location is required.`,
-          fallbackRemediationMessage:
-            "Add at least one location entry.",
-        })
-      );
-      return;
-    }
-
-    /* -----------------------------------------------------
-       Location-level validations
-    ----------------------------------------------------- */
-    locations.forEach((loc, locIndex) => {
-      const locNo = locIndex + 1;
-      const locationId = normalizeText(loc?.locationId);
-      const locationName = normalizeText(loc?.locationName);
-      const locationStatus = normalizeText(loc?.locationStatus);
-      const locationLabel = locationId || locationName || `Location ${locNo}`;
-
-      const resourceInfoList = ensureArray(loc?.resourceInfo);
-      const flags = loc?.flags || {};
-      const componentItems = ensureArray(loc?.componentItems);
-      const coProducts = ensureArray(loc?.coProducts);
-
-      if (isBlank(locationId) && isBlank(locationName)) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            location: locationLabel,
-            field: "locationId/locationName",
-            fallbackValidation: "Location ID or Location Name is required",
-            fallbackErrorDetails:
-              `Record ${recNo}, Location ${locNo}: locationId or locationName is required.`,
-            fallbackRemediationMessage:
-              "Provide either locationId or locationName.",
-          })
-        );
-      }
-
-      if (isBlank(locationStatus)) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            location: locationLabel,
-            field: "locationStatus",
-            fallbackValidation: "Location Status is required",
-            fallbackErrorDetails:
-              `Record ${recNo}, Location ${locNo}: locationStatus is required.`,
-            fallbackRemediationMessage:
-              "Provide locationStatus and resubmit.",
-          })
-        );
-      }
-
-      if (resourceInfoList.length === 0) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            location: locationLabel,
-            field: "resourceInfo",
-            fallbackValidation: "At least one Resource is required",
-            fallbackErrorDetails:
-              `Record ${recNo}, Location ${locNo}: at least one resourceInfo entry is required.`,
-            fallbackRemediationMessage:
-              "Add at least one selected resource for the location.",
-          })
-        );
-      }
-
-      resourceInfoList.forEach((resourceInfo, resourceIndex) => {
-        const resourceNo = resourceIndex + 1;
-        const routingId = normalizeText(resourceInfo?.routingId);
-        const priority = toNumber(resourceInfo?.priority);
-
-        if (isBlank(resourceInfo?.resource)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: "RM&RF",
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              routingId,
-              field: "resourceInfo.resource",
-              fallbackValidation: "Resource is required",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Resource ${resourceNo}: resourceInfo.resource is required.`,
-              fallbackRemediationMessage:
-                "Provide resourceInfo.resource.",
-            })
-          );
-        }
-
-        if (isBlank(resourceInfo?.resourceRelevancy)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: "RM&RF",
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              routingId,
-              field: "resourceInfo.resourceRelevancy",
-              fallbackValidation: "Resource Relevancy is required",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Resource ${resourceNo}: resourceInfo.resourceRelevancy is required.`,
-              fallbackRemediationMessage:
-                "Provide resourceInfo.resourceRelevancy.",
-            })
-          );
-        }
-
-        if (isBlank(resourceInfo?.bomVersion)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: "RM&RF",
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              routingId,
-              field: "resourceInfo.bomVersion",
-              fallbackValidation: "BOM Version is required",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Resource ${resourceNo}: resourceInfo.bomVersion is required.`,
-              fallbackRemediationMessage:
-                "Provide resourceInfo.bomVersion.",
-            })
-          );
-        }
-
-        if (isBlank(resourceInfo?.routingId)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: "RM&RF",
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              field: "resourceInfo.routingId",
-              fallbackValidation: "Routing ID is required",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Resource ${resourceNo}: resourceInfo.routingId is required.`,
-              fallbackRemediationMessage:
-                "Provide resourceInfo.routingId.",
-            })
-          );
-        }
-
-        if (!isNonNegativeNumber(priority)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: 1021,
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              routingId,
-              field: "resourceInfo.priority",
-              values: {
-                value: resourceInfo?.priority ?? "",
-                bom_id: bomId || "",
-              },
-              fallbackValidation: "Routing Priority must be a valid integer",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Resource ${resourceNo}: resourceInfo.priority must be a number >= 0.`,
-              fallbackRemediationMessage:
-                "Set resourceInfo.priority to a valid whole number greater than or equal to 0.",
-            })
-          );
-        } else if (!isIntegerNumber(priority)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: 1021,
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              routingId,
-              field: "resourceInfo.priority",
-              values: {
-                value: resourceInfo?.priority ?? "",
-                bom_id: bomId || "",
-              },
-              fallbackValidation: "Routing Priority must be an integer",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Resource ${resourceNo}: resourceInfo.priority must be an integer.`,
-              fallbackRemediationMessage:
-                "Set resourceInfo.priority to a whole number.",
-            })
-          );
-        }
-      });
-
-      /* -----------------------------------------------------
-         Component item validations
-      ----------------------------------------------------- */
-      if (flags.noComponentItems !== true && componentItems.length === 0) {
-        failures.push(
-          buildManualErrorRow({
-            seq: "RM&RF",
-            record: recNo,
-            bomId,
-            item,
-            location: locationLabel,
-            field: "componentItems",
-            fallbackValidation: "Component Items are required",
-            fallbackErrorDetails:
-              `Record ${recNo}, Location ${locNo}: componentItems are required when flags.noComponentItems is false.`,
-            fallbackRemediationMessage:
-              "Add componentItems or set flags.noComponentItems = true if applicable.",
-          })
-        );
-      }
-
-      componentItems.forEach((comp, compIndex) => {
-        const compNo = compIndex + 1;
-
-        if (isBlank(comp?.componentItem)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: "RM&RF",
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              field: "componentItems.componentItem",
-              fallbackValidation: "Component Item is required",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Component ${compNo}: componentItem is required.`,
-              fallbackRemediationMessage:
-                "Provide componentItems.componentItem.",
-            })
-          );
-        }
-
-        if (!isPositiveNumber(comp?.standardUsage)) {
-          failures.push(
-            buildManualErrorRow({
-              seq: 1010,
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              field: "componentItems.standardUsage",
-              values: {
-                value: comp?.standardUsage ?? "",
-                item: comp?.componentItem ?? "",
-                location: locationLabel,
-                bom_id: bomId || "",
-              },
-              fallbackValidation: "Standard Usage must be greater than 0",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}, Component ${compNo}: standardUsage must be > 0.`,
-              fallbackRemediationMessage:
-                "Set componentItems.standardUsage to a number greater than 0.",
-            })
-          );
-        }
-      });
-
-      /* -----------------------------------------------------
-         Co-product validations
-      ----------------------------------------------------- */
-      if (flags.isCoProduct === true && coProducts.length === 0) {
-        failures.push(
-          buildManualErrorRow({
-            seq: 1008,
-            record: recNo,
-            bomId,
-            item,
-            location: locationLabel,
-            field: "coProducts",
-            values: {
-              value: "",
-              item,
-              location: locationLabel,
-              bom_id: bomId || "",
-            },
-            fallbackValidation: "Co-Product Items are required",
-            fallbackErrorDetails:
-              `Record ${recNo}, Location ${locNo}: coProducts are required when flags.isCoProduct is true.`,
-            fallbackRemediationMessage:
-              "Add at least one co-product item or turn off the Produced Co-Product flag.",
-          })
-        );
-      }
-
-      if (coProducts.length > 0) {
-        if (flags.isCoProduct !== true) {
-          failures.push(
-            buildManualErrorRow({
-              seq: "RM&RF",
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              field: "flags.isCoProduct",
-              fallbackValidation: "Produced Co-Product flag must be true",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}: flags.isCoProduct must be true when coProducts exist.`,
-              fallbackRemediationMessage:
-                "Set flags.isCoProduct = true when coProducts are provided.",
-            })
-          );
-        }
-
-        let hasQtyProducedPerLessThanOne = false;
-
-        coProducts.forEach((cp, cpIndex) => {
-          const cpNo = cpIndex + 1;
-          const qtyProducedPer = toNumber(cp?.qtyProducedPer);
-
-          if (isBlank(cp?.coProductItem)) {
-            failures.push(
-              buildManualErrorRow({
-                seq: "RM&RF",
-                record: recNo,
-                bomId,
-                item,
-                location: locationLabel,
-                field: "coProducts.coProductItem",
-                fallbackValidation: "Co-Product Item is required",
-                fallbackErrorDetails:
-                  `Record ${recNo}, Location ${locNo}, CoProduct ${cpNo}: coProductItem is required.`,
-                fallbackRemediationMessage:
-                  "Provide coProducts.coProductItem.",
-              })
-            );
-          }
-
-          if (!(typeof qtyProducedPer === "number" && qtyProducedPer > 0 && qtyProducedPer < 1)) {
-            failures.push(
-              buildManualErrorRow({
-                seq: 1008,
-                record: recNo,
-                bomId,
-                item,
-                location: locationLabel,
-                field: "coProducts.qtyProducedPer",
-                values: {
-                  value: cp?.qtyProducedPer ?? "",
-                  item: cp?.coProductItem ?? "",
-                  location: locationLabel,
-                  bom_id: bomId || "",
-                },
-                fallbackValidation:
-                  "Co-Product Qty Produced must be greater than 0 and less than 1",
-                fallbackErrorDetails:
-                  `Record ${recNo}, Location ${locNo}, CoProduct ${cpNo}: qtyProducedPer must be > 0 and < 1.`,
-                fallbackRemediationMessage:
-                  "Set coProducts.qtyProducedPer to a number greater than 0 and less than 1.",
-              })
-            );
-          }
-
-          if (typeof qtyProducedPer === "number" && qtyProducedPer < 1) {
-            hasQtyProducedPerLessThanOne = true;
-          }
-        });
-
-        if (!hasQtyProducedPerLessThanOne) {
-          failures.push(
-            buildManualErrorRow({
-              seq: 1008,
-              record: recNo,
-              bomId,
-              item,
-              location: locationLabel,
-              field: "coProducts.qtyProducedPer",
-              values: {
-                value: "",
-                item,
-                location: locationLabel,
-                bom_id: bomId || "",
-              },
-              fallbackValidation:
-                "At least one Co-Product Qty Produced must be less than 1",
-              fallbackErrorDetails:
-                `Record ${recNo}, Location ${locNo}: at least one coProduct qtyProducedPer must be < 1.`,
-              fallbackRemediationMessage:
-                "Ensure at least one coProduct has qtyProducedPer less than 1.",
-            })
-          );
-        }
-      }
-    });
   });
 
-  const errorCodes = [
-    ...new Set(
-      failures.flatMap((row) =>
-        ensureArray(row?.messages).map((msg) => msg?.validationSequence).filter(Boolean)
-      )
-    ),
-  ];
 
   return {
-    isValid: failures.length === 0,
-    errorCodes,
-    errorList: failures,
-    failureDetails: failures,
+    bom_parameters: bomParametersRows,
+    bom_produced: bomProducedRows,
+    bom_consumed: bomConsumedRows,
+    item_bom_routing: itemBomRoutingRows,
   };
+}
+
+async function insertChangeLogRow(
+  client,
+  {
+    ecNumber,
+    targetTable,
+    postgresqlRecId,
+    bomId = "",
+    producedItem = "",
+    location = "",
+    resource = "",
+    summarynotes = "",
+    userDetails,
+  }
+) {
+  const allowedColumns = await getExistingColumns(
+    client,
+    "planning_bom_change_log_summary"
+  );
+
+  const row = {
+    rec_id: generateRandomSixDigit(), // 6-digit as requested
+    engineering_change_id: ecNumber,
+    postgresql_rec_id: postgresqlRecId,
+    change_type: "Add BOM",
+    target_table: targetTable,
+    bom_id: bomId || "",
+    produced_item: producedItem || "",
+    location: location || "",
+    change_date: new Date().toISOString().slice(0, 10),
+    user_name: userDetails.user_name || "APPL_TEAM",
+  };
+
+  // NEW: store notes from Summary.jsx textarea
+  if (allowedColumns.includes("summarynotes")) {
+    row.summarynotes = summarynotes || "";
+  }
+
+  // optional backward compatibility
+  if (allowedColumns.includes("notes")) {
+    row.notes = summarynotes || "";
+  }
+
+  // NEW: store resource
+  if (allowedColumns.includes("resource")) {
+    row.resource = resource || "";
+  }
+
+  // optional plural column if your engineering log uses it
+  if (allowedColumns.includes("resources")) {
+    row.resources = resource || "";
+  }
+
+  // optional user-facing summary column
+  if (allowedColumns.includes("change_summary")) {
+    row.change_summary = summarynotes || targetTable || "Add BOM";
+  }
+
+  await insertDynamic(client, "planning_bom_change_log_summary", row);
+}
+
+async function insertAllManualRows(client, normalizedTables, ecNumber, userDetails, notes) {
+  const dbRows = buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes);
+
+  const insertedCounts = {
+    bom_parameters: 0,
+    bom_produced: 0,
+    bom_consumed: 0,
+    item_bom_routing: 0,
+  };
+
+  // Build resource map from routing rows: key = bom_id__location
+  const resourceByBomAndLocation = new Map();
+
+  for (const row of dbRows.item_bom_routing) {
+    const routingResource =
+      norm(row.resource) ||
+      norm(
+        String(row.routing_id || "")
+          .split("_")
+          .slice(3)
+          .join("_")
+      );
+
+    const key = `${norm(row.bom_id)}__${norm(row.location)}`;
+    if (!resourceByBomAndLocation.has(key) && routingResource) {
+      resourceByBomAndLocation.set(key, routingResource);
+    }
+  }
+
+  const getResourceForRow = (bomId, location) => {
+    const directKey = `${norm(bomId)}__${norm(location)}`;
+    if (resourceByBomAndLocation.has(directKey)) {
+      return resourceByBomAndLocation.get(directKey);
+    }
+
+    // fallback: if location missing (ex: bom_parameters), match by bom only
+    const byBomOnly = [...resourceByBomAndLocation.entries()].find(([key]) =>
+      key.startsWith(`${norm(bomId)}__`)
+    );
+
+    return byBomOnly?.[1] || "";
+  };
+
+  // bom_parameters
+  for (const row of dbRows.bom_parameters) {
+    const inserted = await insertDynamic(client, "bom_parameters", row);
+    insertedCounts.bom_parameters += 1;
+
+    const derivedLocation =
+      norm(row.location) ||
+      norm(String(row.bom_id || "").split("_").slice(-1)[0]);
+
+    const resource = getResourceForRow(row.bom_id, derivedLocation);
+
+    await insertChangeLogRow(client, {
+      ecNumber,
+      targetTable: "bom_parameters",
+      postgresqlRecId: inserted?.rec_id ?? row.rec_id,
+      bomId: row.bom_id,
+      producedItem: row.produced_item,
+      location: derivedLocation,
+      resource,
+      summarynotes: notes,
+      userDetails,
+    });
+  }
+  // bom_produced
+  for (const row of dbRows.bom_produced) {
+    const inserted = await insertDynamic(client, "bom_produced", row);
+    insertedCounts.bom_produced += 1;
+
+    const resource = getResourceForRow(row.bom_id, row.location);
+
+    await insertChangeLogRow(client, {
+      ecNumber,
+      targetTable: "bom_produced",
+      postgresqlRecId: inserted?.rec_id ?? row.rec_id,
+      bomId: row.bom_id,
+      producedItem: row.item,
+      location: row.location,
+      resource,
+      summarynotes: notes,
+      userDetails,
+    });
+  }
+
+  // bom_consumed
+  for (const row of dbRows.bom_consumed) {
+    const inserted = await insertDynamic(client, "bom_consumed", row);
+    insertedCounts.bom_consumed += 1;
+
+    const resource = getResourceForRow(row.bom_id, row.location);
+
+    await insertChangeLogRow(client, {
+      ecNumber,
+      targetTable: "bom_consumed",
+      postgresqlRecId: inserted?.rec_id ?? row.rec_id,
+      bomId: row.bom_id,
+      producedItem: row.item,
+      location: row.location,
+      resource,
+      summarynotes: notes,
+      userDetails,
+    });
+  }
+
+  // item_bom_routing
+  for (const row of dbRows.item_bom_routing) {
+    const inserted = await insertDynamic(client, "item_bom_routing", row);
+    insertedCounts.item_bom_routing += 1;
+
+    const routingResource =
+      norm(row.resource) ||
+      norm(
+        String(row.routing_id || "")
+          .split("_")
+          .slice(3)
+          .join("_")
+      );
+
+    await insertChangeLogRow(client, {
+      ecNumber,
+      targetTable: "item_bom_routing",
+      postgresqlRecId: inserted?.rec_id ?? row.rec_id,
+      bomId: row.bom_id,
+      producedItem: row.item,
+      location: row.location,
+      resource: routingResource,
+      summarynotes: notes,
+      userDetails,
+    });
+  }
+
+  return insertedCounts;
 }
 
 /* =========================================================
    POST /bom-explosion
-   Supports BOTH:
-   1. Existing CSV/GCP validation flow
-   2. Manual-entry JSON validation flow
+   MANUAL ENTRY ONLY
 ========================================================= */
 router.post("/", async (req, res) => {
-  const payload = req.body;
+  const payload = req.body || {};
 
-  const REPORT_DIR = path.join(process.cwd(), "reports");
-  fs.mkdirSync(REPORT_DIR, { recursive: true });
+  if (String(payload?.entryMode || "").toLowerCase() !== "manual") {
+    return res.status(400).json({
+      status: "failure",
+      message:
+        "This /bom-explosion endpoint currently supports manual entry flow only. CSV upload flow will be handled separately.",
+    });
+  }
 
-  const reportNameBase = `BOM_${getChicagoTimeStamp()}`;
-  console.log("bom-explosion called");
+  const records = ensureArray(payload?.records);
+  if (records.length === 0) {
+    return res.status(400).json({
+      status: "failure",
+      message: "No manual entry records received from summary page.",
+    });
+  }
 
-  const extractedRecords = extractRecords(payload);
-  const ecNumber =
-    Array.isArray(extractedRecords) && extractedRecords[0]?.engineeringChange?.ecNumber
-      ? extractedRecords[0].engineeringChange.ecNumber
-      : `EC${Math.floor(1000000 + Math.random() * 9000000)}`;
+  const userDetails = getUserDetails(payload);
+  const notes = collectNotes(payload);
 
   try {
-    const inputMode = detectInputMode(payload);
-    let validation;
+    // 1) Validate manual entry via separate validator file
+    const validation = await validateManualEntryPayload(payload, pool);
 
-    // =====================================================
-    // MANUAL ENTRY FLOW (FIXED FOR SUMMARY PAGE)
-    // =====================================================
-    if (inputMode === "manual") {
-      validation = validateManualEntry(payload);
-
-      if (validation.isValid) {
-        return res.status(200).json({
-          status: "success",
-          message: "Validation successful",
-          ecNumber,
-        });
-      }
-
+    // 2) Failure -> return Summary.jsx expected structure (no report generation)
+    if (!validation.isValid) {
       const remediationDetails = validation.errorList.flatMap((row) =>
         ensureArray(row?.messages).map((msg) => ({
           record: row?.csvRecId ?? null,
@@ -873,19 +448,9 @@ router.post("/", async (req, res) => {
         }))
       );
 
-      const reportFile = generateFailureReport({
-        REPORT_DIR,
-        errorList: validation.errorList,
-        ecNumber,
-        reportNameBase,
-        validation,
-      });
-
       return res.status(400).json({
         status: "failure",
         message: "Validation failed",
-        reportFile,
-        ecNumber,
         errors: validation.errorCodes,
         errorList: validation.errorList,
         errorDetails: validation.errorList,
@@ -893,46 +458,43 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // =====================================================
-    // EXISTING CSV / GCP FLOW (UNCHANGED)
-    // =====================================================
-    validation = await validateWithGCP(payload);
+    // 3) Success -> insert target rows + change logs in one transaction
+    const ecNumber = getEcNumber();
+    const client = await pool.connect();
 
-    if (validation.isValid) {
+    try {
+      await client.query("BEGIN");
+
+      const insertedCounts = await insertAllManualRows(
+        client,
+        validation.normalizedTables,
+        ecNumber,
+        userDetails,
+        notes
+      );
+
+      await client.query("COMMIT");
+
       return res.status(200).json({
         status: "success",
-        message: "Validation successful",
+        message: "Validation successful and records saved successfully.",
         ecNumber,
+        engineeringChangeId: ecNumber,
+        insertedCounts,
       });
+    } catch (dbErr) {
+      await client.query("ROLLBACK");
+      throw dbErr;
+    } finally {
+      client.release();
     }
-
-    const normalized = normalizeValidationForUI(validation);
-
-    const reportFile = generateFailureReport({
-      REPORT_DIR,
-      errorList: normalized.errorList,
-      ecNumber,
-      reportNameBase,
-      validation,
-    });
-
-    return res.status(400).json({
-      status: "failure",
-      message: "Validation failed",
-      reportFile,
-      ecNumber,
-      errors: normalized.errorCodes,
-      errorList: normalized.errorList,
-      errorDetails: normalized.errorDetails,
-      remediationDetails: normalized.remediationDetails,
-    });
   } catch (err) {
-    console.error(err);
+    console.error("bom-explosion manual flow error:", err);
     return res.status(500).json({
       status: "failure",
       message: err.message || "Internal server error",
-      errorDetails: err.errorDetails || [],
-      remediationDetails: err.remediationDetails || [],
+      errorDetails: [],
+      remediationDetails: [],
     });
   }
 });

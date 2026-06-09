@@ -1,6 +1,7 @@
 import express from "express";
 import pool from "../db/postgresClient.js";
 import { BigQuery } from "@google-cloud/bigquery";
+import crypto from "crypto";
 
 const router = express.Router();
 
@@ -8,6 +9,342 @@ const bigquery = new BigQuery({
   projectId: process.env.BQ_PROJECT_ID,
 });
 
+/* =========================================================
+   Common ID helpers
+========================================================= */
+const generateUniqueBigInt = () => {
+  const ts = Date.now().toString();
+  const rand = Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, "0");
+  return `${ts}${rand}`;
+};
+
+const generateUniqueId = (prefix) => {
+  const ts = new Date()
+    .toISOString()
+    .replace(/[-:TZ.]/g, "")
+    .slice(0, 14);
+  const rand = crypto.randomBytes(3).toString("hex").toUpperCase();
+  return `${prefix}${ts}${rand}`;
+};
+
+const generateDeleteBomEngineeringChangeId = () => {
+  const ts = new Date()
+    .toISOString()
+    .replace(/[-:TZ.]/g, "")
+    .slice(0, 14);
+  const rand = crypto.randomBytes(3).toString("hex").toUpperCase();
+  return `EC-${ts}-${rand}`;
+};
+
+const generateDeleteItemBomRoutingEngineeringChangeId = () => {
+  const ts = new Date()
+    .toISOString()
+    .replace(/[-:TZ.]/g, "")
+    .slice(0, 14);
+  const rand = crypto.randomBytes(3).toString("hex").toUpperCase();
+  return `EC-${ts}-${rand}`;
+};
+
+/* =========================================================
+   DB metadata helpers
+========================================================= */
+const getExistingColumns = async (client, tableName) => {
+  const result = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+      ORDER BY ordinal_position
+    `,
+    [tableName]
+  );
+
+  return result.rows.map((row) => String(row.column_name).trim().toLowerCase());
+};
+
+const pgTableExists = async (client, tableName) => {
+  const result = await client.query(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = $1
+      ) AS exists
+    `,
+    [tableName]
+  );
+  return Boolean(result.rows?.[0]?.exists);
+};
+
+const quoteIdent = (value) => `"${String(value).replace(/"/g, '""')}"`;
+
+const buildDynamicInsertQuery = (tableName, data, allowedColumns) => {
+  const entries = Object.entries(data).filter(([key, value]) => {
+    return (
+      value !== undefined &&
+      allowedColumns.includes(String(key).toLowerCase())
+    );
+  });
+
+  if (entries.length === 0) {
+    throw new Error(`No matching columns found for insert into ${tableName}`);
+  }
+
+  const columns = entries.map(([key]) => quoteIdent(key));
+  const values = entries.map(([, value]) => value);
+  const placeholders = entries.map((_, index) => `$${index + 1}`);
+
+  return {
+    query: `INSERT INTO ${quoteIdent(tableName)} (${columns.join(
+      ", "
+    )}) VALUES (${placeholders.join(", ")}) RETURNING *`,
+    values,
+  };
+};
+
+const buildInsertQuery = (tableName, candidateData, allowedColumns) => {
+  const entries = Object.entries(candidateData).filter(([key, value]) => {
+    return (
+      allowedColumns.includes(String(key).toLowerCase()) &&
+      value !== undefined
+    );
+  });
+
+  if (entries.length === 0) {
+    throw new Error(`No matching columns found for insert into ${tableName}`);
+  }
+
+  const columns = entries.map(([key]) => key);
+  const values = entries.map(([, value]) => value);
+  const placeholders = entries.map((_, index) => `$${index + 1}`);
+
+  return {
+    query: `
+      INSERT INTO ${tableName} (${columns.join(", ")})
+      VALUES (${placeholders.join(", ")})
+      RETURNING *
+    `,
+    values,
+  };
+};
+
+/* =========================================================
+   Delete helpers
+========================================================= */
+const DELETE_BOM_SOURCE_TO_ARCHIVE = {
+  bom_parameters: "bom_parameters_og",
+  bom_produced: "bom_produced_og",
+  bom_consumed: "bom_consumed_og",
+  item_bom_routing: "item_bom_routing_og",
+};
+
+const DELETE_BOM_CHANGE_LOG_TABLE_CANDIDATES = [
+  "planning_bom_change_log_summary",
+  "bom_change_log_summary",
+];
+
+const toText = (value) => String(value ?? "").trim();
+
+const normalizeTextArray = (values) => {
+  if (Array.isArray(values)) {
+    return Array.from(new Set(values.map((v) => toText(v)).filter(Boolean)));
+  }
+  if (values == null) return [];
+  return Array.from(new Set([toText(values)].filter(Boolean)));
+};
+
+const buildDeleteBomArchiveRow = ({
+  baseRow,
+  archiveColumns,
+  engineeringChangeId,
+  notes,
+  sourceTable,
+}) => {
+  const row = { ...baseRow };
+
+  if (archiveColumns.includes("engineering_change_id")) {
+    row.engineering_change_id = engineeringChangeId;
+  }
+  if (archiveColumns.includes("engineeringchangeid")) {
+    row.engineeringchangeid = engineeringChangeId;
+  }
+  if (archiveColumns.includes("change_type")) {
+    row.change_type = "deleteBOM";
+  }
+  if (archiveColumns.includes("changetype")) {
+    row.changetype = "deleteBOM";
+  }
+  if (archiveColumns.includes("notes")) {
+    row.notes = notes || "";
+  }
+  if (archiveColumns.includes("source_table")) {
+    row.source_table = sourceTable;
+  }
+  if (archiveColumns.includes("source_rec_id")) {
+    row.source_rec_id =
+      baseRow.rec_id ?? baseRow.record_id ?? baseRow.recordid ?? null;
+  }
+  if (archiveColumns.includes("original_rec_id")) {
+    row.original_rec_id =
+      baseRow.rec_id ?? baseRow.record_id ?? baseRow.recordid ?? null;
+  }
+  if (archiveColumns.includes("archived_at")) {
+    row.archived_at = new Date();
+  }
+  if (archiveColumns.includes("archived_on")) {
+    row.archived_on = new Date();
+  }
+  if (archiveColumns.includes("deleted_at")) {
+    row.deleted_at = new Date();
+  }
+  if (archiveColumns.includes("deleted_on")) {
+    row.deleted_on = new Date();
+  }
+
+  return row;
+};
+
+const insertDeleteBomChangeLogIfAvailable = async ({
+  client,
+  engineeringChangeId,
+  bomIds,
+  notes,
+  userId,
+}) => {
+  for (const tableName of DELETE_BOM_CHANGE_LOG_TABLE_CANDIDATES) {
+    const exists = await pgTableExists(client, tableName);
+    if (!exists) continue;
+
+    const columns = await getExistingColumns(client, tableName);
+    const payload = {};
+
+    if (columns.includes("engineering_change_id")) {
+      payload.engineering_change_id = engineeringChangeId;
+    }
+    if (columns.includes("engineeringchangeid")) {
+      payload.engineeringchangeid = engineeringChangeId;
+    }
+    if (columns.includes("change_type")) {
+      payload.change_type = "deleteBOM";
+    }
+    if (columns.includes("changetype")) {
+      payload.changetype = "deleteBOM";
+    }
+
+    if (columns.includes("notes")) {
+      payload.notes = notes || "";
+    }
+
+    // NEW: summary notes from DeleteBOMSummary.jsx textarea
+    if (columns.includes("summarynotes")) {
+      payload.summarynotes = notes || "";
+    }
+
+    if (columns.includes("bom_id")) {
+      payload.bom_id = bomIds.join(", ");
+    }
+    if (columns.includes("bom_ids")) {
+      payload.bom_ids = bomIds.join(", ");
+    }
+
+    if (columns.includes("created_by")) {
+      payload.created_by = userId || "system";
+    }
+    if (columns.includes("updated_by")) {
+      payload.updated_by = userId || "system";
+    }
+    if (columns.includes("created_at")) {
+      payload.created_at = new Date();
+    }
+    if (columns.includes("created_on")) {
+      payload.created_on = new Date();
+    }
+    if (columns.includes("status")) {
+      payload.status = "COMPLETED";
+    }
+
+    // optional UI-friendly summary text
+    if (columns.includes("change_summary")) {
+      payload.change_summary = notes || "deleteBOM";
+    }
+
+    const { query, values } = buildDynamicInsertQuery(
+      tableName,
+      payload,
+      columns
+    );
+
+    await client.query(query, values);
+    return tableName;
+  }
+
+  return null;
+};
+
+const deleteRowsByBomId = async (client, tableName, bomIds) => {
+  const normalizedBomIds = normalizeTextArray(bomIds);
+  if (!normalizedBomIds.length) {
+    throw new Error(`Cannot delete from ${tableName}: bomIds is empty`);
+  }
+
+  const deleteResult = await client.query(
+    `
+      DELETE FROM ${quoteIdent(tableName)}
+      WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
+      RETURNING bom_id
+    `,
+    [normalizedBomIds]
+  );
+
+  return deleteResult.rowCount || 0;
+};
+
+const deleteItemBomRoutingByBomAndRouting = async (
+  client,
+  bomId,
+  routingId
+) => {
+  const bomIdText = toText(bomId);
+  const routingIdText = toText(routingId);
+
+  if (!bomIdText) {
+    throw new Error(
+      "Cannot delete from item_bom_routing: bom_id is required"
+    );
+  }
+
+  let query = `
+    DELETE FROM item_bom_routing
+    WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+  `;
+  const params = [bomIdText];
+
+  if (routingIdText) {
+    query += ` AND TRIM(CAST(routing_id AS TEXT)) = $2`;
+    params.push(routingIdText);
+  }
+
+  query += ` RETURNING bom_id, routing_id`;
+
+  const deleteResult = await client.query(query, params);
+
+  if (!deleteResult.rowCount) {
+    throw new Error(
+      `Delete failed in item_bom_routing: no row matched bom_id=${bomIdText}${routingIdText ? ` and routing_id=${routingIdText}` : ""
+      }`
+    );
+  }
+
+  return deleteResult.rows || [];
+};
+
+/* =========================================================
+   BigQuery helpers
+========================================================= */
 const getBigQueryConfig = () => {
   const projectId = process.env.BQ_PROJECT_ID;
   const dataset = process.env.BQ_DATASET;
@@ -30,14 +367,6 @@ const runBigQuery = async (query, params = {}) => {
   return rows;
 };
 
-/**
- * Example:
- *   bom_id     = PRIMARY_Item000_Location 1
- *   routing_id = PRIMARY_Item000_Resource1
- *
- * Shared base key should be:
- *   PRIMARY_Item000
- */
 const getBaseKeyFromBomId = (bomId) => {
   const value = normalizeText(bomId);
   if (!value) return "";
@@ -75,7 +404,6 @@ const getBaseKeyAndResourceFromRoutingId = (routingId) => {
 
 /* =========================================================
    1) Dedicated API: item_master + item_releaseflag
-   GET /api/tables/items-with-releaseflag
 ========================================================= */
 router.get("/items-with-releaseflag", async (req, res) => {
   try {
@@ -106,7 +434,6 @@ router.get("/items-with-releaseflag", async (req, res) => {
 
 /* =========================================================
    2) Dedicated API: selected item(s) -> bom_produced -> location_master
-   POST /api/tables/locations-by-items
 ========================================================= */
 router.post("/locations-by-items", async (req, res) => {
   try {
@@ -152,16 +479,10 @@ router.post("/locations-by-items", async (req, res) => {
 });
 
 /* =========================================================
-   3) NEW API: Existing BOM search rows for Step 1
-   GET /api/tables/existing-bom-search
+   3) Existing BOM search rows for Step 1
 ========================================================= */
 router.get("/existing-bom-search", async (req, res) => {
   try {
-    /* ---------------------------------------------
-       STEP A: PostgreSQL -> Base produced rows
-       Pick one base produced item per BOM ID
-       Prefer erp_bom_qty_produced_per = 1 to avoid co-products
-    --------------------------------------------- */
     const producedResult = await pool.query(`
       WITH ranked_produced AS (
         SELECT
@@ -191,11 +512,6 @@ router.get("/existing-bom-search", async (req, res) => {
       ORDER BY location, produced_item, bom_id
     `);
 
-    /* ---------------------------------------------
-       STEP B: PostgreSQL -> routing_id rows
-       Resource comes from routing_id
-       Format: Routing_Item_Resource
-    --------------------------------------------- */
     const routingResult = await pool.query(`
       SELECT DISTINCT
         TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id
@@ -205,9 +521,6 @@ router.get("/existing-bom-search", async (req, res) => {
       ORDER BY TRIM(CAST(ibr.routing_id AS TEXT))
     `);
 
-    /* ---------------------------------------------
-       STEP C: BigQuery -> item_master + item_releaseflag
-    --------------------------------------------- */
     const { projectId, dataset } = getBigQueryConfig();
 
     const itemMasterRows = await runBigQuery(`
@@ -220,9 +533,6 @@ router.get("/existing-bom-search", async (req, res) => {
       FROM \`${projectId}.${dataset}.item_releaseflag\`
     `);
 
-    /* ---------------------------------------------
-       STEP D: Build lookup maps
-    --------------------------------------------- */
     const itemDescMap = new Map();
     for (const row of itemMasterRows) {
       const itemKey = normalizeUpper(row.item);
@@ -230,10 +540,10 @@ router.get("/existing-bom-search", async (req, res) => {
 
       const description = normalizeText(
         row.item_description ??
-          row.description ??
-          row.item_desc ??
-          row.item_desc_1 ??
-          ""
+        row.description ??
+        row.item_desc ??
+        row.item_desc_1 ??
+        ""
       );
 
       if (!itemDescMap.has(itemKey)) {
@@ -248,10 +558,10 @@ router.get("/existing-bom-search", async (req, res) => {
 
       const releaseFlag = normalizeText(
         row.item_releaseflag ??
-          row.release_flag ??
-          row.releaseflag ??
-          row.mrp_release_flag ??
-          ""
+        row.release_flag ??
+        row.releaseflag ??
+        row.mrp_release_flag ??
+        ""
       );
 
       if (!releaseFlagMap.has(itemKey)) {
@@ -259,20 +569,15 @@ router.get("/existing-bom-search", async (req, res) => {
       }
     }
 
-    /* ---------------------------------------------
-       STEP E: Group resources by derived base key
-       Example:
-         routing_id = PRIMARY_Item000_Resource1
-         baseKey    = PRIMARY_Item000
-         resource   = Resource1
-    --------------------------------------------- */
     const resourcesByBaseKey = new Map();
 
     for (const row of routingResult.rows) {
       const routingId = normalizeText(row.routing_id);
       if (!routingId) continue;
 
-      const { baseKey, resource } = getBaseKeyAndResourceFromRoutingId(routingId);
+      const { baseKey, resource } = getBaseKeyAndResourceFromRoutingId(
+        routingId
+      );
 
       if (!baseKey || !resource) continue;
 
@@ -286,10 +591,6 @@ router.get("/existing-bom-search", async (req, res) => {
       }
     }
 
-    /* ---------------------------------------------
-       STEP F: Merge rows
-       Match bom_produced.bom_id to routing_id using derived base key
-    --------------------------------------------- */
     const mergedRows = [];
 
     for (const row of producedResult.rows) {
@@ -346,7 +647,1137 @@ router.get("/existing-bom-search", async (req, res) => {
 });
 
 /* =========================================================
-   4) Generic GET ALL RECORDS FROM TABLE
+   4) CREATE ITEM BOM ROUTING + CHANGE LOG
+========================================================= */
+router.post("/item-bom-routing/create", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const {
+      bomId = "",
+      producedItem = "",
+      itemReleaseFlag = "",
+      location = "",
+      resource = "",
+      resourceRelevancy = "",
+      routingId = "",
+      addConnectedCoProduct = false,
+      coProductItem = "",
+      notes = "",
+      changeType = "Add",
+      user = {},
+    } = req.body || {};
+
+    const changedByUserId =
+      String(user?.userId || "").trim() || "SYSTEM_USER";
+    const changedByUserName =
+      String(user?.userName || "").trim() || "SYSTEM_USER";
+
+    if (!bomId || !producedItem || !location || !resource || !routingId) {
+      return res.status(400).json({
+        error:
+          "bomId, producedItem, location, resource, and routingId are required",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const engineeringChangeId = generateUniqueId("EC-");
+    const trxnSetId = generateUniqueId("TRXN-");
+    const changeLogId = generateUniqueId("U-");
+    const now = new Date();
+
+    const itemBomRoutingColumns = await getExistingColumns(
+      client,
+      "item_bom_routing"
+    );
+
+    const changeLogColumns = await getExistingColumns(
+      client,
+      "planning_bom_change_log_summary"
+    );
+
+    const itemBomRoutingData = {
+      routing_id: routingId,
+      bom_id: bomId,
+      item: producedItem,
+      produced_item: producedItem,
+      location,
+      resource,
+      resource_relevancy: resourceRelevancy,
+      resource_planning_relevance: resourceRelevancy,
+      item_release_flag: itemReleaseFlag,
+      connected_coproduct_item: addConnectedCoProduct ? coProductItem : "",
+      co_product_item: addConnectedCoProduct ? coProductItem : "",
+      notes,
+      engineering_change_id: engineeringChangeId,
+      trxn_set_id: trxnSetId,
+      trxn_creation_date: now,
+      trxn_by_user_name: changedByUserName,
+      changed_by_user_id: changedByUserId,
+      change_type: changeType,
+    };
+
+    const itemInsert = buildInsertQuery(
+      "item_bom_routing",
+      itemBomRoutingData,
+      itemBomRoutingColumns
+    );
+
+    const insertedItemBomRouting = await client.query(
+      itemInsert.query,
+      itemInsert.values
+    );
+
+    const insertedRow = insertedItemBomRouting.rows?.[0] || {};
+
+    let postgresqlRecId =
+      insertedRow.rec_id ??
+      insertedRow.postgresql_rec_id ??
+      insertedRow.id ??
+      null;
+
+    if (postgresqlRecId === null || postgresqlRecId === undefined) {
+      try {
+        const lookupConditions = [];
+        const lookupValues = [];
+        let idx = 1;
+
+        if (itemBomRoutingColumns.includes("routing_id")) {
+          lookupConditions.push(`routing_id = $${idx++}`);
+          lookupValues.push(routingId);
+        }
+
+        if (itemBomRoutingColumns.includes("bom_id")) {
+          lookupConditions.push(`bom_id = $${idx++}`);
+          lookupValues.push(bomId);
+        }
+
+        if (itemBomRoutingColumns.includes("location")) {
+          lookupConditions.push(`location = $${idx++}`);
+          lookupValues.push(location);
+        }
+
+        if (lookupConditions.length > 0) {
+          const idSelectColumn = itemBomRoutingColumns.includes("rec_id")
+            ? "rec_id"
+            : itemBomRoutingColumns.includes("postgresql_rec_id")
+              ? "postgresql_rec_id"
+              : itemBomRoutingColumns.includes("id")
+                ? "id"
+                : null;
+
+          if (idSelectColumn) {
+            const lookupQuery = `
+              SELECT ${idSelectColumn} AS resolved_id
+              FROM item_bom_routing
+              WHERE ${lookupConditions.join(" AND ")}
+              ORDER BY ${idSelectColumn} DESC
+              LIMIT 1
+            `;
+
+            const lookupResult = await client.query(lookupQuery, lookupValues);
+            postgresqlRecId = lookupResult.rows?.[0]?.resolved_id ?? null;
+          }
+        }
+      } catch (lookupError) {
+        console.error("Lookup warning (item_bom_routing rec_id):", lookupError);
+      }
+    }
+
+    const changeLogRecId = generateUniqueBigInt();
+
+    if (postgresqlRecId === null || postgresqlRecId === undefined) {
+      postgresqlRecId = changeLogRecId;
+    }
+
+    const changeLogData = {
+      rec_id: changeLogRecId,
+      engineering_change_id: engineeringChangeId,
+      postgresql_rec_id: postgresqlRecId,
+      change_type: changeType,
+      target_table: "item_bom_routing",
+      bom_id: bomId,
+      produced_item: producedItem,
+      location,
+      change_date: now.toISOString().slice(0, 10),
+      user_name: changedByUserName,
+    };
+
+    // store resource
+    if (changeLogColumns.includes("resource")) {
+      changeLogData.resource = resource;
+    }
+    if (changeLogColumns.includes("resources")) {
+      changeLogData.resources = resource;
+    }
+
+    // store summary notes from ReviewSummary.jsx textarea
+    if (changeLogColumns.includes("summarynotes")) {
+      changeLogData.summarynotes = notes || "";
+    }
+
+    // optional backward compatibility
+    if (changeLogColumns.includes("notes")) {
+      changeLogData.notes = notes || "";
+    }
+
+    // optional better UI summary text
+    if (changeLogColumns.includes("change_summary")) {
+      changeLogData.change_summary = notes || "item_bom_routing";
+    }
+
+    const changeLogInsert = buildInsertQuery(
+      "planning_bom_change_log_summary",
+      changeLogData,
+      changeLogColumns
+    );
+
+    await client.query(changeLogInsert.query, changeLogInsert.values);
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      success: true,
+      message: "Item BOM routing record created successfully",
+      data: {
+        engineeringChangeId,
+        trxnSetId,
+        changeLogId,
+        postgresqlRecId,
+        recId: changeLogRecId,
+        routingId,
+        bomId,
+        producedItem,
+        location,
+        resource,
+      },
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("DB Error (item-bom-routing/create):", error);
+    return res.status(500).json({
+      error: "Failed to create item BOM routing record",
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   DELETE BOM - Step 2 Summary
+========================================================= */
+router.get("/delete-bom/summary", async (req, res) => {
+  try {
+    const bomIds = normalizeTextArray(
+      req.query.bomIds || req.query.bomId || req.query["bomIds[]"]
+    );
+
+    if (!bomIds.length) {
+      return res.status(400).json({
+        error: "bomIds is required",
+      });
+    }
+
+    const summaryResult = await pool.query(
+      `
+        WITH ranked_produced AS (
+          SELECT
+            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(bp.item AS TEXT)) AS produced_item,
+            TRIM(CAST(bp.location AS TEXT)) AS location,
+            '' AS produced_item_desc,
+            ROW_NUMBER() OVER (
+              PARTITION BY TRIM(CAST(bp.bom_id AS TEXT))
+              ORDER BY
+                CASE
+                  WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
+                    THEN 0
+                  ELSE 1
+                END,
+                TRIM(CAST(bp.item AS TEXT))
+            ) AS rn
+          FROM bom_produced bp
+          WHERE TRIM(CAST(bp.bom_id AS TEXT)) = ANY($1::text[])
+        )
+        SELECT
+          bom_id,
+          produced_item,
+          produced_item_desc,
+          location
+        FROM ranked_produced
+        WHERE rn = 1
+        ORDER BY bom_id
+      `,
+      [bomIds]
+    );
+
+    const routingResult = await pool.query(
+      `
+        SELECT
+          TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+          COALESCE(
+            NULLIF(
+              TRIM(
+                CAST(
+                  regexp_replace(CAST(ibr.routing_id AS TEXT), '^.*_', '')
+                  AS TEXT
+                )
+              ),
+              ''
+            ),
+            ''
+          ) AS resource,
+          TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id
+        FROM item_bom_routing ibr
+        WHERE TRIM(CAST(ibr.bom_id AS TEXT)) = ANY($1::text[])
+        ORDER BY
+          TRIM(CAST(ibr.bom_id AS TEXT)),
+          TRIM(CAST(ibr.routing_id AS TEXT))
+      `,
+      [bomIds]
+    );
+
+    const countsResult = await pool.query(
+      `
+        SELECT 'bom_parameters' AS table_name, COUNT(*)::int AS row_count
+        FROM bom_parameters
+        WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
+
+        UNION ALL
+
+        SELECT 'bom_produced' AS table_name, COUNT(*)::int AS row_count
+        FROM bom_produced
+        WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
+
+        UNION ALL
+
+        SELECT 'bom_consumed' AS table_name, COUNT(*)::int AS row_count
+        FROM bom_consumed
+        WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
+
+        UNION ALL
+
+        SELECT 'item_bom_routing' AS table_name, COUNT(*)::int AS row_count
+        FROM item_bom_routing
+        WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
+      `,
+      [bomIds]
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        bomSummary: summaryResult.rows || [],
+        routingSummary: routingResult.rows || [],
+        tableCounts: countsResult.rows || [],
+      },
+    });
+  } catch (error) {
+    console.error("DB Error (delete-bom/summary):", error);
+    return res.status(500).json({
+      error: "Failed to fetch delete BOM summary",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================================================
+   DELETE BOM - Execute permanent delete with archive
+========================================================= */
+router.post("/delete-bom/execute", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const bomIds = normalizeTextArray(req.body?.bomIds);
+    const notes = toText(req.body?.notes);
+    const userId = toText(req.body?.user || req.body?.createdBy || "system");
+
+    if (!bomIds.length) {
+      return res.status(400).json({
+        error: "bomIds must be a non-empty array",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const engineeringChangeId = generateDeleteBomEngineeringChangeId();
+
+    const ogRecIds = {
+      bom_parameters_og: [],
+      bom_produced_og: [],
+      bom_consumed_og: [],
+      item_bom_routing_og: [],
+    };
+
+    const movedCounts = {
+      bom_parameters: 0,
+      bom_produced: 0,
+      bom_consumed: 0,
+      item_bom_routing: 0,
+    };
+
+    for (const [sourceTable, archiveTable] of Object.entries(
+      DELETE_BOM_SOURCE_TO_ARCHIVE
+    )) {
+      const archiveExists = await pgTableExists(client, archiveTable);
+      if (!archiveExists) {
+        throw new Error(`Archive table ${archiveTable} does not exist`);
+      }
+
+      const sourceResult = await client.query(
+        `SELECT * FROM ${quoteIdent(sourceTable)} WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])`,
+        [bomIds]
+      );
+
+      const sourceRows = sourceResult.rows || [];
+      if (!sourceRows.length) {
+        continue;
+      }
+
+      const archiveColumns = await getExistingColumns(client, archiveTable);
+
+      for (const row of sourceRows) {
+        const archiveRow = buildDeleteBomArchiveRow({
+          baseRow: row,
+          archiveColumns,
+          engineeringChangeId,
+          notes,
+          sourceTable,
+        });
+
+        const { query, values } = buildDynamicInsertQuery(
+          archiveTable,
+          archiveRow,
+          archiveColumns
+        );
+
+        const inserted = await client.query(query, values);
+        const insertedRow = inserted.rows?.[0] || {};
+
+        const recId =
+          insertedRow.rec_id ??
+          insertedRow.record_id ??
+          insertedRow.recordid ??
+          null;
+
+        if (recId != null) {
+          ogRecIds[archiveTable].push(String(recId));
+        }
+      }
+
+      // DELETE USING BOM_ID ONLY
+      const deletedCount = await deleteRowsByBomId(client, sourceTable, bomIds);
+      movedCounts[sourceTable] = deletedCount;
+    }
+
+    const changeLogTable = await insertDeleteBomChangeLogIfAvailable({
+      client,
+      engineeringChangeId,
+      bomIds,
+      notes,
+      userId,
+    });
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      success: true,
+      message:
+        "Selected BOM records were permanently deleted and archived successfully.",
+      engineeringChangeId,
+      changeType: "deleteBOM",
+      bomIds,
+      movedCounts,
+      ogRecIds,
+      changeLogTable,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("DB Error (delete-bom/execute):", error);
+    return res.status(500).json({
+      error: "Failed to delete and archive selected BOM records",
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/* =========================================================
+   EXISTING ITEM BOM ROUTING SEARCH - Step 1
+========================================================= */
+router.get("/existing-item-bom-routing-search", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        TRIM(CAST(ibr.rec_id AS TEXT)) AS rec_id,
+        TRIM(CAST(ibr.item AS TEXT)) AS item,
+        TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+        TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id,
+
+        COALESCE(
+          NULLIF(
+            SUBSTRING(
+              TRIM(CAST(ibr.routing_id AS TEXT))
+              FROM '^[^_]+_[^_]+_([^_]+)_[^_]+$'
+            ),
+            ''
+          ),
+          ''
+        ) AS location,
+
+        COALESCE(
+          NULLIF(
+            SUBSTRING(
+              TRIM(CAST(ibr.routing_id AS TEXT))
+              FROM '^[^_]+_[^_]+_[^_]+_(.+)$'
+            ),
+            ''
+          ),
+          ''
+        ) AS resource
+
+      FROM item_bom_routing ibr
+      WHERE ibr.routing_id IS NOT NULL
+        AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
+      ORDER BY
+        TRIM(CAST(ibr.bom_id AS TEXT)),
+        TRIM(CAST(ibr.routing_id AS TEXT))
+    `);
+
+    return res.status(200).json({
+      success: true,
+      data: result.rows || [],
+    });
+  } catch (error) {
+    console.error("DB Error (existing-item-bom-routing-search):", error);
+    return res.status(500).json({
+      error: "Failed to fetch existing item BOM routing rows",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================================================
+   DELETE ITEM BOM ROUTING - Execute delete with archive
+========================================================= */
+router.post("/delete-item-bom-routing/execute", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const records = Array.isArray(req.body?.records) ? req.body.records : [];
+    const notes = String(req.body?.notes ?? "").trim();
+    const userId = String(req.body?.user || req.body?.createdBy || "system").trim();
+
+    if (!records.length) {
+      return res.status(400).json({
+        error: "records must be a non-empty array",
+      });
+    }
+
+    const archiveTable = "item_bom_routing_og";
+    const changeLogTable = "planning_bom_change_log_summary";
+
+    const archiveExists = await pgTableExists(client, archiveTable);
+    if (!archiveExists) {
+      return res.status(500).json({
+        error: "item_bom_routing_og table does not exist",
+      });
+    }
+
+    const changeLogExists = await pgTableExists(client, changeLogTable);
+    if (!changeLogExists) {
+      return res.status(500).json({
+        error: "planning_bom_change_log_summary table does not exist",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const engineeringChangeId =
+      generateDeleteItemBomRoutingEngineeringChangeId();
+
+    const archiveColumns = await getExistingColumns(client, archiveTable);
+    const changeLogColumns = await getExistingColumns(client, changeLogTable);
+
+    const archivedRecIds = [];
+    let movedCount = 0;
+
+    for (const record of records) {
+      const recId = String(record?.rec_id ?? "").trim();
+      const bomId = String(record?.bom_id ?? "").trim();
+      const routingId = String(record?.routing_id ?? "").trim();
+
+      if (!recId && !bomId && !routingId) {
+        continue;
+      }
+
+      const conditions = [];
+      const params = [];
+      let p = 1;
+
+      if (recId) {
+        conditions.push(`TRIM(CAST(rec_id AS TEXT)) = $${p++}`);
+        params.push(recId);
+      }
+      if (bomId) {
+        conditions.push(`TRIM(CAST(bom_id AS TEXT)) = $${p++}`);
+        params.push(bomId);
+      }
+      if (routingId) {
+        conditions.push(`TRIM(CAST(routing_id AS TEXT)) = $${p++}`);
+        params.push(routingId);
+      }
+
+      const sourceQuery = `
+        SELECT *
+        FROM item_bom_routing
+        WHERE ${conditions.join(" AND ")}
+      `;
+
+      const sourceResult = await client.query(sourceQuery, params);
+      const sourceRows = sourceResult.rows || [];
+
+      for (const row of sourceRows) {
+        const archiveRow = { ...row };
+
+        if (archiveColumns.includes("engineering_change_id")) {
+          archiveRow.engineering_change_id = engineeringChangeId;
+        }
+        if (archiveColumns.includes("engineeringchangeid")) {
+          archiveRow.engineeringchangeid = engineeringChangeId;
+        }
+        if (archiveColumns.includes("change_type")) {
+          archiveRow.change_type = "delete";
+        }
+        if (archiveColumns.includes("changetype")) {
+          archiveRow.changetype = "delete";
+        }
+        if (archiveColumns.includes("notes")) {
+          archiveRow.notes = notes || "";
+        }
+        if (archiveColumns.includes("source_table")) {
+          archiveRow.source_table = "item_bom_routing";
+        }
+        if (archiveColumns.includes("source_rec_id")) {
+          archiveRow.source_rec_id =
+            row.rec_id ?? row.record_id ?? row.recordid ?? null;
+        }
+        if (archiveColumns.includes("archived_at")) {
+          archiveRow.archived_at = new Date();
+        }
+        if (archiveColumns.includes("archived_on")) {
+          archiveRow.archived_on = new Date();
+        }
+        if (archiveColumns.includes("deleted_at")) {
+          archiveRow.deleted_at = new Date();
+        }
+        if (archiveColumns.includes("deleted_on")) {
+          archiveRow.deleted_on = new Date();
+        }
+
+        const { query: archiveInsertQuery, values: archiveInsertValues } =
+          buildDynamicInsertQuery(archiveTable, archiveRow, archiveColumns);
+
+        const archiveInsertResult = await client.query(
+          archiveInsertQuery,
+          archiveInsertValues
+        );
+
+        const insertedOgRow = archiveInsertResult.rows?.[0] || {};
+
+        // DO NOT FAIL IF _og DOES NOT RETURN rec_id
+        const ogRecId =
+          insertedOgRow.rec_id ??
+          insertedOgRow.record_id ??
+          insertedOgRow.recordid ??
+          null;
+
+        if (ogRecId != null) {
+          archivedRecIds.push(String(ogRecId));
+        }
+
+        // Separate planning_bom_change_log_summary row per deleted record
+        const changeLogRow = {};
+        const changeLogRecId = generateUniqueBigInt();
+
+        if (changeLogColumns.includes("rec_id")) {
+          changeLogRow.rec_id = changeLogRecId;
+        }
+        if (changeLogColumns.includes("record_id")) {
+          changeLogRow.record_id = changeLogRecId;
+        }
+
+        if (changeLogColumns.includes("engineering_change_id")) {
+          changeLogRow.engineering_change_id = engineeringChangeId;
+        }
+        if (changeLogColumns.includes("engineeringchangeid")) {
+          changeLogRow.engineeringchangeid = engineeringChangeId;
+        }
+
+        if (changeLogColumns.includes("change_type")) {
+          changeLogRow.change_type = "delete";
+        }
+        if (changeLogColumns.includes("changetype")) {
+          changeLogRow.changetype = "delete";
+        }
+
+        if (changeLogColumns.includes("bom_id")) {
+          changeLogRow.bom_id = row.bom_id ?? null;
+        }
+        if (changeLogColumns.includes("routing_id")) {
+          changeLogRow.routing_id = row.routing_id ?? null;
+        }
+        if (changeLogColumns.includes("item")) {
+          changeLogRow.item = row.item ?? null;
+        }
+
+        if (changeLogColumns.includes("notes")) {
+          changeLogRow.notes = notes || "";
+        }
+
+        if (changeLogColumns.includes("created_by")) {
+          changeLogRow.created_by = userId || "system";
+        }
+        if (changeLogColumns.includes("updated_by")) {
+          changeLogRow.updated_by = userId || "system";
+        }
+        if (changeLogColumns.includes("created_at")) {
+          changeLogRow.created_at = new Date();
+        }
+        if (changeLogColumns.includes("created_on")) {
+          changeLogRow.created_on = new Date();
+        }
+        if (changeLogColumns.includes("status")) {
+          changeLogRow.status = "COMPLETED";
+        }
+
+        const { query: changeLogInsertQuery, values: changeLogInsertValues } =
+          buildDynamicInsertQuery(
+            changeLogTable,
+            changeLogRow,
+            changeLogColumns
+          );
+
+        await client.query(changeLogInsertQuery, changeLogInsertValues);
+
+        // DELETE USING bom_id + routing_id
+        await deleteItemBomRoutingByBomAndRouting(
+          client,
+          row.bom_id,
+          row.routing_id
+        );
+
+        movedCount += 1;
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      success: true,
+      message: "Selected Item BOM Routing records were deleted successfully.",
+      engineeringChangeId,
+      changeType: "delete",
+      movedCount,
+      archivedRecIds,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("DB Error (delete-item-bom-routing/execute):", error);
+    return res.status(500).json({
+      error: "Failed to delete item BOM routing records",
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+/* =========================================================
+   ENGINEERING CHANGE LOG SUMMARY
+   GET /api/tables/engineering-change-log
+   Fetch logs from planning_bom_change_log_summary (PostgreSQL)
+========================================================= */
+router.get("/engineering-change-log", async (req, res) => {
+  try {
+    const columns = await getExistingColumns(
+      { query: (...args) => pool.query(...args) },
+      "planning_bom_change_log_summary"
+    );
+
+    if (!columns || columns.length === 0) {
+      return res.status(500).json({
+        error: "planning_bom_change_log_summary table columns could not be resolved",
+      });
+    }
+
+    const selectParts = [];
+
+    // Engineering Change #
+    if (columns.includes("engineering_change_id")) {
+      selectParts.push(`CAST(engineering_change_id AS TEXT) AS engineering_change_id`);
+    } else if (columns.includes("engineeringchangeid")) {
+      selectParts.push(`CAST(engineeringchangeid AS TEXT) AS engineering_change_id`);
+    } else {
+      selectParts.push(`'' AS engineering_change_id`);
+    }
+
+    // Change Date
+    if (columns.includes("change_date")) {
+      selectParts.push(`CAST(change_date AS TEXT) AS change_date`);
+    } else if (columns.includes("created_at")) {
+      selectParts.push(`CAST(created_at AS TEXT) AS change_date`);
+    } else if (columns.includes("created_on")) {
+      selectParts.push(`CAST(created_on AS TEXT) AS change_date`);
+    } else {
+      selectParts.push(`'' AS change_date`);
+    }
+
+    // Change Type
+    if (columns.includes("change_type")) {
+      selectParts.push(`CAST(change_type AS TEXT) AS change_type`);
+    } else if (columns.includes("changetype")) {
+      selectParts.push(`CAST(changetype AS TEXT) AS change_type`);
+    } else {
+      selectParts.push(`'' AS change_type`);
+    }
+
+    // Location(s)
+    if (columns.includes("location")) {
+      selectParts.push(`CAST(location AS TEXT) AS locations`);
+    } else if (columns.includes("locations")) {
+      selectParts.push(`CAST(locations AS TEXT) AS locations`);
+    } else {
+      selectParts.push(`'' AS locations`);
+    }
+
+    // BOM ID(s)
+    if (columns.includes("bom_id")) {
+      selectParts.push(`CAST(bom_id AS TEXT) AS bom_ids`);
+    } else if (columns.includes("bom_ids")) {
+      selectParts.push(`CAST(bom_ids AS TEXT) AS bom_ids`);
+    } else {
+      selectParts.push(`'' AS bom_ids`);
+    }
+
+
+    // Resource(s)
+    if (columns.includes("resource")) {
+      selectParts.push(`CAST(resource AS TEXT) AS resources`);
+    } else if (columns.includes("resources")) {
+      selectParts.push(`CAST(resources AS TEXT) AS resources`);
+    } else if (columns.includes("routing_id")) {
+      selectParts.push(`CAST(routing_id AS TEXT) AS resources`);
+    } else {
+      selectParts.push(`'' AS resources`);
+    }
+
+    // User
+    if (columns.includes("user_name")) {
+      selectParts.push(`CAST(user_name AS TEXT) AS user_name`);
+    } else if (columns.includes("created_by")) {
+      selectParts.push(`CAST(created_by AS TEXT) AS user_name`);
+    } else if (columns.includes("updated_by")) {
+      selectParts.push(`CAST(updated_by AS TEXT) AS user_name`);
+    } else {
+      selectParts.push(`'' AS user_name`);
+    }
+
+    // Change Summary
+    if (columns.includes("summarynotes")) {
+      selectParts.push(`CAST(summarynotes AS TEXT) AS change_summary`);
+    } else if (columns.includes("change_summary")) {
+      selectParts.push(`CAST(change_summary AS TEXT) AS change_summary`);
+    } else if (columns.includes("notes")) {
+      selectParts.push(`CAST(notes AS TEXT) AS change_summary`);
+    } else if (columns.includes("target_table")) {
+      selectParts.push(`CAST(target_table AS TEXT) AS change_summary`);
+    } else {
+      selectParts.push(`'' AS change_summary`);
+    }
+
+    // Optional raw rec_id for debugging/reference
+    if (columns.includes("rec_id")) {
+      selectParts.push(`CAST(rec_id AS TEXT) AS rec_id`);
+    } else if (columns.includes("record_id")) {
+      selectParts.push(`CAST(record_id AS TEXT) AS rec_id`);
+    } else {
+      selectParts.push(`'' AS rec_id`);
+    }
+
+    const orderBy =
+      columns.includes("created_at")
+        ? `ORDER BY created_at DESC`
+        : columns.includes("created_on")
+          ? `ORDER BY created_on DESC`
+          : columns.includes("change_date")
+            ? `ORDER BY change_date DESC`
+            : columns.includes("engineering_change_id")
+              ? `ORDER BY engineering_change_id DESC`
+              : ``;
+
+    const query = `
+      SELECT
+        ${selectParts.join(",\n        ")}
+      FROM planning_bom_change_log_summary
+      ${orderBy}
+    `;
+
+    const result = await pool.query(query);
+
+    return res.status(200).json({
+      success: true,
+      data: result.rows || [],
+    });
+  } catch (error) {
+    console.error("DB Error (engineering-change-log):", error);
+    return res.status(500).json({
+      error: "Failed to fetch engineering change log",
+      details: error.message,
+    });
+  }
+});
+
+router.get("/engineering-changes-detail-add", async (req, res) => {
+  try {
+    const engineeringChangeId = String(
+      req.query.changeID || req.query.engineeringChangeId || ""
+    ).trim();
+
+    const bomId = String(req.query.bomID || req.query.bomId || "").trim();
+    const resource = String(req.query.resource || "").trim();
+
+    let location = String(req.query.location || "").trim();
+    let producedItem = String(req.query.producedItem || req.query.item || "").trim();
+
+    // Derive item + location from BOM ID format: BOMID_ITEM_LOCATION
+    // Example: BOM3_HRL00123_1007
+    if (bomId) {
+      const bomParts = bomId.split("_");
+
+      if (!producedItem && bomParts.length >= 3) {
+        producedItem = String(bomParts[1] || "").trim();
+      }
+
+      if (!location && bomParts.length >= 3) {
+        location = String(bomParts[2] || "").trim();
+      }
+    }
+
+    if (!engineeringChangeId || !bomId || !location) {
+      return res.status(400).json({
+        error:
+          "engineeringChangeId/changeID and bomId/bomID are required. Location is derived from BOM ID if not passed.",
+        details: {
+          engineeringChangeId,
+          bomId,
+          derivedLocation: location || "",
+        },
+      });
+    }
+
+    // 1) Fetch from planning_bom_change_log_summary first
+    const summaryQuery = `
+  SELECT
+    engineering_change_id,
+    change_type,
+    target_table,
+    bom_id,
+    produced_item,
+    location,
+    resource,
+    summarynotes,
+    change_date,
+    user_name
+  FROM planning_bom_change_log_summary
+  WHERE engineering_change_id = $1
+    AND bom_id = $2
+    AND ($3 = '' OR location = $3)
+    AND LOWER(change_type) LIKE 'add%'
+  ORDER BY change_date DESC, engineering_change_id DESC
+`;
+
+
+
+    const summaryResult = await pool.query(summaryQuery, [
+      engineeringChangeId,
+      bomId,
+      location,
+    ]);
+
+
+
+    const summaryRows = summaryResult.rows || [];
+
+    if (!summaryRows.length) {
+      return res.status(404).json({
+        error: "No matching add-change rows found in planning_bom_change_log_summary",
+        details: {
+          engineeringChangeId,
+          bomId,
+          location,
+        },
+      });
+    }
+
+    const firstSummaryRow = summaryRows[0] || {};
+
+    const resolvedLocation =
+      location || String(firstSummaryRow.location || "").trim();
+
+    const resolvedResource =
+      resource || String(firstSummaryRow.resource || "").trim();
+
+
+    // Prefer produced_item from summary log if available
+    if (!producedItem) {
+      producedItem = String(firstSummaryRow.produced_item || "").trim();
+    }
+
+    // fallback again from bomId if still empty
+    if (!producedItem && bomId) {
+      const bomParts = bomId.split("_");
+      if (bomParts.length >= 3) {
+        producedItem = String(bomParts[1] || "").trim();
+      }
+    }
+
+    const changeDate = firstSummaryRow.change_date || "";
+    const userName = firstSummaryRow.user_name || "";
+
+    // Expected routing id only if resource is passed from log/frontend
+    const expectedRoutingId =
+      producedItem && resolvedLocation && resolvedResource
+        ? `ROUTING_${producedItem}_${resolvedLocation}_${resolvedResource}`
+        : "";
+
+    // 2) Fetch from bom_produced
+
+    const producedQuery = `
+  SELECT *
+  FROM bom_produced
+  WHERE bom_id = $1
+    AND location = $2
+    AND ($3 = '' OR item = $3)
+  ORDER BY load_datetime DESC NULLS LAST
+  LIMIT 1
+`;
+
+
+
+    // 3) Fetch from bom_consumed
+
+    const consumedQuery = `
+  SELECT *
+  FROM bom_consumed
+  WHERE bom_id = $1
+    AND location = $2
+  ORDER BY load_datetime DESC NULLS LAST
+`;
+
+
+
+    // 4) Fetch from item_bom_routing
+    // item_bom_routing has item, bom_id, routing_id
+    // no location column, no resource column
+
+    const routingQuery = `
+  SELECT *
+  FROM item_bom_routing
+  WHERE bom_id = $1
+    AND ($2 = '' OR item = $2)
+    AND ($3 = '' OR routing_id = $3)
+  ORDER BY load_datetime DESC NULLS LAST
+  LIMIT 1
+`;
+
+
+    // 5) Fetch from bom_parameters
+    // bom_parameters only has bom_id + date columns
+
+    const parameterQuery = `
+  SELECT *
+  FROM bom_parameters
+  WHERE bom_id = $1
+  ORDER BY load_datetime DESC NULLS LAST
+  LIMIT 1
+`;
+
+
+
+    const producedResult = await pool.query(producedQuery, [
+      bomId,
+      location,
+      producedItem,
+    ]);
+
+    const consumedResult = await pool.query(consumedQuery, [
+      bomId,
+      location,
+    ]);
+
+    const routingResult = await pool.query(routingQuery, [
+      bomId,
+      producedItem,
+      expectedRoutingId,
+    ]);
+
+
+    const parameterResult = await pool.query(parameterQuery, [bomId]);
+
+
+    const bomProduced = producedResult.rows[0] || {};
+    const bomConsumedRows = consumedResult.rows || [];
+    const itemBomRouting = routingResult.rows[0] || {};
+    const bomParameters = parameterResult.rows[0] || {};
+
+    const resolvedItem =
+      producedItem ||
+      bomProduced.item ||
+      itemBomRouting.item ||
+      "";
+
+    const resolvedRoutingId =
+      itemBomRouting.routing_id ||
+      expectedRoutingId ||
+      "";
+
+    return res.json({
+      engineeringChangeId,
+      changeDate,
+      user: userName,
+      changeType: "Added",
+
+      item: resolvedItem,
+      location: resolvedLocation,
+      bomId,
+      resource: resolvedResource,
+      routingId: resolvedRoutingId,
+
+      itemReleaseFlag: "",
+      resourceRelevancy: "",
+      summaryNotes: firstSummaryRow.summarynotes || "",
+
+      summaryLogRows: summaryRows,
+      bomProduced,
+      bomConsumedRows,
+      itemBomRouting,
+      bomParameters,
+    });
+
+  } catch (error) {
+    console.error("DB Error (engineering-changes-detail-add):", error);
+    return res.status(500).json({
+      error: "Failed to fetch engineering add detail",
+      details: error.message,
+    });
+  }
+});
+
+/* =========================================================
+   5) Generic GET ALL RECORDS FROM TABLE
 ========================================================= */
 router.get("/:tableName", async (req, res) => {
   const { tableName } = req.params;
@@ -376,7 +1807,7 @@ router.get("/:tableName", async (req, res) => {
 });
 
 /* =========================================================
-   5) Generic GET SINGLE RECORD BY ID
+   6) Generic GET SINGLE RECORD BY ID
 ========================================================= */
 const allowedTables = [
   "item_bom_routing",
