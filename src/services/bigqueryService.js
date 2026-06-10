@@ -1,11 +1,11 @@
 import { BigQuery } from "@google-cloud/bigquery";
 
 const bigquery = new BigQuery({
-  projectId: process.env.BQ_PROJECT_ID,
+  projectId: process.env.BQ_PROJECT_ID || process.env.GCP_PROJECT_ID,
 });
 
 const getBigQueryConfig = () => {
-  const projectId = process.env.BQ_PROJECT_ID;
+  const projectId = process.env.BQ_PROJECT_ID || process.env.GCP_PROJECT_ID;
   const dataset = process.env.BQ_DATASET;
 
   if (!projectId || !dataset) {
