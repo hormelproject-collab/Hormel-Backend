@@ -4,12 +4,18 @@ import {
   fetchItemMasterWithReleaseFlag,
   fetchLocationsBySelectedItems,
   fetchResourceComponentMetadata,
+  fetchExistingBomSearchRows,
+  fetchBomIdsFromBomParameters,
+  fetchBomDetailsByBomId,
+  fetchAllResourcesFromRoutingResCons,
+  fetchResourceRelevancyByResource,
+  fetchCoProductsByItem,
 } from "../services/bigqueryService.js";
 
 const router = express.Router();
 
 /* =========================================================
-   Allowed dynamic GCP tables for frontend
+ Allowed dynamic GCP tables for frontend
 ========================================================= */
 const ALLOWED_BIGQUERY_TABLES = [
   "item_master",
@@ -21,13 +27,13 @@ const ALLOWED_BIGQUERY_TABLES = [
   "resource_master",
   "routing_rescons",
   "resource_rescons",
+  "bom_parameters",
 ];
 
 const normalizeLimit = (limit) => {
   if (limit === undefined || limit === null || limit === "") return null;
 
   const text = String(limit).trim().toLowerCase();
-
   if (text === "all") return null;
 
   const parsed = Number(text);
@@ -37,12 +43,11 @@ const normalizeLimit = (limit) => {
 };
 
 /* =========================================================
-   1) Existing API: item_master + item_releaseflag
+ 1) Existing API: item_master + item_releaseflag
 ========================================================= */
 router.get("/item-master-with-releaseflag", async (req, res) => {
   try {
     const { limit, ...filters } = req.query;
-
     const data = await fetchItemMasterWithReleaseFlag(
       filters,
       limit === undefined ? null : limit
@@ -59,7 +64,7 @@ router.get("/item-master-with-releaseflag", async (req, res) => {
 });
 
 /* =========================================================
-   2) Existing API: selected item(s) -> bom_produced -> location_master
+ 2) Existing API: selected item(s) -> bom_produced -> location_master
 ========================================================= */
 router.post("/locations-by-items", async (req, res) => {
   try {
@@ -113,8 +118,7 @@ router.post("/by-items", async (req, res) => {
 });
 
 /* =========================================================
-   3) NEW API: Resource & Component Step metadata
-   Does NOT alter any existing API
+ 3) Existing API: Resource & Component Step metadata
 ========================================================= */
 router.post("/resource-component-metadata", async (req, res) => {
   try {
@@ -148,14 +152,7 @@ router.post("/resource-component-metadata", async (req, res) => {
 });
 
 /* =========================================================
-   4) NEW API: Existing BOM search rows for Step 1
-   Returns flattened joined rows from GCP:
-   - location from bom_produced
-   - produced item from bom_produced (base produced item only)
-   - produced item desc from item_master
-   - bom_id from bom_produced
-   - one row per resource via item_bom_routing + routing_rescons
-   - item release flag from item_releaseflag
+ 4) Existing API: Existing BOM search rows for Step 1
 ========================================================= */
 router.get("/existing-bom-search", async (req, res) => {
   try {
@@ -175,15 +172,142 @@ router.get("/existing-bom-search", async (req, res) => {
 });
 
 /* =========================================================
-   Keep existing generic route
+ 5) NEW API: Create Item BOM Routing Record - Step 1
 ========================================================= */
+
+/**
+ * Pull all BOM IDs from bom_parameters
+ */
+router.get("/bom-routing-step1/bom-ids", async (_req, res) => {
+  try {
+    const data = await fetchBomIdsFromBomParameters();
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching BOM IDs:", error);
+    return res.status(500).json({
+      error: "Failed to fetch BOM IDs",
+      details: error.message,
+    });
+  }
+});
+
+/**
+ * Based on BOM ID selected:
+ * - fetch produced item + location from bom_produced
+ * - fetch release flag from item_releaseflag
+ */
+router.get("/bom-routing-step1/bom-details/:bomId", async (req, res) => {
+  try {
+    const bomId = String(req.params.bomId || "").trim();
+
+    if (!bomId) {
+      return res.status(400).json({
+        error: "bomId is required",
+      });
+    }
+
+    const data = await fetchBomDetailsByBomId(bomId);
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching BOM details:", error);
+    return res.status(500).json({
+      error: "Failed to fetch BOM details",
+      details: error.message,
+    });
+  }
+});
+
+/**
+ * Pull all resources from routing_rescons
+ */
+router.get("/bom-routing-step1/resources", async (_req, res) => {
+  try {
+    const data = await fetchAllResourcesFromRoutingResCons();
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching resources:", error);
+    return res.status(500).json({
+      error: "Failed to fetch resources",
+      details: error.message,
+    });
+  }
+});
+
+/**
+ * Based on resource selected:
+ * fetch resource_planning_relevance from resource_master
+ */
+router.get("/bom-routing-step1/resource-relevancy/:resource", async (req, res) => {
+  try {
+    const resource = String(req.params.resource || "").trim();
+
+    if (!resource) {
+      return res.status(400).json({
+        error: "resource is required",
+      });
+    }
+
+    const data = await fetchResourceRelevancyByResource(resource);
+ console.error("resource relevancy:", data);
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching resource relevancy:", error);
+    return res.status(500).json({
+      error: "Failed to fetch resource relevancy",
+      details: error.message,
+    });
+  }
+});
+
+/**
+ * Co-product list from item_master for selected item
+ */
+router.get("/bom-routing-step1/co-products/:item", async (req, res) => {
+  try {
+    const item = String(req.params.item || "").trim();
+
+    if (!item) {
+      return res.status(400).json({
+        error: "item is required",
+      });
+    }
+
+    const data = await fetchCoProductsByItem(item);
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching co-products:", error);
+    return res.status(500).json({
+      error: "Failed to fetch co-products",
+      details: error.message,
+    });
+  }
+});
+
 /* =========================================================
-   Generic dynamic GCP table route for frontend
-   Supports:
-   - /api/bigquery/table/:table
-   - optional filters via query params
-   - ?limit=all  => no limit
-   - ?limit=100  => LIMIT 100
+ Generic dynamic GCP table route for frontend
+ Supports:
+ - /api/bigquery/table/:table
+ - optional filters via query params
+ - ?limit=all => no limit
+ - ?limit=100 => LIMIT 100
 ========================================================= */
 router.get("/:table", async (req, res) => {
   try {
@@ -199,7 +323,10 @@ router.get("/:table", async (req, res) => {
 
     const normalizedFilters = Object.fromEntries(
       Object.entries(filters).filter(
-        ([, value]) => value !== undefined && value !== null && String(value).trim() !== ""
+        ([, value]) =>
+          value !== undefined &&
+          value !== null &&
+          String(value).trim() !== ""
       )
     );
 
