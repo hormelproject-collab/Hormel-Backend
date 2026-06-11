@@ -146,10 +146,13 @@ export const fetchAllResourcesFromRoutingResCons = async () => {
 
   const query = `
     SELECT DISTINCT
-      TRIM(CAST(resource AS STRING)) AS resource
-    FROM \`${projectId}.${dataset}.routing_rescons\`
-    WHERE resource IS NOT NULL
-      AND TRIM(CAST(resource AS STRING)) != ''
+      TRIM(CAST(rr.resource AS STRING)) AS resource,
+      COALESCE(CAST(rm.resource_planning_relevance AS STRING), '') AS resource_planning_relevance
+    FROM \`${projectId}.${dataset}.routing_rescons\` rr
+    LEFT JOIN \`${projectId}.${dataset}.resource_master\` rm
+      ON UPPER(TRIM(CAST(rr.resource AS STRING))) = UPPER(TRIM(CAST(rm.resource AS STRING)))
+    WHERE rr.resource IS NOT NULL
+      AND TRIM(CAST(rr.resource AS STRING)) != ''
     ORDER BY resource
   `;
 
@@ -157,8 +160,69 @@ export const fetchAllResourcesFromRoutingResCons = async () => {
 
   return rows.map((row) => ({
     resource: normalizeText(row.resource),
+    resourcePlanningRelevance: pickFirstValue(row, [
+      "resource_planning_relevance",
+    ]),
   }));
 };
+
+  const resourceColumnCandidates = [
+    "resource",
+    "resource_id",
+    "res",
+  ];
+
+
+
+
+export const fetchItemReleaseFlagByItem = async (item) => {
+  const { projectId, dataset } = getBigQueryConfig();
+
+  const columns = await getTableColumns("item_releaseflag");
+
+  const releaseColumnCandidates = [
+    "release",
+    "release_flag",
+    "releaseflag",
+    "item_release_flag",
+    "planning_release_flag",
+    "status",
+  ];
+
+  const releaseColumn = releaseColumnCandidates.find((col) =>
+    columns.includes(col)
+  );
+
+  if (!releaseColumn) {
+    return {
+      item: normalizeText(item),
+      itemReleaseFlag: "",
+    };
+  }
+
+  const query = `
+    SELECT
+      TRIM(CAST(item AS STRING)) AS item,
+      COALESCE(CAST(${releaseColumn} AS STRING), '') AS release
+    FROM \`${projectId}.${dataset}.item_releaseflag\`
+    WHERE UPPER(TRIM(CAST(item AS STRING))) = @item
+    LIMIT 1
+  `;
+
+  const rows = await runQuery(query, {
+    item: normalizeUpper(item),
+  });
+
+  const row = rows?.[0] || {};
+
+  return {
+    item: normalizeText(item),
+    itemReleaseFlag: pickFirstValue(row, ["release"]),
+    release: pickFirstValue(row, ["release"]),
+  };
+};
+
+
 
 /**
  * Resource relevancy from resource_master
@@ -210,7 +274,44 @@ export const fetchBomIdsFromBomParameters = async () => {
     bomId: normalizeText(row.bom_id),
   }));
 };
+export const fetchCoProductsByBomId = async (bomId) => {
+  const { projectId, dataset } = getBigQueryConfig();
 
+  const columns = await getTableColumns("bom_consumed");
+
+  const itemColumnCandidates = [
+    "item",
+    "consumed_item",
+    "component_item",
+    "material_item",
+  ];
+
+  const itemColumn = itemColumnCandidates.find((col) =>
+    columns.includes(col)
+  );
+
+  if (!itemColumn) {
+    return [];
+  }
+
+  const query = `
+    SELECT DISTINCT
+      TRIM(CAST(${itemColumn} AS STRING)) AS item
+    FROM \`${projectId}.${dataset}.bom_consumed\`
+    WHERE UPPER(TRIM(CAST(bom_id AS STRING))) = @bomId
+      AND ${itemColumn} IS NOT NULL
+      AND TRIM(CAST(${itemColumn} AS STRING)) != ''
+    ORDER BY item
+  `;
+
+  const rows = await runQuery(query, {
+    bomId: normalizeUpper(bomId),
+  });
+
+  return rows.map((row) => ({
+    item: normalizeText(row.item),
+  }));
+};
 /**
  * Based on selected BOM ID:
  * 1) fetch produced item + location from bom_produced
@@ -261,12 +362,10 @@ export const fetchBomDetailsByBomId = async (bomId) => {
   let itemReleaseFlag = "";
 
   if (producedItem) {
-    const releaseQuery = `
-      SELECT *
-      FROM \`${projectId}.${dataset}.item_releaseflag\`
-      WHERE UPPER(TRIM(CAST(item AS STRING))) = @item
-      LIMIT 1
-    `;
+    const releaseData = await fetchItemReleaseFlagByItem(producedItem);
+    itemReleaseFlag = releaseData?.itemReleaseFlag || "";
+
+
 
     const releaseRows = await runQuery(releaseQuery, {
       item: normalizeUpper(producedItem),

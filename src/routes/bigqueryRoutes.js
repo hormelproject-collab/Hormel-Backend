@@ -10,7 +10,9 @@ import {
   fetchAllResourcesFromRoutingResCons,
   fetchResourceRelevancyByResource,
   fetchCoProductsByItem,
+  fetchItemReleaseFlagByItem,
 } from "../services/bigqueryService.js";
+
 
 const router = express.Router();
 
@@ -146,6 +148,31 @@ router.post("/resource-component-metadata", async (req, res) => {
     console.error("Error fetching resource component metadata:", error);
     return res.status(500).json({
       error: "Failed to fetch resource component metadata",
+      details: error.message,
+    });
+  }
+});
+
+router.get("/bom-routing-step1/item-releaseflag/:item", async (req, res) => {
+  try {
+    const item = String(req.params?.item || "").trim();
+
+    if (!item) {
+      return res.status(400).json({
+        error: "Item is required",
+      });
+    }
+
+    const data = await fetchItemReleaseFlagByItem(item);
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching item release flag:", error);
+    return res.status(500).json({
+      error: "Failed to fetch item release flag",
       details: error.message,
     });
   }
@@ -300,6 +327,33 @@ router.get("/bom-routing-step1/co-products/:item", async (req, res) => {
     });
   }
 });
+
+router.get("/bom-routing-step1/co-products/:bomId", async (req, res) => {
+  try {
+    const bomId = String(req.params.bomId || "").trim();
+    if (!bomId) {
+      return res.status(400).json({
+        error: "bomId is required",
+      });
+    }
+
+    const data = await fetchCoProductsByBomId(bomId);
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching co-products:", error);
+    return res.status(500).json({
+      error: "Failed to fetch co-products",
+      details: error.message,
+    });
+  }
+});
+
+
+
 
 /* =========================================================
  Generic dynamic GCP table route for frontend

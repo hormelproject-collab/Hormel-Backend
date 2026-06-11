@@ -10,6 +10,11 @@ const router = express.Router();
 ========================================================= */
 const norm = (v) => String(v ?? "").trim();
 const ensureArray = (v) => (Array.isArray(v) ? v : []);
+function getCstTimestamp() {
+  return new Date(
+    new Date().toLocaleString("en-US", { timeZone: "America/Chicago" })
+  );
+}
 
 function getEcNumber() {
   const d = new Date();
@@ -127,20 +132,16 @@ function collectNotes(payload) {
    Build DB rows from normalized validator tables
 ========================================================= */
 function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes) {
-  const now = new Date().toISOString();
+  const now = getCstTimestamp();
 
   const bomParametersRows = ensureArray(normalizedTables?.bom_parameters).map((row) => ({
     rec_id: generateUniqueBigInt(),
     bom_id: row.bom_id,
-    produced_item: row.produced_item,
+    erp_bom_start_date: row.erp_bom_start_date ?? null,
+    erp_bom_end_date: row.erp_bom_end_date ?? null,
     engineering_change_id: ecNumber,
-    eng_change_id: ecNumber,
     change_type: "Add BOM",
-    notes,
-    created_by: userDetails.user_name,
-    updated_by: userDetails.user_name,
-    created_at: now,
-    updated_at: now,
+    load_datetime: now,
   }));
 
   const bomProducedRows = ensureArray(normalizedTables?.bom_produced).map((row) => ({
@@ -148,15 +149,27 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes) {
     bom_id: row.bom_id,
     item: row.item,
     location: row.location,
-    erp_bom_qty_produced_per: row.erp_bom_qty_produced_per,
-    is_coproduct: row.is_coproduct,
+    bom_status:
+      row.bom_status ??
+      row.status ??
+      null,
+    bom_version:
+      row.bom_version ??
+      row.version ??
+      null,
+    prefix:
+      row.prefix ??
+      null,
+    bom_plan_type:
+      row.bom_plan_type ??
+      null,
+    erp_bom_qty_produced_per:
+      row.erp_bom_qty_produced_per ??
+      row.qty_produced_per ??
+      null,
     engineering_change_id: ecNumber,
-    eng_change_id: ecNumber,
     change_type: "Add BOM",
-    created_by: userDetails.user_name,
-    updated_by: userDetails.user_name,
-    created_at: now,
-    updated_at: now,
+    load_datetime: now,
   }));
 
   const bomConsumedRows = ensureArray(normalizedTables?.bom_consumed).map((row) => ({
@@ -164,39 +177,57 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes) {
     bom_id: row.bom_id,
     item: row.item,
     location: row.location,
-    erp_bom_quantity_consumed_per: row.erp_bom_quantity_consumed_per,
-    co_product_flag: row.co_product_flag,
+    bom_quantity_consumed_per:
+      row.bom_quantity_consumed_per ??
+      row.erp_bom_quantity_consumed_per ??
+      row.quantity_consumed_per ??
+      null,
+    bom_component_start_date:
+      row.bom_component_start_date ??
+      row.erp_bom_component_start_date ??
+      null,
+    bom_component_end_date:
+      row.bom_component_end_date ??
+      row.erp_bom_component_end_date ??
+      null,
     engineering_change_id: ecNumber,
-    eng_change_id: ecNumber,
     change_type: "Add BOM",
-    created_by: userDetails.user_name,
-    updated_by: userDetails.user_name,
-    created_at: now,
-    updated_at: now,
+    load_datetime: now,
   }));
 
 
   const itemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map((row) => {
-    const derivedResource = norm(row.resource) ||
+    const derivedResource =
+      norm(row.resource) ||
       norm(String(row.routing_id || "").split("_").slice(3).join("_"));
+
+    const coProductAssociation =
+      row.co_product_association ??
+      row.erp_co_product_association ??
+      ((Number(row.is_coproduct) === 1 || row.is_coproduct === true) ? 1 : 0);
 
     return {
       rec_id: generateUniqueBigInt(),
       bom_id: row.bom_id,
       item: row.item,
-      location: row.location,
       routing_id: row.routing_id,
-      resource: derivedResource,
-      priority: row.priority,
-      erp_item_bom_routing_priority: row.priority,
-      erp_co_product_association: row.erp_co_product_association,
+      item_bom_routing_priority:
+        row.item_bom_routing_priority ??
+        row.priority ??
+        row.routingPriority ??
+        null,
+      item_bom_routing_min_lot_size:
+        row.item_bom_routing_min_lot_size ?? null,
+      item_bom_routing_lot_size_increment:
+        row.item_bom_routing_lot_size_increment ?? null,
+      item_bom_routing_wip_sweep_priority:
+        row.item_bom_routing_wip_sweep_priority ?? null,
+      co_product_association: coProductAssociation,
+      item_bom_routing_max_lot_size:
+        row.item_bom_routing_max_lot_size ?? null,
       engineering_change_id: ecNumber,
-      eng_change_id: ecNumber,
       change_type: "Add BOM",
-      created_by: userDetails.user_name,
-      updated_by: userDetails.user_name,
-      created_at: now,
-      updated_at: now,
+      load_datetime: now,
     };
   });
 
