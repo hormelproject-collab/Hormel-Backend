@@ -300,6 +300,7 @@ router.get("/bom-routing-step1/resource-relevancy/:resource", async (req, res) =
   }
 });
 
+
 /**
  * Co-product list from item_master for selected item
  */
@@ -401,5 +402,70 @@ router.get("/:table", async (req, res) => {
     });
   }
 });
+
+router.get("/bom-consumed/:bomId", async (req, res) => {
+  try {
+    const { bomId } = req.params;
+
+    if (!bomId) {
+      return res.status(400).json({
+        success: false,
+        message: "bomId is required",
+      });
+    }
+
+    const data = await fetchFromTable(
+      "bom_consumed",
+      { BOMID: bomId },
+      1000
+    );
+
+    return res.status(200).json({
+      success: true,
+      count: data.length,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching BOM consumed items:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Something went wrong",
+    });
+  }
+});
+
+router.get("/item_bom_routing/:bomId", async (req, res) => {
+  try {
+    const { bomId } = req.params;
+
+    if (!bomId) {
+      return res.status(400).json({
+        success: false,
+        message: "bomId is required",
+      });
+    }
+
+    const data = await fetchFromTable(
+      "item_bom_routing",
+      { BOMID: bomId },
+      1000
+    );
+
+    return res.status(200).json({
+      success: true,
+      count: data.length,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching item BOM routing items:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Something went wrong",
+    });
+  }
+});
+
 
 export default router;

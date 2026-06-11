@@ -21,6 +21,24 @@ const generateUniqueBigInt = () => {
   return `${ts}${rand}`;
 };
 
+const HARD_CODED_START_DATE = "2019-01-01";
+const HARD_CODED_END_DATE = "2099-01-25";
+const HARD_CODED_BOM_STATUS = "ACTIVE";
+const HARD_CODED_PREFIX = "BOM";
+const HARD_CODED_BOM_PLAN_TYPE = "MP and OP";
+const HARD_CODED_LOAD_DATETIME = null;
+
+const getBomVersionFromBomId = (bomId) => {
+  const parts = String(bomId || "")
+    .split("_")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // Format expected: BOMVERSION_item_location
+  // Example: BOM1_HRL00068_1008 -> BOM1
+  return parts.length >= 1 ? parts[0] : "";
+};
+
 const generateUniqueId = (prefix) => {
   const ts = new Date()
     .toISOString()
@@ -79,10 +97,20 @@ const getResourceFromRoutingId = (routingId) => {
 };
 
 const getSourceRecId = (row) =>
-  row?.rec_id ?? row?.record_id ?? row?.recordid ?? null;
+  row?.postgresql_rec_id ??
+  row?.rec_id ??
+  row?.record_id ??
+  row?.recordid ??
+  row?.id ??
+  null;
 
 const getArchiveRecId = (row) =>
-  row?.rec_id ?? row?.record_id ?? row?.recordid ?? null;
+  row?.postgresql_rec_id ??
+  row?.rec_id ??
+  row?.record_id ??
+  row?.recordid ??
+  row?.id ??
+  null;
 
 /* =========================================================
    DB metadata helpers
@@ -210,10 +238,10 @@ const buildDeleteBomArchiveRow = ({
     row.engineeringchangeid = engineeringChangeId;
   }
   if (archiveColumns.includes("change_type")) {
-    row.change_type = "deleteBOM";
+    row.change_type = "Deleted";
   }
   if (archiveColumns.includes("changetype")) {
-    row.changetype = "deleteBOM";
+    row.changetype = "Deleted";
   }
   if (archiveColumns.includes("notes")) {
     row.notes = notes || "";
@@ -606,6 +634,705 @@ router.get("/existing-bom-search", async (req, res) => {
   }
 });
 
+
+router.put("/modify-bom", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const payload = req.body || {};
+    const bomId = String(payload.bomId || "").trim();
+    const producedItem = payload.producedItem || {};
+    const engineeringChange = payload.engineeringChange || {};
+    const notes = String(payload.notes || "").trim();
+    const locations = Array.isArray(payload.locations) ? payload.locations : [];
+
+    if (!bomId) {
+      throw new Error("bomId is required");
+    }
+
+    if (!locations.length) {
+      throw new Error("At least one location is required");
+    }
+
+    // ---------------------------------------------------------
+    // Local helpers
+    // Prefer postgresql_rec_id first
+    // ---------------------------------------------------------
+    const resolvePrimaryIdColumn = async (tableName) => {
+      const columns = await getExistingColumns(client, tableName);
+
+      if (columns.includes("postgresql_rec_id")) return "postgresql_rec_id";
+      if (columns.includes("rec_id")) return "rec_id";
+      if (columns.includes("record_id")) return "record_id";
+      if (columns.includes("recordid")) return "recordid";
+      if (columns.includes("id")) return "id";
+
+      return null;
+    };
+
+    const getResolvedRowId = (row, idColumn) => {
+      if (!row) return null;
+      return (
+        row[idColumn] ??
+        row.postgresql_rec_id ??
+        row.rec_id ??
+        row.record_id ??
+        row.recordid ??
+        row.id ??
+        null
+      );
+    };
+
+    const buildModifiedSummary = (title, changes) => {
+      const validChanges = changes.filter(Boolean);
+      if (!validChanges.length) {
+        return `Modified ${title}`;
+      }
+      return `Modified ${title}: ${validChanges.join(", ")}`;
+    };
+
+    // ---------------------------------------------------------
+    // Engineering Change ID generated in backend
+    // ---------------------------------------------------------
+    const engineeringChangeId = generateUniqueId("EC-");
+    const derivedBomVersion = getBomVersionFromBomId(bomId);
+
+    // Current CST/Chicago date-time
+    const chicagoNow = new Date(
+      new Date().toLocaleString("en-US", { timeZone: "America/Chicago" })
+    );
+    const chicagoDate = chicagoNow.toISOString().slice(0, 10);
+
+    const changeLogTable = "planning_bom_change_log_summary";
+    const changeLogColumns = await getExistingColumns(client, changeLogTable);
+
+    // Resolve actual ID columns dynamically
+    const bomProducedIdColumn = await resolvePrimaryIdColumn("bom_produced");
+    const itemBomRoutingIdColumn = await resolvePrimaryIdColumn("item_bom_routing");
+    const bomConsumedIdColumn = await resolvePrimaryIdColumn("bom_consumed");
+    const bomParametersIdColumn = await resolvePrimaryIdColumn("bom_parameters");
+
+    if (!bomProducedIdColumn) {
+      throw new Error("Could not resolve primary id column for bom_produced");
+    }
+    if (!itemBomRoutingIdColumn) {
+      throw new Error("Could not resolve primary id column for item_bom_routing");
+    }
+    if (!bomConsumedIdColumn) {
+      throw new Error("Could not resolve primary id column for bom_consumed");
+    }
+    if (!bomParametersIdColumn) {
+      throw new Error("Could not resolve primary id column for bom_parameters");
+    }
+
+    // ---------------------------------------------------------
+    // Common archive + changelog helper
+    // ---------------------------------------------------------
+    const archiveAndLog = async ({
+      sourceTable,
+      archiveTable,
+      sourceRow,
+      actualRecId,
+      logProducedItem,
+      logItem,
+      logLocation,
+      logResource,
+      summaryText,
+    }) => {
+      if (actualRecId == null || String(actualRecId).trim() === "") {
+        throw new Error(
+          `Actual row id could not be resolved for source table ${sourceTable}`
+        );
+      }
+
+      const archiveColumns = await getExistingColumns(client, archiveTable);
+      const archiveRow = { ...sourceRow };
+
+      // enrich archive row if archive columns exist
+      if (archiveColumns.includes("engineering_change_id")) {
+        archiveRow.engineering_change_id = engineeringChangeId;
+      }
+      if (archiveColumns.includes("engineeringchangeid")) {
+        archiveRow.engineeringchangeid = engineeringChangeId;
+      }
+
+      if (archiveColumns.includes("change_type")) {
+        archiveRow.change_type = "Modified";
+      }
+      if (archiveColumns.includes("changetype")) {
+        archiveRow.changetype = "Modified";
+      }
+
+      // keep notes fields clean
+      // keep notes fields clean
+      if (archiveColumns.includes("notes")) {
+        archiveRow.notes = notes || "";
+      }
+      if (archiveColumns.includes("summarynotes")) {
+        archiveRow.summarynotes = notes || "";
+      }
+      if (archiveColumns.includes("change_summary")) {
+        archiveRow.change_summary = summaryText;
+      }
+
+
+      if (archiveColumns.includes("source_table")) {
+        archiveRow.source_table = sourceTable;
+      }
+      if (archiveColumns.includes("source_rec_id")) {
+        archiveRow.source_rec_id = actualRecId;
+      }
+      if (archiveColumns.includes("original_rec_id")) {
+        archiveRow.original_rec_id = actualRecId;
+      }
+
+      if (archiveColumns.includes("archived_at")) {
+        archiveRow.archived_at = chicagoNow;
+      }
+      if (archiveColumns.includes("archived_on")) {
+        archiveRow.archived_on = chicagoNow;
+      }
+
+      if (archiveColumns.includes("created_by")) {
+        archiveRow.created_by = "SYSTEM_USER";
+      }
+      if (archiveColumns.includes("updated_by")) {
+        archiveRow.updated_by = "SYSTEM_USER";
+      }
+
+      const { query: archiveInsertQuery, values: archiveInsertValues } =
+        buildDynamicInsertQuery(archiveTable, archiveRow, archiveColumns);
+
+      await client.query(archiveInsertQuery, archiveInsertValues);
+
+      // build changelog row
+      const changeLogRow = {};
+
+      if (changeLogColumns.includes("rec_id")) {
+        changeLogRow.rec_id = actualRecId;
+      }
+      if (changeLogColumns.includes("record_id")) {
+        changeLogRow.record_id = actualRecId;
+      }
+      if (changeLogColumns.includes("postgresql_rec_id")) {
+        changeLogRow.postgresql_rec_id = actualRecId;
+      }
+
+      if (changeLogColumns.includes("engineering_change_id")) {
+        changeLogRow.engineering_change_id = engineeringChangeId;
+      }
+      if (changeLogColumns.includes("engineeringchangeid")) {
+        changeLogRow.engineeringchangeid = engineeringChangeId;
+      }
+
+      if (changeLogColumns.includes("change_type")) {
+        changeLogRow.change_type = "Modified";
+      }
+      if (changeLogColumns.includes("changetype")) {
+        changeLogRow.changetype = "Modified";
+      }
+
+      if (changeLogColumns.includes("target_table")) {
+        changeLogRow.target_table = archiveTable;
+      }
+
+      if (changeLogColumns.includes("bom_id")) {
+        changeLogRow.bom_id = bomId;
+      }
+      if (changeLogColumns.includes("bom_ids")) {
+        changeLogRow.bom_ids = bomId;
+      }
+
+      if (changeLogColumns.includes("produced_item")) {
+        changeLogRow.produced_item = logProducedItem || "";
+      }
+
+      if (changeLogColumns.includes("item")) {
+        changeLogRow.item = logItem || "";
+      }
+
+      if (changeLogColumns.includes("location")) {
+        changeLogRow.location = logLocation || "";
+      }
+      if (changeLogColumns.includes("locations")) {
+        changeLogRow.locations = logLocation || "";
+      }
+
+      if (changeLogColumns.includes("resource")) {
+        changeLogRow.resource = logResource || "";
+      }
+      if (changeLogColumns.includes("resources")) {
+        changeLogRow.resources = logResource || "";
+      }
+
+      if (changeLogColumns.includes("change_date")) {
+        changeLogRow.change_date = chicagoDate;
+      }
+      if (changeLogColumns.includes("created_at")) {
+        changeLogRow.created_at = chicagoNow;
+      }
+      if (changeLogColumns.includes("created_on")) {
+        changeLogRow.created_on = chicagoNow;
+      }
+
+      if (changeLogColumns.includes("user_name")) {
+        changeLogRow.user_name = "SYSTEM_USER";
+      }
+      if (changeLogColumns.includes("created_by")) {
+        changeLogRow.created_by = "SYSTEM_USER";
+      }
+      if (changeLogColumns.includes("updated_by")) {
+        changeLogRow.updated_by = "SYSTEM_USER";
+      }
+
+      // keep planning_bom_change_log_summary fields separate
+      // keep planning_bom_change_log_summary fields separate
+      if (changeLogColumns.includes("summarynotes")) {
+        changeLogRow.summarynotes = notes || "";
+      }
+      if (changeLogColumns.includes("change_summary")) {
+        changeLogRow.change_summary = summaryText;
+      }
+      if (changeLogColumns.includes("notes")) {
+        changeLogRow.notes = notes || "";
+      }
+
+
+      if (changeLogColumns.includes("status")) {
+        changeLogRow.status = "COMPLETED";
+      }
+
+      const { query: changeLogInsertQuery, values: changeLogInsertValues } =
+        buildDynamicInsertQuery(changeLogTable, changeLogRow, changeLogColumns);
+
+      await client.query(changeLogInsertQuery, changeLogInsertValues);
+    };
+
+    // ---------------------------------------------------------
+    // BOM_PARAMETERS is bom_id-level only. Archive/update once.
+    // Use first location context for changelog location/resource.
+    // ---------------------------------------------------------
+    const firstLocation = locations[0] || {};
+    const firstLocationName = String(firstLocation?.locationName || "").trim();
+    const firstRoutingId = String(firstLocation?.resourceInfo?.routingId || "").trim();
+    const firstResource =
+      String(firstLocation?.resourceInfo?.resource || "").trim() ||
+      (firstRoutingId ? getResourceFromRoutingId(firstRoutingId) : "");
+
+    const paramsLiveResult = await client.query(
+      `
+      SELECT *
+      FROM bom_parameters
+      WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+      LIMIT 1
+      `,
+      [bomId]
+    );
+
+    if (!paramsLiveResult.rows.length) {
+      throw new Error(`No matching bom_parameters row found for bom_id=${bomId}`);
+    }
+
+    const paramsLiveRow = paramsLiveResult.rows[0];
+    const paramsActualRecId = getResolvedRowId(
+      paramsLiveRow,
+      bomParametersIdColumn
+    );
+
+    if (paramsActualRecId == null || String(paramsActualRecId).trim() === "") {
+      throw new Error(
+        `Could not resolve live row id for bom_parameters using column ${bomParametersIdColumn}`
+      );
+    }
+
+    const parameterChanges = [];
+    if (
+      String(paramsLiveRow.erp_bom_start_date ?? "") !==
+      String(engineeringChange.creationDate ?? "")
+    ) {
+      parameterChanges.push(
+        `BOM Start Date (${paramsLiveRow.erp_bom_start_date ?? ""} -> ${engineeringChange.creationDate ?? ""})`
+      );
+    }
+
+    await archiveAndLog({
+      sourceTable: "bom_parameters",
+      archiveTable: "bom_parameters_og",
+      sourceRow: paramsLiveRow,
+      actualRecId: paramsActualRecId,
+      logProducedItem: producedItem.item || "",
+      logItem: producedItem.item || "",
+      logLocation: firstLocationName,
+      logResource: firstResource,
+      summaryText: buildModifiedSummary(
+        "engineering / BOM parameter information",
+        parameterChanges
+      ),
+    });
+
+    await client.query(
+      `
+      UPDATE bom_parameters
+      SET
+        erp_bom_start_date = $1,
+        erp_bom_end_date = $2,
+        load_datetime = $3
+      WHERE ${quoteIdent(bomParametersIdColumn)} = $4
+      `,
+      [
+        HARD_CODED_START_DATE,
+        HARD_CODED_END_DATE,
+        HARD_CODED_LOAD_DATETIME,
+        paramsActualRecId,
+      ]
+    );
+
+    // ---------------------------------------------------------
+    // Process each location payload
+    // ---------------------------------------------------------
+    for (const location of locations) {
+      const locationName = String(location?.locationName || "").trim();
+      const routingId = String(location?.resourceInfo?.routingId || "").trim();
+      const priority =
+        location?.resourceInfo?.priority === "" ||
+          location?.resourceInfo?.priority == null
+          ? null
+          : Number(location.resourceInfo.priority);
+      const coProductAssociation =
+        location?.resourceInfo?.coProductAssociation === "" ||
+          location?.resourceInfo?.coProductAssociation == null
+          ? null
+          : Number(location.resourceInfo.coProductAssociation);
+
+      const resource =
+        String(location?.resourceInfo?.resource || "").trim() ||
+        (routingId ? getResourceFromRoutingId(routingId) : "");
+
+      if (!locationName) {
+        throw new Error("locationName is required in locations");
+      }
+
+      // item_bom_routing should use only bom_id + routing_id
+      if (!routingId) {
+        throw new Error("routingId is required in resourceInfo");
+      }
+
+      // =========================================================
+      // 1) BOM_PRODUCED -> fetch exact row by bom_id + location
+      // =========================================================
+      const producedLiveResult = await client.query(
+        `
+        SELECT *
+        FROM bom_produced
+        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(location AS TEXT)) = $2
+        LIMIT 1
+        `,
+        [bomId, locationName]
+      );
+
+      if (!producedLiveResult.rows.length) {
+        throw new Error(
+          `No matching bom_produced row found for bom_id=${bomId}, location=${locationName}`
+        );
+      }
+
+      const producedLiveRow = producedLiveResult.rows[0];
+      const producedActualRecId = getResolvedRowId(
+        producedLiveRow,
+        bomProducedIdColumn
+      );
+
+      if (
+        producedActualRecId == null ||
+        String(producedActualRecId).trim() === ""
+      ) {
+        throw new Error(
+          `Could not resolve live row id for bom_produced using column ${bomProducedIdColumn}`
+        );
+      }
+
+      const producedChanges = [];
+      if (String(producedLiveRow.item ?? "") !== String(producedItem.item ?? "")) {
+        producedChanges.push(
+          `Produced Item (${producedLiveRow.item ?? ""} -> ${producedItem.item ?? ""})`
+        );
+      }
+      if (
+        String(producedLiveRow.bom_status ?? "") !==
+        String(producedItem.status ?? "")
+      ) {
+        producedChanges.push(
+          `BOM Status (${producedLiveRow.bom_status ?? ""} -> ${producedItem.status ?? ""})`
+        );
+      }
+      if (String(producedLiveRow.location ?? "") !== String(locationName)) {
+        producedChanges.push(
+          `Location (${producedLiveRow.location ?? ""} -> ${locationName})`
+        );
+      }
+
+      await archiveAndLog({
+        sourceTable: "bom_produced",
+        archiveTable: "bom_produced_og",
+        sourceRow: producedLiveRow,
+        actualRecId: producedActualRecId,
+        logProducedItem: producedItem.item || "",
+        logItem: producedItem.item || "",
+        logLocation: locationName,
+        logResource: resource,
+        summaryText: buildModifiedSummary(
+          "produced item information",
+          producedChanges
+        ),
+      });
+
+      await client.query(
+        `
+        UPDATE bom_produced
+        SET
+          item = $1,
+          location = $2,
+          bom_status = $3,
+          bom_version = $4,
+          prefix = $5,
+          bom_plan_type = $6,
+          load_datetime = $7
+        WHERE ${quoteIdent(bomProducedIdColumn)} = $8
+        `,
+        [
+          producedItem.item || null,
+          locationName,
+          HARD_CODED_BOM_STATUS,
+          derivedBomVersion || null,
+          HARD_CODED_PREFIX,
+          HARD_CODED_BOM_PLAN_TYPE,
+          HARD_CODED_LOAD_DATETIME,
+          producedActualRecId,
+        ]
+      );
+
+      // =========================================================
+      // 2) ITEM_BOM_ROUTING
+      // Fetch exact row only by bom_id + routing_id
+      // =========================================================
+      const routingLiveResult = await client.query(
+        `
+        SELECT *
+        FROM item_bom_routing
+        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(routing_id AS TEXT)) = $2
+        LIMIT 1
+        `,
+        [bomId, routingId]
+      );
+
+      const routingLiveRow = routingLiveResult.rows[0] || null;
+
+      if (!routingLiveRow) {
+        throw new Error(
+          `No matching item_bom_routing row found for bom_id=${bomId}, routing_id=${routingId}`
+        );
+      }
+
+      const routingActualRecId = getResolvedRowId(
+        routingLiveRow,
+        itemBomRoutingIdColumn
+      );
+
+      if (
+        routingActualRecId == null ||
+        String(routingActualRecId).trim() === ""
+      ) {
+        throw new Error(
+          `Could not resolve live row id for item_bom_routing using column ${itemBomRoutingIdColumn}`
+        );
+      }
+
+      const routingChanges = [];
+      if (String(routingLiveRow.routing_id ?? "") !== String(routingId ?? "")) {
+        routingChanges.push(
+          `Routing ID (${routingLiveRow.routing_id ?? ""} -> ${routingId ?? ""})`
+        );
+      }
+      if (
+        String(routingLiveRow.item_bom_routing_priority ?? "") !==
+        String(priority ?? "")
+      ) {
+        routingChanges.push(
+          `Routing Priority (${routingLiveRow.item_bom_routing_priority ?? ""} -> ${priority ?? ""})`
+        );
+      }
+      if (
+        String(routingLiveRow.co_product_association ?? "") !==
+        String(coProductAssociation ?? "")
+      ) {
+        routingChanges.push(
+          `Co-Product Association (${routingLiveRow.co_product_association ?? ""} -> ${coProductAssociation ?? ""})`
+        );
+      }
+
+      await archiveAndLog({
+        sourceTable: "item_bom_routing",
+        archiveTable: "item_bom_routing_og",
+        sourceRow: routingLiveRow,
+        actualRecId: routingActualRecId,
+        logProducedItem: producedItem.item || "",
+        logItem: producedItem.item || "",
+        logLocation: locationName,
+        logResource: resource,
+        summaryText: buildModifiedSummary(
+          "routing and co-product information",
+          routingChanges
+        ),
+      });
+
+      await client.query(
+        `
+        UPDATE item_bom_routing
+        SET
+          routing_id = $1,
+          item_bom_routing_priority = $2,
+          co_product_association = $3,
+          load_datetime = $4
+        WHERE ${quoteIdent(itemBomRoutingIdColumn)} = $5
+        `,
+        [
+          routingId || routingLiveRow.routing_id || null,
+          priority,
+          coProductAssociation,
+          HARD_CODED_LOAD_DATETIME,
+          routingActualRecId,
+        ]
+      );
+
+      // =========================================================
+      // 3) BOM_CONSUMED -> fetch exact row(s) by bom_id + location + item
+      // =========================================================
+      for (const component of Array.isArray(location.componentItems)
+        ? location.componentItems
+        : []) {
+        const componentItem = String(component?.componentItem || "").trim();
+        const standardUsage =
+          component?.standardUsage === "" || component?.standardUsage == null
+            ? null
+            : Number(component.standardUsage);
+
+        if (!componentItem) {
+          continue;
+        }
+
+        const consumedLiveResult = await client.query(
+          `
+          SELECT *
+          FROM bom_consumed
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+            AND TRIM(CAST(location AS TEXT)) = $2
+            AND TRIM(CAST(item AS TEXT)) = $3
+          LIMIT 1
+          `,
+          [bomId, locationName, componentItem]
+        );
+
+        if (!consumedLiveResult.rows.length) {
+          throw new Error(
+            `No matching bom_consumed row found for bom_id=${bomId}, location=${locationName}, item=${componentItem}`
+          );
+        }
+
+        const consumedLiveRow = consumedLiveResult.rows[0];
+        const consumedActualRecId = getResolvedRowId(
+          consumedLiveRow,
+          bomConsumedIdColumn
+        );
+
+        if (
+          consumedActualRecId == null ||
+          String(consumedActualRecId).trim() === ""
+        ) {
+          throw new Error(
+            `Could not resolve live row id for bom_consumed using column ${bomConsumedIdColumn}`
+          );
+        }
+
+        const componentChanges = [];
+        if (String(consumedLiveRow.item ?? "") !== String(componentItem)) {
+          componentChanges.push(
+            `Component Item (${consumedLiveRow.item ?? ""} -> ${componentItem})`
+          );
+        }
+        if (
+          String(consumedLiveRow.bom_quantity_consumed_per ?? "") !==
+          String(standardUsage ?? "")
+        ) {
+          componentChanges.push(
+            `Standard Usage (${consumedLiveRow.bom_quantity_consumed_per ?? ""} -> ${standardUsage ?? ""})`
+          );
+        }
+
+        await archiveAndLog({
+          sourceTable: "bom_consumed",
+          archiveTable: "bom_consumed_og",
+          sourceRow: consumedLiveRow,
+          actualRecId: consumedActualRecId,
+          logProducedItem: producedItem.item || "",
+          logItem: componentItem,
+          logLocation: locationName,
+          logResource: resource,
+          summaryText: buildModifiedSummary(
+            "component information",
+            componentChanges
+          ),
+        });
+
+        await client.query(
+          `
+          UPDATE bom_consumed
+          SET
+            item = $1,
+            bom_quantity_consumed_per = $2,
+            bom_component_start_date = $3,
+            bom_component_end_date = $4,
+            load_datetime = $5
+          WHERE ${quoteIdent(bomConsumedIdColumn)} = $6
+          `,
+          [
+            componentItem,
+            standardUsage,
+            HARD_CODED_START_DATE,
+            HARD_CODED_END_DATE,
+            HARD_CODED_LOAD_DATETIME,
+            consumedActualRecId,
+          ]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      success: true,
+      message: "BOM updated successfully",
+      engineeringChangeId,
+      changeType: "Modified",
+      bomId,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("DB Error (modify-bom):", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
 /* =========================================================
    4) CREATE ITEM BOM ROUTING + CHANGE LOG
 ========================================================= */
@@ -625,7 +1352,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
       addConnectedCoProduct = false,
       coProductItem = "",
       notes = "",
-      changeType = "Add",
+      changeType = "Added",
       user = {},
     } = req.body || {};
 
@@ -652,7 +1379,6 @@ router.post("/item-bom-routing/create", async (req, res) => {
       client,
       "item_bom_routing"
     );
-
     const changeLogColumns = await getExistingColumns(
       client,
       "planning_bom_change_log_summary"
@@ -686,9 +1412,8 @@ router.post("/item-bom-routing/create", async (req, res) => {
       trxn_by_user_name: changedByUserName,
       changed_by_user_id: changedByUserId,
       change_type: changeType,
-      load_datetime: chicagoNow,
+      load_datetime: HARD_CODED_LOAD_DATETIME,
     };
-
 
     const itemInsert = buildInsertQuery(
       "item_bom_routing",
@@ -780,6 +1505,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
     if (changeLogColumns.includes("resource")) {
       changeLogData.resource = resource;
     }
+
     if (changeLogColumns.includes("resources")) {
       changeLogData.resources = resource;
     }
@@ -828,6 +1554,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("DB Error (item-bom-routing/create):", error);
+
     return res.status(500).json({
       error: "Failed to create item BOM routing record",
       details: error.message,
@@ -964,6 +1691,12 @@ router.post("/delete-bom/execute", async (req, res) => {
   try {
     const bomIds = normalizeTextArray(req.body?.bomIds);
     const notes = toText(req.body?.notes);
+    const user = req.body?.user || {};
+
+    const changedBy =
+      String(user?.userName || "").trim() ||
+      String(user?.userId || "").trim() ||
+      "SYSTEM_USER";
 
     if (!bomIds.length) {
       return res.status(400).json({
@@ -1092,6 +1825,9 @@ router.post("/delete-bom/execute", async (req, res) => {
 
       const archiveColumns = await getExistingColumns(client, archiveTable);
 
+      const tableDeleteSummary = `Deleted ${sourceRows.length} record${sourceRows.length === 1 ? "" : "s"
+        } from ${sourceTable}`;
+
       for (const row of sourceRows) {
         const archiveRow = buildDeleteBomArchiveRow({
           baseRow: row,
@@ -1214,6 +1950,7 @@ router.post("/delete-bom/execute", async (req, res) => {
           changeLogRow.routing_id = row.routing_id ?? null;
         }
 
+        // keep summarynotes and change_summary separate
         if (changeLogColumns.includes("summarynotes")) {
           changeLogRow.summarynotes = notes || "";
         }
@@ -1221,18 +1958,17 @@ router.post("/delete-bom/execute", async (req, res) => {
           changeLogRow.notes = notes || "";
         }
         if (changeLogColumns.includes("change_summary")) {
-          changeLogRow.change_summary = notes || archiveTable;
+          changeLogRow.change_summary = tableDeleteSummary;
         }
 
         if (changeLogColumns.includes("user_name")) {
-          changeLogRow.user_name =
-            String(user?.userId || "").trim() || "SYSTEM_USER";
+          changeLogRow.user_name = changedBy;
         }
         if (changeLogColumns.includes("created_by")) {
-          changeLogRow.created_by = String(user?.userId || "").trim() || "SYSTEM_USER";
+          changeLogRow.created_by = changedBy;
         }
         if (changeLogColumns.includes("updated_by")) {
-          changeLogRow.updated_by = String(user?.userId || "").trim() || "SYSTEM_USER";
+          changeLogRow.updated_by = changedBy;
         }
 
         if (changeLogColumns.includes("change_date")) {
@@ -1353,6 +2089,12 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
   try {
     const records = Array.isArray(req.body?.records) ? req.body.records : [];
     const notes = String(req.body?.notes ?? "").trim();
+    const user = req.body?.user || {};
+
+    const changedBy =
+      String(user?.userName || "").trim() ||
+      String(user?.userId || "").trim() ||
+      "SYSTEM_USER";
 
     if (!records.length) {
       return res.status(400).json({
@@ -1386,6 +2128,9 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
     const archivedRecIds = [];
     let movedCount = 0;
+
+    const totalDeleteCount = records.length;
+    const deleteChangeSummary = `Deleted ${totalDeleteCount} record${totalDeleteCount === 1 ? "" : "s"} in item_bom_routing`;
 
     const getLocationFromBomId = (bomId) => {
       const value = String(bomId || "").trim();
@@ -1457,6 +2202,14 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           archiveRow.notes = notes || "";
         }
 
+        if (archiveColumns.includes("summarynotes")) {
+          archiveRow.summarynotes = notes || "";
+        }
+
+        if (archiveColumns.includes("change_summary")) {
+          archiveRow.change_summary = deleteChangeSummary;
+        }
+
         if (archiveColumns.includes("source_table")) {
           archiveRow.source_table = "item_bom_routing";
         }
@@ -1464,6 +2217,22 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
         if (archiveColumns.includes("source_rec_id")) {
           archiveRow.source_rec_id =
             row.rec_id ?? row.record_id ?? row.recordid ?? null;
+        }
+
+        // hardcoded values for archive row if column exists
+        if (archiveColumns.includes("item_bom_routing_min_lot_size")) {
+          archiveRow.item_bom_routing_min_lot_size =
+            row.item_bom_routing_min_lot_size ?? 1;
+        }
+
+        if (archiveColumns.includes("item_bom_routing_lot_size_increment")) {
+          archiveRow.item_bom_routing_lot_size_increment =
+            row.item_bom_routing_lot_size_increment ?? 1;
+        }
+
+        if (archiveColumns.includes("item_bom_routing_wip_sweep_priority")) {
+          archiveRow.item_bom_routing_wip_sweep_priority =
+            row.item_bom_routing_wip_sweep_priority ?? 1;
         }
 
         if (archiveColumns.includes("archived_at")) {
@@ -1578,26 +2347,26 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           changeLogRow.resources = derivedResource || "";
         }
 
+        // summarynotes and change_summary
         if (changeLogColumns.includes("summarynotes")) {
           changeLogRow.summarynotes = notes || "";
         }
         if (changeLogColumns.includes("notes")) {
           changeLogRow.notes = notes || "";
         }
-
         if (changeLogColumns.includes("change_summary")) {
-          changeLogRow.change_summary = notes || archiveTable;
+          changeLogRow.change_summary = deleteChangeSummary;
         }
 
-        // username 
+        // username
         if (changeLogColumns.includes("user_name")) {
-          changeLogRow.user_name = String(user?.userId || "").trim() || "SYSTEM_USER";
+          changeLogRow.user_name = changedBy;
         }
         if (changeLogColumns.includes("created_by")) {
-          changeLogRow.created_by = String(user?.userId || "").trim() || "SYSTEM_USER";
+          changeLogRow.created_by = changedBy;
         }
         if (changeLogColumns.includes("updated_by")) {
-          changeLogRow.updated_by = String(user?.userId || "").trim() || "SYSTEM_USER";
+          changeLogRow.updated_by = changedBy;
         }
 
         const now = new Date();
@@ -1656,6 +2425,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     client.release();
   }
 });
+
 /* =========================================================
    ENGINEERING CHANGE LOG SUMMARY
    GET /api/tables/engineering-change-log
@@ -1723,7 +2493,6 @@ router.get("/engineering-change-log", async (req, res) => {
       selectParts.push(`'' AS bom_ids`);
     }
 
-
     // Resource(s)
     if (columns.includes("resource")) {
       selectParts.push(`CAST(resource AS TEXT) AS resources`);
@@ -1747,10 +2516,10 @@ router.get("/engineering-change-log", async (req, res) => {
     }
 
     // Change Summary
-    if (columns.includes("summarynotes")) {
-      selectParts.push(`CAST(summarynotes AS TEXT) AS change_summary`);
-    } else if (columns.includes("change_summary")) {
+    if (columns.includes("change_summary")) {
       selectParts.push(`CAST(change_summary AS TEXT) AS change_summary`);
+    } else if (columns.includes("summarynotes")) {
+      selectParts.push(`CAST(summarynotes AS TEXT) AS change_summary`);
     } else if (columns.includes("notes")) {
       selectParts.push(`CAST(notes AS TEXT) AS change_summary`);
     } else if (columns.includes("target_table")) {
@@ -1814,7 +2583,6 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
     let producedItem = String(req.query.producedItem || req.query.item || "").trim();
 
     // Derive item + location from BOM ID format: BOMID_ITEM_LOCATION
-    // Example: BOM3_HRL00123_1007
     if (bomId) {
       const bomParts = bomId.split("_");
 
@@ -1839,36 +2607,49 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
       });
     }
 
-    // 1) Fetch from planning_bom_change_log_summary first
+    // ---------------------------------------------------------
+    // 1) Fetch consolidated add-change row from changelog
+    // Supports exact value or value inside comma-separated consolidated text
+    // ---------------------------------------------------------
     const summaryQuery = `
-  SELECT
-    engineering_change_id,
-    change_type,
-    target_table,
-    bom_id,
-    produced_item,
-    location,
-    resource,
-    summarynotes,
-    change_date,
-    user_name
-  FROM planning_bom_change_log_summary
-  WHERE engineering_change_id = $1
-    AND bom_id = $2
-    AND ($3 = '' OR location = $3)
-    AND LOWER(change_type) LIKE 'add%'
-  ORDER BY change_date DESC, engineering_change_id DESC
-`;
-
-
+      SELECT
+        engineering_change_id,
+        change_type,
+        target_table,
+        bom_id,
+        produced_item,
+        location,
+        resource,
+        summarynotes,
+        change_summary,
+        change_date,
+        user_name
+      FROM planning_bom_change_log_summary
+      WHERE engineering_change_id = $1
+        AND (
+          bom_id = $2
+          OR $2 = ANY(regexp_split_to_array(COALESCE(bom_id, ''), '\\s*,\\s*'))
+        )
+        AND (
+          $3 = ''
+          OR location = $3
+          OR $3 = ANY(regexp_split_to_array(COALESCE(location, ''), '\\s*,\\s*'))
+        )
+        AND (
+          $4 = ''
+          OR resource = $4
+          OR $4 = ANY(regexp_split_to_array(COALESCE(resource, ''), '\\s*,\\s*'))
+        )
+        AND LOWER(change_type) LIKE 'add%'
+      ORDER BY change_date DESC, engineering_change_id DESC
+    `;
 
     const summaryResult = await pool.query(summaryQuery, [
       engineeringChangeId,
       bomId,
       location,
+      resource,
     ]);
-
-
 
     const summaryRows = summaryResult.rows || [];
 
@@ -1879,6 +2660,7 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
           engineeringChangeId,
           bomId,
           location,
+          resource,
         },
       });
     }
@@ -1891,13 +2673,10 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
     const resolvedResource =
       resource || String(firstSummaryRow.resource || "").trim();
 
-
-    // Prefer produced_item from summary log if available
     if (!producedItem) {
       producedItem = String(firstSummaryRow.produced_item || "").trim();
     }
 
-    // fallback again from bomId if still empty
     if (!producedItem && bomId) {
       const bomParts = bomId.split("_");
       if (bomParts.length >= 3) {
@@ -1908,65 +2687,47 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
     const changeDate = firstSummaryRow.change_date || "";
     const userName = firstSummaryRow.user_name || "";
 
-    // Expected routing id only if resource is passed from log/frontend
     const expectedRoutingId =
       producedItem && resolvedLocation && resolvedResource
         ? `ROUTING_${producedItem}_${resolvedLocation}_${resolvedResource}`
         : "";
 
-    // 2) Fetch from bom_produced
-
+    // ---------------------------------------------------------
+    // 2) Fetch all matching rows from main tables
+    // ---------------------------------------------------------
     const producedQuery = `
-  SELECT *
-  FROM bom_produced
-  WHERE bom_id = $1
-    AND location = $2
-    AND ($3 = '' OR item = $3)
-  ORDER BY load_datetime DESC NULLS LAST
-  LIMIT 1
-`;
-
-
-
-    // 3) Fetch from bom_consumed
+      SELECT *
+      FROM bom_produced
+      WHERE bom_id = $1
+        AND location = $2
+        AND ($3 = '' OR item = $3)
+      ORDER BY load_datetime DESC NULLS LAST
+    `;
 
     const consumedQuery = `
-  SELECT *
-  FROM bom_consumed
-  WHERE bom_id = $1
-    AND location = $2
-  ORDER BY load_datetime DESC NULLS LAST
-`;
+      SELECT *
+      FROM bom_consumed
+      WHERE bom_id = $1
+        AND location = $2
+      ORDER BY load_datetime DESC NULLS LAST
+    `;
 
-
-
-    // 4) Fetch from item_bom_routing
-    // item_bom_routing has item, bom_id, routing_id
-    // no location column, no resource column
-
+    // item_bom_routing does not have location/resource columns in DB
+    // so fetch by bom_id (and optionally item)
     const routingQuery = `
-  SELECT *
-  FROM item_bom_routing
-  WHERE bom_id = $1
-    AND ($2 = '' OR item = $2)
-    AND ($3 = '' OR routing_id = $3)
-  ORDER BY load_datetime DESC NULLS LAST
-  LIMIT 1
-`;
-
-
-    // 5) Fetch from bom_parameters
-    // bom_parameters only has bom_id + date columns
+      SELECT *
+      FROM item_bom_routing
+      WHERE bom_id = $1
+        AND ($2 = '' OR item = $2)
+      ORDER BY load_datetime DESC NULLS LAST
+    `;
 
     const parameterQuery = `
-  SELECT *
-  FROM bom_parameters
-  WHERE bom_id = $1
-  ORDER BY load_datetime DESC NULLS LAST
-  LIMIT 1
-`;
-
-
+      SELECT *
+      FROM bom_parameters
+      WHERE bom_id = $1
+      ORDER BY load_datetime DESC NULLS LAST
+    `;
 
     const producedResult = await pool.query(producedQuery, [
       bomId,
@@ -1982,17 +2743,20 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
     const routingResult = await pool.query(routingQuery, [
       bomId,
       producedItem,
-      expectedRoutingId,
     ]);
-
 
     const parameterResult = await pool.query(parameterQuery, [bomId]);
 
+    const bomProducedRows = producedResult.rows || [];
+    const bomProduced = bomProducedRows[0] || {};
 
-    const bomProduced = producedResult.rows[0] || {};
     const bomConsumedRows = consumedResult.rows || [];
-    const itemBomRouting = routingResult.rows[0] || {};
-    const bomParameters = parameterResult.rows[0] || {};
+
+    const itemBomRoutingRows = routingResult.rows || [];
+    const itemBomRouting = itemBomRoutingRows[0] || {};
+
+    const bomParametersRows = parameterResult.rows || [];
+    const bomParameters = bomParametersRows[0] || {};
 
     const resolvedItem =
       producedItem ||
@@ -2004,6 +2768,102 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
       itemBomRouting.routing_id ||
       expectedRoutingId ||
       "";
+
+    // ---------------------------------------------------------
+    // 3) Build one combined array for frontend cards
+    // ---------------------------------------------------------
+    const createdRecords = [
+      ...bomParametersRows.map((row, index) => ({
+        tableName: "bom_parameters",
+        key: `bom_parameters_${row.postgresql_rec_id || row.rec_id || index}`,
+        bomId: row.bom_id || "",
+        item: "",
+        location: resolvedLocation || "",
+        resource: resolvedResource || "",
+        routingId: "",
+        priority: "",
+        quantity: "",
+        startDate: row.erp_bom_start_date || "",
+        endDate: row.erp_bom_end_date || "",
+      })),
+
+      ...bomProducedRows.map((row, index) => ({
+        tableName: "bom_produced",
+        key: `bom_produced_${row.postgresql_rec_id || row.rec_id || index}`,
+        bomId: row.bom_id || "",
+        item: row.item || "",
+        location: row.location || "",
+        resource: resolvedResource || "",
+        routingId: "",
+        priority: "",
+        quantity: row.erp_bom_qty_produced_per || "",
+        startDate: "",
+        endDate: "",
+      })),
+
+      ...bomConsumedRows.map((row, index) => ({
+        tableName: "bom_consumed",
+        key: `bom_consumed_${row.postgresql_rec_id || row.rec_id || index}`,
+        bomId: row.bom_id || "",
+        item: row.item || "",
+        location: row.location || "",
+        resource: resolvedResource || "",
+        routingId: "",
+        priority: "",
+        quantity:
+          row.erp_bom_quantity_consumed_per ??
+          row.bom_quantity_consumed_per ??
+          "",
+        startDate:
+          row.erp_bom_component_start_date ??
+          row.bom_component_start_date ??
+          "",
+        endDate:
+          row.erp_bom_component_end_date ??
+          row.bom_component_end_date ??
+          "",
+      })),
+
+      ...itemBomRoutingRows.map((row, index) => ({
+        tableName: "item_bom_routing",
+        key: `item_bom_routing_${row.postgresql_rec_id || row.rec_id || index}`,
+        bomId: row.bom_id || "",
+        item: row.item || "",
+        location: resolvedLocation || "",
+        resource:
+          String(row.routing_id || "").split("_").slice(3).join("_") ||
+          resolvedResource ||
+          "",
+        routingId: row.routing_id || "",
+        priority:
+          row.erp_item_bom_routing_priority ??
+          row.item_bom_routing_priority ??
+          "",
+        quantity: "",
+        startDate: "",
+        endDate: "",
+        minLotSize:
+          row.erp_item_bom_routing_min_lot_size ??
+          row.item_bom_routing_min_lot_size ??
+          "",
+        lotSizeIncrement:
+          row.erp_item_bom_routing_lot_size_increment ??
+          row.item_bom_routing_lot_size_increment ??
+          "",
+        wipSweepPriority:
+          row.erp_item_bom_routing_wip_sweep_priority ??
+          row.item_bom_routing_wip_sweep_priority ??
+          "",
+        coProductAssociation:
+          row.erp_co_product_association ??
+          row.co_product_association ??
+          "",
+        maxLotSize:
+          row.erp_item_bom_routing_max_lot_size ??
+          row.item_bom_routing_max_lot_size ??
+          "",
+      })),
+    ];
 
     return res.json({
       engineeringChangeId,
@@ -2017,17 +2877,36 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
       resource: resolvedResource,
       routingId: resolvedRoutingId,
 
+      itemBomRoutingPriority:
+        itemBomRouting.erp_item_bom_routing_priority ??
+        itemBomRouting.item_bom_routing_priority ??
+        "",
+
+      coProductAssociation:
+        itemBomRouting.erp_co_product_association ??
+        itemBomRouting.co_product_association ??
+        "",
+
       itemReleaseFlag: "",
       resourceRelevancy: "",
       summaryNotes: firstSummaryRow.summarynotes || "",
+      changeSummary: firstSummaryRow.change_summary || "",
 
       summaryLogRows: summaryRows,
-      bomProduced,
-      bomConsumedRows,
-      itemBomRouting,
-      bomParameters,
-    });
 
+      bomProduced,
+      bomProducedRows,
+
+      bomConsumedRows,
+
+      itemBomRouting,
+      itemBomRoutingRows,
+
+      bomParameters,
+      bomParametersRows,
+
+      createdRecords,
+    });
   } catch (error) {
     console.error("DB Error (engineering-changes-detail-add):", error);
     return res.status(500).json({
@@ -2070,8 +2949,8 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
         produced_item,
         location,
         resource,
-        routing_id,
         summarynotes,
+        change_summary,
         change_date,
         user_name,
         postgresql_rec_id,
@@ -2111,19 +2990,45 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
 
     const firstRow = rows[0] || {};
 
+    const derivedRoutingId =
+      (firstRow.produced_item || item) && (firstRow.resource || resource)
+        ? `ROUTING_${firstRow.produced_item || item}_${firstRow.resource || resource}`
+        : "";
+
+    const deletedBomRecords = rows.map((row) => ({
+      producedItem: row.produced_item || "",
+      itemDescription: "",
+      location: row.location || "",
+      bomId: row.bom_id || "",
+      resource: row.resource || "",
+      routingId:
+        row.produced_item && row.resource
+          ? `ROUTING_${row.produced_item}_${row.resource}`
+          : "",
+      summaryNotes: row.summarynotes || "",
+      changeSummary: row.change_summary || "",
+      targetTable: row.target_table || "",
+      postgresqlRecId: row.postgresql_rec_id || "",
+      recId: row.rec_id || "",
+    }));
+
     return res.status(200).json({
       success: true,
       data: {
-        engineeringChangeId: firstRow.engineering_change_id || engineeringChangeId,
+        engineeringChangeId:
+          firstRow.engineering_change_id || engineeringChangeId,
         changeDate: firstRow.change_date || "",
-        user: firstRow.user_name || String(user?.userId || "").trim() || "SYSTEM_USER",
+        user: firstRow.user_name || "SYSTEM_USER",
         changeType: "Deleted",
         item: firstRow.produced_item || item || "",
         itemDescription: "",
         location: firstRow.location || location || "",
         bomId: firstRow.bom_id || bomId || "",
         resource: firstRow.resource || resource || "",
+        routingId: derivedRoutingId,
         summaryNotes: firstRow.summarynotes || "",
+        changeSummary: firstRow.change_summary || "",
+        deletedBomRecords,
         summaryRows: rows,
       },
     });
@@ -2133,6 +3038,384 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
       error: "Failed to fetch engineering delete BOM detail",
       details: error.message,
     });
+  }
+});
+
+router.get("/engineering-changes-detail-modify", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const engineeringChangeId = String(req.query.engineeringChangeId || "").trim();
+    const bomId = String(req.query.bomId || "").trim();
+    const location = String(req.query.location || "").trim();
+    const resource = String(req.query.resource || "").trim();
+    const producedItem = String(req.query.producedItem || req.query.item || "").trim();
+    const componentItem = String(req.query.componentItem || "").trim();
+
+    if (!engineeringChangeId) {
+      return res.status(400).json({
+        success: false,
+        message: "engineeringChangeId is required",
+      });
+    }
+
+    if (!bomId) {
+      return res.status(400).json({
+        success: false,
+        message: "bomId is required",
+      });
+    }
+
+    if (!location) {
+      return res.status(400).json({
+        success: false,
+        message: "location is required",
+      });
+    }
+
+    // ---------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------
+    const safeText = (value) => {
+      if (value === null || value === undefined) return "";
+      return String(value).trim();
+    };
+
+    const isSame = (a, b) => safeText(a) === safeText(b);
+
+    const buildChangeRow = (field, originalValue, updatedValue) => ({
+      field,
+      originalValue: originalValue ?? "",
+      updatedValue: updatedValue ?? "",
+      changed: !isSame(originalValue, updatedValue),
+    });
+
+    const getResourceFromRoutingIdLocal = (routingId) => {
+      const value = safeText(routingId);
+      if (!value) return "";
+
+      // Example:
+      // 1001_20054_R20_RETORT_20 -> R20_RETORT_20
+      const parts = value.split("_").filter(Boolean);
+      if (parts.length <= 2) return value;
+      return parts.slice(2).join("_");
+    };
+
+    const fetchSingleRow = async ({ tableName, whereClause, values, orderBy = "" }) => {
+      const query = `
+        SELECT *
+        FROM ${quoteIdent(tableName)}
+        WHERE ${whereClause}
+        ${orderBy ? `ORDER BY ${orderBy}` : ""}
+        LIMIT 1
+      `;
+      const result = await client.query(query, values);
+      return result.rows[0] || null;
+    };
+
+    // ---------------------------------------------------------
+    // 1) Fetch header row from planning_bom_change_log_summary
+    // IMPORTANT:
+    // This table does NOT have created_at / created_on
+    // So order only by existing columns
+    // ---------------------------------------------------------
+    let headerRow = null;
+
+    if (resource) {
+      const headerWithResourceResult = await client.query(
+        `
+        SELECT *
+        FROM planning_bom_change_log_summary
+        WHERE engineering_change_id = $1
+          AND bom_id = $2
+          AND location = $3
+          AND resource = $4
+        ORDER BY change_date DESC NULLS LAST, rec_id DESC
+        LIMIT 1
+        `,
+        [engineeringChangeId, bomId, location, resource]
+      );
+
+      headerRow = headerWithResourceResult.rows[0] || null;
+    }
+
+    if (!headerRow) {
+      const headerResult = await client.query(
+        `
+        SELECT *
+        FROM planning_bom_change_log_summary
+        WHERE engineering_change_id = $1
+          AND bom_id = $2
+          AND location = $3
+        ORDER BY change_date DESC NULLS LAST, rec_id DESC
+        LIMIT 1
+        `,
+        [engineeringChangeId, bomId, location]
+      );
+
+      headerRow = headerResult.rows[0] || null;
+    }
+
+    // ---------------------------------------------------------
+    // 2) Fetch BOM_PRODUCED original + updated
+    // based on state payload values
+    // ---------------------------------------------------------
+    let producedWhereClause = `bom_id = $1 AND location = $2`;
+    let producedWhereValues = [bomId, location];
+
+    if (producedItem) {
+      producedWhereClause += ` AND item = $3`;
+      producedWhereValues.push(producedItem);
+    }
+
+    const originalProducedRow = await fetchSingleRow({
+      tableName: "bom_produced_og",
+      whereClause: producedWhereClause,
+      values: producedWhereValues,
+      orderBy: "load_datetime DESC NULLS LAST",
+    });
+
+    const updatedProducedRow = await fetchSingleRow({
+      tableName: "bom_produced",
+      whereClause: producedWhereClause,
+      values: producedWhereValues,
+      orderBy: "load_datetime DESC NULLS LAST",
+    });
+
+    // ---------------------------------------------------------
+    // 3) Fetch BOM_PARAMETERS original + updated
+    // ---------------------------------------------------------
+    const originalParametersRow = await fetchSingleRow({
+      tableName: "bom_parameters_og",
+      whereClause: `bom_id = $1`,
+      values: [bomId],
+      orderBy: "load_datetime DESC NULLS LAST",
+    });
+
+    const updatedParametersRow = await fetchSingleRow({
+      tableName: "bom_parameters",
+      whereClause: `bom_id = $1`,
+      values: [bomId],
+      orderBy: "load_datetime DESC NULLS LAST",
+    });
+
+    // ---------------------------------------------------------
+    // 4) Fetch ITEM_BOM_ROUTING original + updated
+    // item_bom_routing has NO resource column
+    // so fetch bom_id rows, then filter by item/resource
+    // ---------------------------------------------------------
+    const routingOgResult = await client.query(
+      `
+      SELECT *
+      FROM item_bom_routing_og
+      WHERE bom_id = $1
+      ORDER BY load_datetime DESC NULLS LAST
+      `,
+      [bomId]
+    );
+
+    const routingLiveResult = await client.query(
+      `
+      SELECT *
+      FROM item_bom_routing
+      WHERE bom_id = $1
+      ORDER BY load_datetime DESC NULLS LAST
+      `,
+      [bomId]
+    );
+
+    const pickRoutingRow = (rows) => {
+      let candidates = rows || [];
+
+      if (producedItem) {
+        const itemMatched = candidates.filter(
+          (row) => safeText(row.item) === producedItem
+        );
+        if (itemMatched.length) {
+          candidates = itemMatched;
+        }
+      }
+
+      if (resource) {
+        const resourceMatched = candidates.filter((row) => {
+          const parsedResource = getResourceFromRoutingIdLocal(row.routing_id);
+          return safeText(parsedResource) === resource;
+        });
+
+        if (resourceMatched.length) {
+          return resourceMatched[0];
+        }
+      }
+
+      return candidates[0] || null;
+    };
+
+    const originalRoutingRow = pickRoutingRow(routingOgResult.rows);
+    const updatedRoutingRow = pickRoutingRow(routingLiveResult.rows);
+
+    // ---------------------------------------------------------
+    // 5) Fetch BOM_CONSUMED original + updated
+    // if componentItem passed, use it
+    // else fetch first row for bom_id + location
+    // ---------------------------------------------------------
+    let originalConsumedRow = null;
+    let updatedConsumedRow = null;
+
+    if (componentItem) {
+      originalConsumedRow = await fetchSingleRow({
+        tableName: "bom_consumed_og",
+        whereClause: `bom_id = $1 AND location = $2 AND item = $3`,
+        values: [bomId, location, componentItem],
+        orderBy: "load_datetime DESC NULLS LAST",
+      });
+
+      updatedConsumedRow = await fetchSingleRow({
+        tableName: "bom_consumed",
+        whereClause: `bom_id = $1 AND location = $2 AND item = $3`,
+        values: [bomId, location, componentItem],
+        orderBy: "load_datetime DESC NULLS LAST",
+      });
+    } else {
+      originalConsumedRow = await fetchSingleRow({
+        tableName: "bom_consumed_og",
+        whereClause: `bom_id = $1 AND location = $2`,
+        values: [bomId, location],
+        orderBy: "load_datetime DESC NULLS LAST",
+      });
+
+      updatedConsumedRow = await fetchSingleRow({
+        tableName: "bom_consumed",
+        whereClause: `bom_id = $1 AND location = $2`,
+        values: [bomId, location],
+        orderBy: "load_datetime DESC NULLS LAST",
+      });
+    }
+
+    // ---------------------------------------------------------
+    // 6) Resolve display resource
+    // ---------------------------------------------------------
+    const originalResource =
+      getResourceFromRoutingIdLocal(originalRoutingRow?.routing_id || "") || resource;
+
+    const updatedResource =
+      getResourceFromRoutingIdLocal(updatedRoutingRow?.routing_id || "") || resource;
+
+    // ---------------------------------------------------------
+    // 7) Build response
+    // ---------------------------------------------------------
+    const bomRecordChanges = [
+      buildChangeRow(
+        "Location",
+        originalProducedRow?.location || location,
+        updatedProducedRow?.location || location
+      ),
+      buildChangeRow(
+        "Produced Item",
+        originalProducedRow?.item || producedItem,
+        updatedProducedRow?.item || producedItem
+      ),
+      buildChangeRow(
+        "BOM Status",
+        originalProducedRow?.bom_status || "",
+        updatedProducedRow?.bom_status || ""
+      ),
+      buildChangeRow(
+        "Resource",
+        originalResource,
+        updatedResource
+      ),
+      buildChangeRow(
+        "Routing ID",
+        originalRoutingRow?.routing_id || "",
+        updatedRoutingRow?.routing_id || ""
+      ),
+      buildChangeRow(
+        "Item BOM Routing Priority",
+        originalRoutingRow?.item_bom_routing_priority || "",
+        updatedRoutingRow?.item_bom_routing_priority || ""
+      ),
+      buildChangeRow(
+        "Co-Product Association",
+        originalRoutingRow?.co_product_association || "",
+        updatedRoutingRow?.co_product_association || ""
+      ),
+      buildChangeRow(
+        "BOM Version",
+        originalProducedRow?.bom_version || "",
+        updatedProducedRow?.bom_version || ""
+      ),
+      buildChangeRow(
+        "BOM ID",
+        originalProducedRow?.bom_id || originalParametersRow?.bom_id || bomId,
+        updatedProducedRow?.bom_id || updatedParametersRow?.bom_id || bomId
+      ),
+      buildChangeRow(
+        "ERP BOM Start Date",
+        originalParametersRow?.erp_bom_start_date || "",
+        updatedParametersRow?.erp_bom_start_date || ""
+      ),
+      buildChangeRow(
+        "ERP BOM End Date",
+        originalParametersRow?.erp_bom_end_date || "",
+        updatedParametersRow?.erp_bom_end_date || ""
+      ),
+    ].filter(
+      (row) =>
+        safeText(row.originalValue) !== "" || safeText(row.updatedValue) !== ""
+    );
+
+    const componentItemChanges = [
+      buildChangeRow(
+        "Component Item 1",
+        originalConsumedRow?.item || componentItem || "",
+        updatedConsumedRow?.item || componentItem || ""
+      ),
+      buildChangeRow(
+        "Standard Usage 1",
+        originalConsumedRow?.bom_quantity_consumed_per || "",
+        updatedConsumedRow?.bom_quantity_consumed_per || ""
+      ),
+      buildChangeRow(
+        "Component Start Date 1",
+        originalConsumedRow?.bom_component_start_date || "",
+        updatedConsumedRow?.bom_component_start_date || ""
+      ),
+      buildChangeRow(
+        "Component End Date 1",
+        originalConsumedRow?.bom_component_end_date || "",
+        updatedConsumedRow?.bom_component_end_date || ""
+      ),
+    ].filter(
+      (row) =>
+        safeText(row.originalValue) !== "" || safeText(row.updatedValue) !== ""
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        header: {
+          engineeringChangeId,
+          changeDate: headerRow?.change_date || "",
+          userName: headerRow?.user_name || "",
+          changeType: headerRow?.change_type || "Modified",
+          bomId,
+          location,
+          resource,
+          summaryNotes: headerRow?.summarynotes || "",
+        },
+        bomRecordChanges,
+        componentItemChanges,
+      },
+    });
+  } catch (error) {
+    console.error("DB Error (engineering-changes-detail-modify):", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch engineering modify detail",
+      details: error.message,
+    });
+  } finally {
+    client.release();
   }
 });
 
