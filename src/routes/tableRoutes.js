@@ -526,12 +526,14 @@ router.get("/existing-bom-search", async (req, res) => {
     `);
 
     const routingResult = await pool.query(`
-      SELECT DISTINCT
+      SELECT
+        TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+        TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
         TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id
       FROM item_bom_routing ibr
       WHERE ibr.routing_id IS NOT NULL
         AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
-      ORDER BY TRIM(CAST(ibr.routing_id AS TEXT))
+      ORDER BY TRIM(CAST(ibr.bom_id AS TEXT)), TRIM(CAST(ibr.routing_id AS TEXT))
     `);
 
     const { projectId, dataset } = getBigQueryConfig();
@@ -582,65 +584,74 @@ router.get("/existing-bom-search", async (req, res) => {
       }
     }
 
-    const resourcesByBaseKey = new Map();
+    const getResourceFromRoutingIdValue = (routingId) => {
+      const value = normalizeText(routingId);
+      if (!value) return "";
+      const parts = value.split("_").map((p) => p.trim()).filter(Boolean);
 
-    for (const row of routingResult.rows) {
-      const routingId = normalizeText(row.routing_id);
-      if (!routingId) continue;
-
-      const { baseKey, resource } = getBaseKeyAndResourceFromRoutingId(
-        routingId
-      );
-
-      if (!baseKey || !resource) continue;
-
-      if (!resourcesByBaseKey.has(baseKey)) {
-        resourcesByBaseKey.set(baseKey, []);
+      // ROUTING_item_resource...
+      if (parts.length >= 3 && parts[0].toUpperCase() === "ROUTING") {
+        return parts.slice(2).join("_");
       }
 
-      const existing = resourcesByBaseKey.get(baseKey);
-      if (!existing.includes(resource)) {
-        existing.push(resource);
+      // fallback for other patterns
+      return parts.length >= 2 ? parts.slice(1).join("_") : "";
+    };
+
+    const routingsByBomId = new Map();
+    for (const row of routingResult.rows || []) {
+      const bomId = normalizeText(row.bom_id);
+      if (!bomId) continue;
+
+      if (!routingsByBomId.has(bomId)) {
+        routingsByBomId.set(bomId, []);
       }
+
+      routingsByBomId.get(bomId).push({
+        produced_item: normalizeText(row.produced_item),
+        routing_id: normalizeText(row.routing_id),
+        resource: getResourceFromRoutingIdValue(row.routing_id),
+      });
     }
 
     const mergedRows = [];
-
     for (const row of producedResult.rows) {
       const bomId = normalizeText(row.bom_id);
       const producedItem = normalizeText(row.produced_item);
       const location = normalizeText(row.location);
-
       if (!bomId || !producedItem) continue;
 
       const producedItemKey = normalizeUpper(producedItem);
       const producedItemDesc = itemDescMap.get(producedItemKey) ?? "";
       const itemReleaseFlag = releaseFlagMap.get(producedItemKey) ?? "";
 
-      const baseKey = getBaseKeyFromBomId(bomId);
-      const resources = resourcesByBaseKey.get(baseKey) ?? [];
+      const routingRows = (routingsByBomId.get(bomId) || []).filter(
+        (r) => !r.produced_item || r.produced_item === producedItem
+      );
 
-      if (resources.length === 0) {
+      if (routingRows.length === 0) {
         mergedRows.push({
-          id: `${bomId}__NORESOURCE`,
+          id: `${bomId}__NOROUTING`,
           location,
           produced_item: producedItem,
           produced_item_desc: producedItemDesc,
           bom_id: bomId,
           resource: "",
+          routing_id: "",
           item_release_flag: itemReleaseFlag,
         });
         continue;
       }
 
-      for (const resource of resources) {
+      for (const routing of routingRows) {
         mergedRows.push({
-          id: `${bomId}__${resource}`,
+          id: `${bomId}__${routing.routing_id || routing.resource || "ROW"}`,
           location,
           produced_item: producedItem,
           produced_item_desc: producedItemDesc,
           bom_id: bomId,
-          resource,
+          resource: routing.resource || "",
+          routing_id: routing.routing_id || "",
           item_release_flag: itemReleaseFlag,
         });
       }
@@ -1201,9 +1212,13 @@ router.put("/modify-bom", async (req, res) => {
         ]
       );
 
-      // =========================================================
+   // =========================================================
       // 3) BOM_CONSUMED
+      // If row exists -> archive + update
+      // If row missing -> insert new row
       // =========================================================
+      const bomConsumedColumns = await getExistingColumns(client, "bom_consumed");
+
       for (const component of Array.isArray(location.componentItems)
         ? location.componentItems
         : []) {
@@ -1229,80 +1244,108 @@ router.put("/modify-bom", async (req, res) => {
           [bomId, locationName, componentItem]
         );
 
-        if (!consumedLiveResult.rows.length) {
-          throw new Error(
-            `No matching bom_consumed row found for bom_id=${bomId}, location=${locationName}, item=${componentItem}`
+        // ---------------------------------------------------------
+        // Existing row found -> archive + update
+        // ---------------------------------------------------------
+        if (consumedLiveResult.rows.length) {
+          const consumedLiveRow = consumedLiveResult.rows[0];
+          const consumedActualRecId = getResolvedRowId(
+            consumedLiveRow,
+            bomConsumedIdColumn
           );
-        }
 
-        const consumedLiveRow = consumedLiveResult.rows[0];
-        const consumedActualRecId = getResolvedRowId(
-          consumedLiveRow,
-          bomConsumedIdColumn
-        );
+          if (
+            consumedActualRecId == null ||
+            String(consumedActualRecId).trim() === ""
+          ) {
+            throw new Error(
+              `Could not resolve live row id for bom_consumed using column ${bomConsumedIdColumn}`
+            );
+          }
 
-        if (
-          consumedActualRecId == null ||
-          String(consumedActualRecId).trim() === ""
-        ) {
-          throw new Error(
-            `Could not resolve live row id for bom_consumed using column ${bomConsumedIdColumn}`
+          const componentChanges = [];
+          if (String(consumedLiveRow.item ?? "") !== String(componentItem)) {
+            componentChanges.push(
+              `Component Item (${consumedLiveRow.item ?? ""} -> ${componentItem})`
+            );
+          }
+          if (
+            String(consumedLiveRow.erp_bom_quantity_consumed_per ?? "") !==
+            String(standardUsage ?? "")
+          ) {
+            componentChanges.push(
+              `Standard Usage (${consumedLiveRow.erp_bom_quantity_consumed_per ?? ""} -> ${standardUsage ?? ""})`
+            );
+          }
+
+          await archiveOnly({
+            sourceTable: "bom_consumed",
+            archiveTable: "bom_consumed_og",
+            sourceRow: consumedLiveRow,
+            actualRecId: consumedActualRecId,
+            logProducedItem: producedItem.item || "",
+            logItem: componentItem,
+            logLocation: locationName,
+            logResource: resource,
+            summaryText: buildModifiedSummary(
+              "component information",
+              componentChanges
+            ),
+            summaryCategory: componentChanges.length
+              ? "component information"
+              : "",
+          });
+
+          await client.query(
+            `
+            UPDATE bom_consumed
+            SET
+              item = $1,
+              erp_bom_quantity_consumed_per = $2,
+              erp_bom_component_start_date = $3,
+              erp_bom_component_end_date = $4,
+              load_datetime = $5
+            WHERE ${quoteIdent(bomConsumedIdColumn)} = $6
+            `,
+            [
+              componentItem,
+              standardUsage,
+              HARD_CODED_START_DATE,
+              HARD_CODED_END_DATE,
+              HARD_CODED_LOAD_DATETIME,
+              consumedActualRecId,
+            ]
           );
-        }
+        } else {
+          // ---------------------------------------------------------
+          // Row missing -> insert new bom_consumed row
+          // ---------------------------------------------------------
+          const newConsumedRow = {
+            bom_id: bomId,
+            item: componentItem,
+            location: locationName,
+            erp_bom_quantity_consumed_per: standardUsage,
+            erp_bom_component_start_date: HARD_CODED_START_DATE,
+            erp_bom_component_end_date: HARD_CODED_END_DATE,
+            load_datetime: HARD_CODED_LOAD_DATETIME,
+            rec_id: generateUniqueBigInt(),
+          };
 
-        const componentChanges = [];
-        if (String(consumedLiveRow.item ?? "") !== String(componentItem)) {
-          componentChanges.push(
-            `Component Item (${consumedLiveRow.item ?? ""} -> ${componentItem})`
+          const consumedInsert = buildInsertQuery(
+            "bom_consumed",
+            newConsumedRow,
+            bomConsumedColumns
           );
-        }
-        if (
-          String(consumedLiveRow.erp_bom_quantity_consumed_per ?? "") !==
-          String(standardUsage ?? "")
-        ) {
-          componentChanges.push(
-            `Standard Usage (${consumedLiveRow.erp_bom_quantity_consumed_per ?? ""} -> ${standardUsage ?? ""})`
-          );
-        }
 
-        await archiveOnly({
-          sourceTable: "bom_consumed",
-          archiveTable: "bom_consumed_og",
-          sourceRow: consumedLiveRow,
-          actualRecId: consumedActualRecId,
-          logProducedItem: producedItem.item || "",
-          logItem: componentItem,
-          logLocation: locationName,
-          logResource: resource,
-          summaryText: buildModifiedSummary(
-            "component information",
-            componentChanges
-          ),
-          summaryCategory: componentChanges.length
-            ? "component information"
-            : "",
-        });
+          await client.query(consumedInsert.query, consumedInsert.values);
 
-        await client.query(
-          `
-          UPDATE bom_consumed
-          SET
-            item = $1,
-            erp_bom_quantity_consumed_per = $2,
-            erp_bom_component_start_date = $3,
-            erp_bom_component_end_date = $4,
-            load_datetime = $5
-          WHERE ${quoteIdent(bomConsumedIdColumn)} = $6
-          `,
-          [
-            componentItem,
-            standardUsage,
-            HARD_CODED_START_DATE,
-            HARD_CODED_END_DATE,
-            HARD_CODED_LOAD_DATETIME,
-            consumedActualRecId,
-          ]
-        );
+          consolidatedItems.add(String(componentItem).trim());
+          consolidatedLocations.add(String(locationName).trim());
+          if (resource) {
+            consolidatedResources.add(String(resource).trim());
+          }
+          consolidatedSummaryCategories.add("component information");
+        }
       }
     }
 

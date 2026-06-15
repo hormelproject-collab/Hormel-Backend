@@ -435,7 +435,7 @@ router.get("/bom-consumed/:bomId", async (req, res) => {
   }
 });
 
-router.get("/item_bom_routing/:bomId", async (req, res) => {
+router.get("/api/bigquery/table/item_bom_routing/:bomId", async (req, res) => {
   try {
     const { bomId } = req.params;
 
@@ -446,23 +446,30 @@ router.get("/item_bom_routing/:bomId", async (req, res) => {
       });
     }
 
-    const data = await fetchFromTable(
-      "item_bom_routing",
-      { BOMID: bomId },
-      1000
-    );
+    const query = `
+      SELECT *
+      FROM \`${projectId}.${dataset}.item_bom_routing\`
+      WHERE TRIM(CAST(bom_id AS STRING)) = @bomId
+    `;
 
-    return res.status(200).json({
+    const options = {
+      query,
+      params: { bomId: String(bomId).trim() },
+      location: "US", // or your dataset location if different
+    };
+
+    const [rows] = await bigquery.query(options);
+
+    return res.json({
       success: true,
-      count: data.length,
-      data,
+      data: rows || [],
     });
   } catch (error) {
     console.error("Error fetching item BOM routing items:", error);
-
     return res.status(500).json({
       success: false,
-      message: error.message || "Something went wrong",
+      message: "Failed to fetch item BOM routing items",
+      details: error.message,
     });
   }
 });
