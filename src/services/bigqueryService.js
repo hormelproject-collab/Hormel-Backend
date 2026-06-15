@@ -404,47 +404,52 @@ export const fetchBomDetailsByBomId = async (bomId) => {
  */
 export const fetchCoProductsByItem = async (item) => {
   const { projectId, dataset } = getBigQueryConfig();
-  const columns = await getTableColumns("item_master");
+  const columns = await getTableColumns("item_bom_routing");
 
-  const relationColumnCandidates = [
-    "parent_item",
+  console.log("item_bom_routing columns:", columns);
+
+  const associationColumn = columns.includes("erp_co_product_association")
+    ? "erp_co_product_association"
+    : columns.includes("co_product_association")
+    ? "co_product_association"
+    : null;
+
+  const parentColumnCandidates = [
     "produced_item",
-    "base_item",
+    "erp_parent_item",
     "main_item",
     "item",
   ];
 
-  const coProductColumnCandidates = [
-    "co_product_item",
-    "coproduct_item",
-    "connected_co_product",
-    "co_product",
-    "connected_item",
-  ];
+  const parentColumn = parentColumnCandidates.find((c) => columns.includes(c));
 
-  const relationColumn = relationColumnCandidates.find((c) => columns.includes(c));
-  const coProductColumn = coProductColumnCandidates.find((c) => columns.includes(c));
-
-  if (!relationColumn || !coProductColumn) {
+  if (!associationColumn || !parentColumn) {
+    console.log("Missing required columns", {
+      associationColumn,
+      parentColumn,
+    });
     return [];
   }
 
   const query = `
     SELECT DISTINCT
-      TRIM(CAST(${coProductColumn} AS STRING)) AS co_product_item
-    FROM \`${projectId}.${dataset}.item_master\`
-    WHERE UPPER(TRIM(CAST(${relationColumn} AS STRING))) = @item
-      AND ${coProductColumn} IS NOT NULL
-      AND TRIM(CAST(${coProductColumn} AS STRING)) != ''
-    ORDER BY co_product_item
+      TRIM(CAST(item AS STRING)) AS item
+    FROM \`${projectId}.${dataset}.item_bom_routing\`
+    WHERE SAFE_CAST(${associationColumn} AS INT64) = 1
+    ORDER BY item
   `;
+
+  console.log("Co-product query using parentColumn:", parentColumn);
+  console.log("Selected item:", item);
 
   const rows = await runQuery(query, {
     item: normalizeUpper(item),
   });
 
+  console.log("Co-product rows:", rows);
+
   return rows.map((row) => ({
-    item: normalizeText(row.co_product_item),
+    item: normalizeText(row.item),
   }));
 };
 
