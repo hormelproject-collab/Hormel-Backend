@@ -3689,40 +3689,40 @@ router.post("/view-bom-data/search", async (req, res) => {
           `)
         : Promise.resolve({ rows: [] }),
 
-      // Use actual DB columns, alias to frontend-expected names
+      // Updated to ERP-prefixed PostgreSQL columns
       tablesToShow.includes("bom_consumed")
         ? pool.query(`
             SELECT
               item,
               location,
               bom_id,
-              bom_quantity_consumed_per AS erp_bom_quantity_consumed_per,
-              bom_component_start_date AS erp_bom_component_start_date,
-              bom_component_end_date AS erp_bom_component_end_date,
+              erp_bom_quantity_consumed_per,
+              erp_bom_component_start_date,
+              erp_bom_component_end_date,
               load_datetime
             FROM bom_consumed
             ORDER BY bom_id, item, location
           `)
         : Promise.resolve({ rows: [] }),
 
-      // Use actual DB columns, alias to frontend-expected names
-      tablesToShow.includes("item_bom_routing")
-        ? pool.query(`
-            SELECT
-              item,
-              routing_id,
-              bom_id,
-              item_bom_routing_priority AS erp_item_bom_routing_priority,
-              item_bom_routing_min_lot_size AS erp_item_bom_routing_min_lot_size,
-              item_bom_routing_lot_size_increment AS erp_item_bom_routing_lot_size_increment,
-              item_bom_routing_wip_sweep_priority AS erp_item_bom_wip_sweep_priority,
-              co_product_association AS erp_co_product_association,
-              item_bom_routing_max_lot_size AS erp_item_bom_routing_max_lot_size,
-              load_datetime
-            FROM item_bom_routing
-            ORDER BY bom_id, routing_id
-          `)
-        : Promise.resolve({ rows: [] }),
+      // Updated to ERP-prefixed PostgreSQL columns
+     tablesToShow.includes("item_bom_routing")
+  ? pool.query(`
+      SELECT
+        item,
+        routing_id,
+        bom_id,
+        erp_item_bom_routing_priority,
+        erp_item_bom_routing_min_lot_size,
+        erp_item_bom_routing_lot_size_increment,
+        erp_item_bom_wip_sweep_priority,
+        erp_co_product_association,
+        erp_item_bom_routing_max_lot_size,
+        load_datetime
+      FROM item_bom_routing
+      ORDER BY bom_id, routing_id
+    `)
+  : Promise.resolve({ rows: [] }),
     ]);
 
     let itemBomRoutingRows = (itemBomRoutingResult.rows || []).map((row) => ({
