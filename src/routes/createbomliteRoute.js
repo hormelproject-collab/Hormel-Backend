@@ -88,7 +88,7 @@ async function insertConsolidatedChangeLogRow(
     produced_item: allProducedItems.join(", "),
     location: allLocations.join(", "),
     resource: allResources.join(", "),
-    change_date: new Date().toISOString().slice(0, 10),
+    change_date: formatChicagoChangeDate(),
     user_name: userDetails.user_name || "APPL_TEAM",
     summarynotes: notes || "",
     change_summary: `Created ${totalBomRecordsCreated} BOM record${totalBomRecordsCreated === 1 ? "" : "s"}`,
@@ -117,6 +117,20 @@ function getCstTimestamp() {
   return new Date(
     new Date().toLocaleString("en-US", { timeZone: "America/Chicago" })
   );
+}
+function formatChicagoChangeDate(dateInput = new Date()) {
+  const chicagoDate = new Date(
+    new Date(dateInput).toLocaleString("en-US", { timeZone: "America/Chicago" })
+  );
+
+  const yyyy = chicagoDate.getFullYear();
+  const dd = String(chicagoDate.getDate()).padStart(2, "0");
+  const mm = String(chicagoDate.getMonth() + 1).padStart(2, "0");
+  const hh = String(chicagoDate.getHours()).padStart(2, "0");
+  const mi = String(chicagoDate.getMinutes()).padStart(2, "0");
+  const ss = String(chicagoDate.getSeconds()).padStart(2, "0");
+
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
 function getEcNumber() {
@@ -241,7 +255,7 @@ function collectNotes(payload) {
 /* =========================================================
    Build DB rows from normalized validator tables
 ========================================================= */
-function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes) {
+function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes, payloadRecords = []) {
   const now = getCstTimestamp();
 
   const bomParametersRows = ensureArray(normalizedTables?.bom_parameters).map(
@@ -294,16 +308,11 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes) {
       load_datetime: HARD_CODED_LOAD_DATETIME,
     })
   );
-const itemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map(
+const baseItemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map(
   (row) => {
     const derivedResource =
       norm(row.resource) ||
       norm(String(row.routing_id || "").split("_").slice(3).join("_"));
-
-    const coProductAssociation =
-      row.co_product_association ??
-      row.erp_co_product_association ??
-      (Number(row.is_coproduct) === 1 || row.is_coproduct === true ? 1 : 0);
 
     return {
       rec_id: generateUniqueBigInt(),
@@ -336,7 +345,8 @@ const itemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map(
         row.erp_item_bom_wip_sweep_priority ??
         1,
 
-      erp_co_product_association: coProductAssociation,
+      // produced-item row = blank / null association
+      erp_co_product_association: null,
 
       erp_item_bom_routing_max_lot_size:
         row.item_bom_routing_max_lot_size ??
@@ -349,6 +359,50 @@ const itemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map(
     };
   }
 );
+
+  const coProductRoutingRows = [];
+  const baseRoutingRowsByBomId = new Map();
+  for (const row of baseItemBomRoutingRows) {
+    const bomId = norm(row.bom_id);
+    if (!bomId) continue;
+
+    if (!baseRoutingRowsByBomId.has(bomId)) {
+      baseRoutingRowsByBomId.set(bomId, []);
+    }
+    baseRoutingRowsByBomId.get(bomId).push(row);
+  }
+
+  ensureArray(payloadRecords).forEach((record) => {
+    const bomId = norm(record?.bomId);
+    if (!bomId) return;
+
+    const baseRowsForBom = baseRoutingRowsByBomId.get(bomId) || [];
+    if (baseRowsForBom.length === 0) return;
+
+    ensureArray(record?.locations).forEach((locationRow) => {
+      ensureArray(locationRow?.coProducts).forEach((coProduct) => {
+        const coProductItem = norm(
+          coProduct?.coProductItem ?? coProduct?.item ?? coProduct?.value
+        );
+        if (!coProductItem) return;
+
+        baseRowsForBom.forEach((baseRow) => {
+          coProductRoutingRows.push({
+            ...baseRow,
+            rec_id: generateUniqueBigInt(),
+            bom_id: bomId,
+            item: coProductItem,
+            erp_co_product_association: 1,
+          });
+        });
+      });
+    });
+  });
+
+  const itemBomRoutingRows = [
+    ...baseItemBomRoutingRows,
+    ...coProductRoutingRows,
+  ];
 
   return {
     bom_parameters: bomParametersRows,
@@ -387,7 +441,7 @@ async function insertChangeLogRow(
     bom_id: bomId || "",
     produced_item: producedItem || "",
     location: location || "",
-    change_date: new Date().toISOString().slice(0, 10),
+    change_date: formatChicagoChangeDate(),
     user_name: userDetails.user_name || "APPL_TEAM",
   };
 
@@ -425,13 +479,15 @@ async function insertAllManualRows(
   normalizedTables,
   ecNumber,
   userDetails,
-  notes
+  notes,
+  payloadRecords = []
 ) {
   const dbRows = buildTargetTableRows(
     normalizedTables,
     ecNumber,
     userDetails,
-    notes
+    notes,
+    payloadRecords
   );
 
   const insertedCounts = {
@@ -603,7 +659,8 @@ router.post("/", async (req, res) => {
         validation.normalizedTables,
         ecNumber,
         userDetails,
-        notes
+        notes,
+        records
       );
 
       await client.query("COMMIT");
