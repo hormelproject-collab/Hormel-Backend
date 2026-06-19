@@ -5,6 +5,7 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import pool from "./src/db/postgresClient.js";
 
 import sampleRoute from "./src/routes/route.js";
 import bomExplosionRoute from "./src/routes/createbomliteRoute.js";
@@ -28,8 +29,6 @@ const REPORT_DIR = path.join(ROOT_DIR, "reports");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(REPORT_DIR)) fs.mkdirSync(REPORT_DIR, { recursive: true });
 
-// Existing routes
-
 // using cors to overcome browser restrictions
 app.use(
   cors({
@@ -51,20 +50,17 @@ app.use("/api/bigquery", sampleRoute);
 app.use("/api/bom-upload", bomValidateLoadRoutes);
 // BOM Explosion: create bom manual validation
 app.use("/bom-explosion", bomExplosionRoute);
-// BOM editing from exsisting records - PostgraSQL to UI
+// BOM editing from existing records - PostgreSQL to UI
 app.use("/api/tables", tableRoutes);
 
 app.get("/health", (req, res) => res.json({ status: "UP" }));
 app.get("/", (req, res) => res.send("✅ BOM API Server Running"));
 
-
-
 /* -----------------------------------------------------
-   ✅ NEW: GET ENGINEERING CHANGE DETAIL (BY ID)
+   ✅ GET ENGINEERING CHANGE DETAIL (BY ID)
    Query Param: EngineeringchangeID=EC-001234
 ------------------------------------------------------*/
 app.get("/api/engineering-changes/detail", (req, res) => {
-
   const id =
     req.query.EngineeringchangeID ||
     req.query.EngineeringChangeID ||
@@ -86,12 +82,29 @@ app.get("/api/engineering-changes/detail", (req, res) => {
   }
 
   return res.status(200).json({
-    data: detail, // ✅ preferred key for frontend
+    data: detail,
   });
 });
 
+console.log("DEBUG DB USER from server.js:", process.env.PG_USER);
+console.log("DEBUG DB HOST from server.js:", process.env.PG_HOST);
+console.log("DEBUG DB NAME from server.js:", process.env.PG_DATABASE);
 
-
+/* =============================
+   ✅ PostgreSQL connection test
+============================= */
+(async () => {
+  try {
+    const client = await pool.connect();
+    const result = await client.query(
+      "SELECT current_database(), current_user, now()"
+    );
+    console.log("✅ PostgreSQL test connection successful:", result.rows[0]);
+    client.release();
+  } catch (err) {
+    console.error("❌ PostgreSQL connection failed:", err.message);
+  }
+})();
 
 /* =============================
    ✅ Start Server

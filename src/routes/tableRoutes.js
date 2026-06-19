@@ -10,6 +10,104 @@ const bigquery = new BigQuery({
   projectId: process.env.BQ_PROJECT_ID,
 });
 
+// ENV-driven object maps
+const envOr = (key, fallback = "") => {
+  const value = process.env[key];
+  return value == null || String(value).trim() === "" ? fallback : String(value).trim();
+};
+
+const IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const assertSafeIdentifier = (value, label) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    throw new Error(`Missing identifier for ${label}`);
+  }
+  if (!IDENTIFIER_REGEX.test(normalized)) {
+    throw new Error(`Invalid SQL identifier for ${label}: ${normalized}`);
+  }
+  return normalized;
+};
+
+const CFG = Object.freeze({
+  pg: {
+    schema: envOr("PG_SCHEMA", "public"),
+    database: envOr("PG_DATABASE", "postgres"),
+  },
+  bq: {
+    projectId: envOr("BQ_PROJECT_ID", envOr("GCP_PROJECT_ID", "")),
+    dataset: envOr("BQ_DATASET", ""),
+  },
+  tables: {
+    bomParameters: envOr("PG_TABLE_BOM_PARAMETERS", "bom_parameters"),
+    bomProduced: envOr("PG_TABLE_BOM_PRODUCED", "bom_produced"),
+    bomConsumed: envOr("PG_TABLE_BOM_CONSUMED", "bom_consumed"),
+    itemBomRouting: envOr("PG_TABLE_ITEM_BOM_ROUTING", "item_bom_routing"),
+    itemMaster: envOr("PG_TABLE_ITEM_MASTER", "item_master"),
+    locationMaster: envOr("PG_TABLE_LOCATION_MASTER", "location_master"),
+    itemReleaseFlag: envOr("PG_TABLE_ITEM_RELEASEFLAG", "item_releaseflag"),
+    changeLog: envOr("PG_TABLE_CHANGE_LOG", "planning_bom_change_log_summary"),
+    bomParametersOg: envOr("PG_TABLE_BOM_PARAMETERS_OG", "bom_parameters_og"),
+    bomProducedOg: envOr("PG_TABLE_BOM_PRODUCED_OG", "bom_produced_og"),
+    bomConsumedOg: envOr("PG_TABLE_BOM_CONSUMED_OG", "bom_consumed_og"),
+    itemBomRoutingOg: envOr("PG_TABLE_ITEM_BOM_ROUTING_OG", "item_bom_routing_og"),
+    bqBomParameters: envOr("BQ_TABLE_BOM_PARAMETERS", "bom_parameters"),
+    bqBomProduced: envOr("BQ_TABLE_BOM_PRODUCED", "bom_produced"),
+    bqBomConsumed: envOr("BQ_TABLE_BOM_CONSUMED", "bom_consumed"),
+    bqItemBomRouting: envOr("BQ_TABLE_ITEM_BOM_ROUTING", "item_bom_routing"),
+    bqItemMaster: envOr("BQ_TABLE_ITEM_MASTER", "item_master"),
+    bqItemReleaseFlag: envOr("BQ_TABLE_ITEM_RELEASEFLAG", "item_releaseflag"),
+    bqLocationMaster: envOr("BQ_TABLE_LOCATION_MASTER", "location_master"),
+  },
+  columns: {
+    postgresqlRecId: envOr("PG_COL_POSTGRESQL_REC_ID", "postgresql_rec_id"),
+    recId: envOr("PG_COL_REC_ID", "rec_id"),
+    recordId: envOr("PG_COL_RECORD_ID", "record_id"),
+    bomId: envOr("PG_COL_BOM_ID", "bom_id"),
+    item: envOr("PG_COL_ITEM", "item"),
+    location: envOr("PG_COL_LOCATION", "location"),
+    routingId: envOr("PG_COL_ROUTING_ID", "routing_id"),
+    engineeringChangeId: envOr("PG_COL_ENGINEERING_CHANGE_ID", "engineering_change_id"),
+    changeType: envOr("PG_COL_CHANGE_TYPE", "change_type"),
+    changeDate: envOr("PG_COL_CHANGE_DATE", "change_date"),
+    userName: envOr("PG_COL_USER_NAME", "user_name"),
+    createdAt: envOr("PG_COL_CREATED_AT", "created_at"),
+    createdOn: envOr("PG_COL_CREATED_ON", "created_on"),
+    notes: envOr("PG_COL_NOTES", "notes"),
+    summaryNotes: envOr("PG_COL_SUMMARYNOTES", "summarynotes"),
+    changeSummary: envOr("PG_COL_CHANGE_SUMMARY", "change_summary"),
+    sourceTable: envOr("PG_COL_SOURCE_TABLE", "source_table"),
+    sourceRecId: envOr("PG_COL_SOURCE_REC_ID", "source_rec_id"),
+    originalRecId: envOr("PG_COL_ORIGINAL_REC_ID", "original_rec_id"),
+    loadDatetime: envOr("PG_COL_LOAD_DATETIME", "load_datetime"),
+    erpBomQtyProducedPer: envOr("PG_COL_ERP_BOM_QTY_PRODUCED_PER", "erp_bom_qty_produced_per"),
+    erpBomQuantityConsumedPer: envOr("PG_COL_ERP_BOM_QUANTITY_CONSUMED_PER", "erp_bom_quantity_consumed_per"),
+    erpBomComponentStartDate: envOr("PG_COL_ERP_BOM_COMPONENT_START_DATE", "erp_bom_component_start_date"),
+    erpBomComponentEndDate: envOr("PG_COL_ERP_BOM_COMPONENT_END_DATE", "erp_bom_component_end_date"),
+    erpItemBomRoutingPriority: envOr("PG_COL_ERP_ITEM_BOM_ROUTING_PRIORITY", "erp_item_bom_routing_priority"),
+    erpItemBomRoutingMinLotSize: envOr("PG_COL_ERP_ITEM_BOM_ROUTING_MIN_LOT_SIZE", "erp_item_bom_routing_min_lot_size"),
+    erpItemBomRoutingLotSizeIncrement: envOr("PG_COL_ERP_ITEM_BOM_ROUTING_LOT_SIZE_INCREMENT", "erp_item_bom_routing_lot_size_increment"),
+    erpItemBomWipSweepPriority: envOr("PG_COL_ERP_ITEM_BOM_WIP_SWEEP_PRIORITY", "erp_item_bom_wip_sweep_priority"),
+    erpItemBomRoutingWipSweepPriority: envOr("PG_COL_ERP_ITEM_BOM_ROUTING_WIP_SWEEP_PRIORITY", "erp_item_bom_routing_wip_sweep_priority"),
+    erpItemBomRoutingMaxLotSize: envOr("PG_COL_ERP_ITEM_BOM_ROUTING_MAX_LOT_SIZE", "erp_item_bom_routing_max_lot_size"),
+    erpCoProductAssociation: envOr("PG_COL_ERP_CO_PRODUCT_ASSOCIATION", "erp_co_product_association"),
+    erpBomStartDate: envOr("PG_COL_ERP_BOM_START_DATE", "erp_bom_start_date"),
+    erpBomEndDate: envOr("PG_COL_ERP_BOM_END_DATE", "erp_bom_end_date"),
+  },
+});
+
+const T = new Proxy(CFG.tables, {
+  get(target, prop) {
+    return assertSafeIdentifier(target[prop], `table.${String(prop)}`);
+  },
+});
+
+const C = new Proxy(CFG.columns, {
+  get(target, prop) {
+    return assertSafeIdentifier(target[prop], `column.${String(prop)}`);
+  },
+});
+
 /* =========================================================
    Common ID helpers
 ========================================================= */
@@ -589,15 +687,15 @@ const buildInsertQuery = (tableName, candidateData, allowedColumns) => {
    Delete helpers
 ========================================================= */
 const DELETE_BOM_SOURCE_TO_ARCHIVE = {
-  bom_parameters: "bom_parameters_og",
-  bom_produced: "bom_produced_og",
-  bom_consumed: "bom_consumed_og",
-  item_bom_routing: "item_bom_routing_og",
+  [T.bomParameters]: T.bomParametersOg,
+  [T.bomProduced]: T.bomProducedOg,
+  [T.bomConsumed]: T.bomConsumedOg,
+  [T.itemBomRouting]: T.itemBomRoutingOg,
 };
 
 const DELETE_BOM_CHANGE_LOG_TABLE_CANDIDATES = [
-  "planning_bom_change_log_summary",
-  "bom_change_log_summary",
+  T.changeLog,
+  envOr("PG_TABLE_CHANGE_LOG_FALLBACK", "bom_change_log_summary"),
 ];
 
 const toText = (value) => String(value ?? "").trim();
@@ -743,8 +841,8 @@ const deleteItemBomRoutingByBomAndRouting = async (
    BigQuery helpers
 ========================================================= */
 const getBigQueryConfig = () => {
-  const projectId = process.env.BQ_PROJECT_ID;
-  const dataset = process.env.BQ_DATASET;
+  const projectId = CFG.bq.projectId;
+  const dataset = CFG.bq.dataset;
 
   if (!projectId || !dataset) {
     throw new Error("BQ_PROJECT_ID or BQ_DATASET is not set in .env");
