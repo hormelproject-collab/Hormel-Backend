@@ -4784,11 +4784,12 @@ router.get("/:tableName", async (req, res) => {
   try {
     const allowedTables = [
       "bom_produced",
+      "bom_consumed",
       "item_bom_routing",
       "item_master",
       "location_master",
       "item_releaseflag",
-
+    
       // OG tables
       "bom_parameters_og",
       "bom_produced_og",
@@ -4818,6 +4819,7 @@ router.get("/:tableName", async (req, res) => {
 const allowedTables = [
   "item_bom_routing",
   "bom_produced",
+  "bom_consumed",
   "item_master",
   "location_master",
   "item_releaseflag",
@@ -4839,7 +4841,7 @@ router.get("/:tableName/:id", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT * FROM ${tableName} WHERE postgresql_rec_id = $1`,
+      `SELECT * FROM ${tableName} WHERE bom_id = $1`,
       [id]
     );
 
@@ -4847,7 +4849,7 @@ router.get("/:tableName/:id", async (req, res) => {
       return res.status(404).json({ message: "Record not found" });
     }
 
-    return res.json(result.rows[0]);
+    return res.json(result.rows);
   } catch (err) {
     console.error("ERROR:", err);
     return res.status(500).json({
