@@ -1,6 +1,14 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+console.log("DEBUG BQ_PROJECT_ID from server.js:", process.env.BQ_PROJECT_ID);
+console.log("DEBUG BQ_DATASET from server.js:", process.env.BQ_DATASET);
+console.log("DEBUG BQ_LOCATION from server.js:", process.env.BQ_LOCATION);
+console.log(
+  "DEBUG GOOGLE_APPLICATION_CREDENTIALS from server.js:",
+  process.env.GOOGLE_APPLICATION_CREDENTIALS
+);
+
 import express from "express";
 import cors from "cors";
 import fs from "fs";

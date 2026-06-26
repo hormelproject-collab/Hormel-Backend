@@ -6,13 +6,10 @@ import {
   fetchResourceComponentMetadata,
   fetchExistingBomSearchRows,
   fetchBomIdsFromBomParameters,
-  fetchBomDetailsByBomId,
   fetchAllResourcesFromRoutingResCons,
   fetchResourceRelevancyByResource,
-  fetchCoProductsByItem,
   fetchItemReleaseFlagByItem,
 } from "../services/bigqueryService.js";
-
 
 const router = express.Router();
 
@@ -34,14 +31,79 @@ const ALLOWED_BIGQUERY_TABLES = [
 
 const normalizeLimit = (limit) => {
   if (limit === undefined || limit === null || limit === "") return null;
-
   const text = String(limit).trim().toLowerCase();
   if (text === "all") return null;
-
   const parsed = Number(text);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
-
   return Math.floor(parsed);
+};
+
+const toText = (value) => {
+  if (value === undefined || value === null) return "";
+  return String(value).trim();
+};
+const safeArray = (value) => (Array.isArray(value) ? value : []);
+const getRowValue = (row, keys) => {
+  for (const key of keys) {
+    const value = row?.[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return value;
+    }
+  }
+  return "";
+};
+
+const getBomIdFilters = (bomId) => {
+  const value = toText(bomId);
+  if (!value) return [];
+  return [
+    { bom_id: value },
+    { BOMID: value },
+    { bomId: value },
+  ];
+};
+
+const fetchRowsByBomId = async (tableName, bomId, limit = 1000) => {
+  const filtersToTry = getBomIdFilters(bomId);
+
+  for (const filters of filtersToTry) {
+    try {
+      const rows = await fetchFromTable(tableName, filters, limit);
+      if (Array.isArray(rows) && rows.length) {
+        return rows;
+      }
+    } catch (error) {
+      const message = String(error?.message || "");
+
+      if (
+        message.includes("Unrecognized name: bom_id") ||
+        message.includes("Unrecognized name: BOMID") ||
+        message.includes("Unrecognized name: bomId")
+      ) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  return [];
+};
+
+const deriveItemAndLocationFromBomId = (bomId) => {
+  const parts = String(bomId || "")
+    .split("_")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (parts.length < 3) {
+    return { item: "", location: "" };
+  }
+
+  return {
+    item: parts[1] || "",
+    location: parts.slice(2).join("_") || "",
+  };
 };
 
 /* =========================================================
@@ -54,7 +116,6 @@ router.get("/item-master-with-releaseflag", async (req, res) => {
       filters,
       limit === undefined ? null : limit
     );
-
     return res.status(200).json(data);
   } catch (error) {
     console.error("Error fetching item master with release flag:", error);
@@ -71,15 +132,12 @@ router.get("/item-master-with-releaseflag", async (req, res) => {
 router.post("/locations-by-items", async (req, res) => {
   try {
     const { itemIds } = req.body;
-
     if (!Array.isArray(itemIds) || itemIds.length === 0) {
       return res.status(400).json({
         error: "itemIds must be a non-empty array",
       });
     }
-
     const data = await fetchLocationsBySelectedItems(itemIds);
-
     return res.status(200).json({
       success: true,
       data,
@@ -97,15 +155,12 @@ router.post("/locations-by-items", async (req, res) => {
 router.post("/by-items", async (req, res) => {
   try {
     const { itemIds } = req.body;
-
     if (!Array.isArray(itemIds) || itemIds.length === 0) {
       return res.status(400).json({
         error: "itemIds must be a non-empty array",
       });
     }
-
     const data = await fetchLocationsBySelectedItems(itemIds);
-
     return res.status(200).json({
       success: true,
       data,
@@ -139,7 +194,6 @@ router.post("/resource-component-metadata", async (req, res) => {
     }
 
     const data = await fetchResourceComponentMetadata(items, locations);
-
     return res.status(200).json({
       success: true,
       data,
@@ -156,7 +210,6 @@ router.post("/resource-component-metadata", async (req, res) => {
 router.get("/bom-routing-step1/item-releaseflag/:item", async (req, res) => {
   try {
     const item = String(req.params?.item || "").trim();
-
     if (!item) {
       return res.status(400).json({
         error: "Item is required",
@@ -164,7 +217,6 @@ router.get("/bom-routing-step1/item-releaseflag/:item", async (req, res) => {
     }
 
     const data = await fetchItemReleaseFlagByItem(item);
-
     return res.status(200).json({
       success: true,
       data,
@@ -184,7 +236,6 @@ router.get("/bom-routing-step1/item-releaseflag/:item", async (req, res) => {
 router.get("/existing-bom-search", async (req, res) => {
   try {
     const data = await fetchExistingBomSearchRows();
-
     return res.status(200).json({
       success: true,
       data,
@@ -199,12 +250,8 @@ router.get("/existing-bom-search", async (req, res) => {
 });
 
 /* =========================================================
- 5) NEW API: Create Item BOM Routing Record - Step 1
+ 5) Create Item BOM Routing Record - Step 1
 ========================================================= */
-
-/**
- * Pull all BOM IDs from bom_parameters
- */
 router.get("/bom-routing-step1/bom-ids", async (_req, res) => {
   try {
     const data = await fetchBomIdsFromBomParameters();
@@ -221,26 +268,53 @@ router.get("/bom-routing-step1/bom-ids", async (_req, res) => {
   }
 });
 
-/**
- * Based on BOM ID selected:
- * - fetch produced item + location from bom_produced
- * - fetch release flag from item_releaseflag
- */
 router.get("/bom-routing-step1/bom-details/:bomId", async (req, res) => {
   try {
     const bomId = String(req.params.bomId || "").trim();
-
     if (!bomId) {
       return res.status(400).json({
         error: "bomId is required",
       });
     }
 
-    const data = await fetchBomDetailsByBomId(bomId);
+    const producedRows = await fetchRowsByBomId("bom_produced", bomId, 1000);
+    const firstProducedRow = producedRows[0] || {};
+    const derived = deriveItemAndLocationFromBomId(bomId);
+
+    const producedItem =
+      getRowValue(firstProducedRow, [
+        "item",
+        "produced_item",
+        "producedItem",
+        "item_id",
+      ]) || derived.item;
+
+    const location =
+      getRowValue(firstProducedRow, ["location", "plant", "site"]) ||
+      derived.location;
+
+    let itemReleaseFlag = "";
+    if (producedItem) {
+      try {
+        const releaseFlagData = await fetchItemReleaseFlagByItem(producedItem);
+        itemReleaseFlag =
+          releaseFlagData?.release ||
+          releaseFlagData?.item_releaseflag ||
+          releaseFlagData?.releaseFlag ||
+          "";
+      } catch (releaseErr) {
+        console.error("Error fetching item release flag in bom-details:", releaseErr);
+      }
+    }
 
     return res.status(200).json({
       success: true,
-      data,
+      data: {
+        bomId,
+        producedItem,
+        location,
+        itemReleaseFlag,
+      },
     });
   } catch (error) {
     console.error("Error fetching BOM details:", error);
@@ -251,13 +325,9 @@ router.get("/bom-routing-step1/bom-details/:bomId", async (req, res) => {
   }
 });
 
-/**
- * Pull all resources from routing_rescons
- */
 router.get("/bom-routing-step1/resources", async (_req, res) => {
   try {
     const data = await fetchAllResourcesFromRoutingResCons();
-
     return res.status(200).json({
       success: true,
       data,
@@ -271,14 +341,9 @@ router.get("/bom-routing-step1/resources", async (_req, res) => {
   }
 });
 
-/**
- * Based on resource selected:
- * fetch resource_planning_relevance from resource_master
- */
 router.get("/bom-routing-step1/resource-relevancy/:resource", async (req, res) => {
   try {
     const resource = String(req.params.resource || "").trim();
-
     if (!resource) {
       return res.status(400).json({
         error: "resource is required",
@@ -286,7 +351,6 @@ router.get("/bom-routing-step1/resource-relevancy/:resource", async (req, res) =
     }
 
     const data = await fetchResourceRelevancyByResource(resource);
- console.error("resource relevancy:", data);
     return res.status(200).json({
       success: true,
       data,
@@ -300,21 +364,56 @@ router.get("/bom-routing-step1/resource-relevancy/:resource", async (req, res) =
   }
 });
 
-
-/**
- * Co-product list from item_master for selected item
- */
-router.get("/bom-routing-step1/co-products/:item", async (req, res) => {
+router.get("/bom-routing-step1/co-products/:bomIdOrItem", async (req, res) => {
   try {
-    const item = String(req.params.item || "").trim();
+    const bomIdOrItem = String(
+      req.params.bomIdOrItem || req.query.bomId || req.query.item || ""
+    ).trim();
 
-    if (!item) {
+    if (!bomIdOrItem) {
       return res.status(400).json({
-        error: "item is required",
+        error: "bomIdOrItem is required",
       });
     }
 
-    const data = await fetchCoProductsByItem(item);
+    let producedItemToExclude = "";
+
+    const producedRows = await fetchRowsByBomId("bom_produced", bomIdOrItem, 1000);
+    const firstProducedRow = producedRows[0] || {};
+
+    producedItemToExclude = getRowValue(firstProducedRow, [
+      "item",
+      "produced_item",
+      "producedItem",
+      "item_id",
+    ]);
+
+    if (!producedItemToExclude && !bomIdOrItem.includes("_")) {
+      producedItemToExclude = bomIdOrItem;
+    }
+
+    const itemMasterRows = await fetchFromTable("item_master", {}, null);
+
+    const data = safeArray(itemMasterRows)
+      .map((row) => ({
+        item: getRowValue(row, ["item", "item_id", "item_number", "itemNumber"]),
+        description: getRowValue(row, [
+          "item_description",
+          "item_desc",
+          "item_desc_1",
+          "description",
+          "desc",
+        ]),
+      }))
+      .filter((row) => row.item)
+      .filter((row) => row.item !== producedItemToExclude)
+      .reduce((acc, row) => {
+        if (!acc.some((existing) => existing.item === row.item)) {
+          acc.push(row);
+        }
+        return acc;
+      }, [])
+      .sort((a, b) => a.item.localeCompare(b.item));
 
     return res.status(200).json({
       success: true,
@@ -328,46 +427,13 @@ router.get("/bom-routing-step1/co-products/:item", async (req, res) => {
     });
   }
 });
-
-router.get("/bom-routing-step1/co-products/:bomId", async (req, res) => {
-  try {
-    const bomId = String(req.params.bomId || "").trim();
-    if (!bomId) {
-      return res.status(400).json({
-        error: "bomId is required",
-      });
-    }
-
-    const data = await fetchCoProductsByBomId(bomId);
-
-    return res.status(200).json({
-      success: true,
-      data,
-    });
-  } catch (error) {
-    console.error("Error fetching co-products:", error);
-    return res.status(500).json({
-      error: "Failed to fetch co-products",
-      details: error.message,
-    });
-  }
-});
-
-
-
 
 /* =========================================================
  Generic dynamic GCP table route for frontend
- Supports:
- - /api/bigquery/table/:table
- - optional filters via query params
- - ?limit=all => no limit
- - ?limit=100 => LIMIT 100
 ========================================================= */
 router.get("/:table", async (req, res) => {
   try {
     const tableName = String(req.params.table || "").trim();
-
     if (!ALLOWED_BIGQUERY_TABLES.includes(tableName)) {
       return res.status(400).json({
         error: "Invalid table name",
@@ -375,7 +441,6 @@ router.get("/:table", async (req, res) => {
     }
 
     const { limit, ...filters } = req.query || {};
-
     const normalizedFilters = Object.fromEntries(
       Object.entries(filters).filter(
         ([, value]) =>
@@ -406,7 +471,6 @@ router.get("/:table", async (req, res) => {
 router.get("/bom-consumed/:bomId", async (req, res) => {
   try {
     const { bomId } = req.params;
-
     if (!bomId) {
       return res.status(400).json({
         success: false,
@@ -414,65 +478,20 @@ router.get("/bom-consumed/:bomId", async (req, res) => {
       });
     }
 
-    const data = await fetchFromTable(
-      "bom_consumed",
-      { BOMID: bomId },
-      1000
-    );
+    const data = await fetchRowsByBomId("bom_consumed", bomId, 1000);
 
     return res.status(200).json({
       success: true,
-      count: data.length,
+      count: Array.isArray(data) ? data.length : 0,
       data,
     });
   } catch (error) {
     console.error("Error fetching BOM consumed items:", error);
-
     return res.status(500).json({
       success: false,
       message: error.message || "Something went wrong",
     });
   }
 });
-
-router.get("/api/bigquery/table/item_bom_routing/:bomId", async (req, res) => {
-  try {
-    const { bomId } = req.params;
-
-    if (!bomId) {
-      return res.status(400).json({
-        success: false,
-        message: "bomId is required",
-      });
-    }
-
-    const query = `
-      SELECT *
-      FROM \`${projectId}.${dataset}.item_bom_routing\`
-      WHERE TRIM(CAST(bom_id AS STRING)) = @bomId
-    `;
-
-    const options = {
-      query,
-      params: { bomId: String(bomId).trim() },
-      location: "US", // or your dataset location if different
-    };
-
-    const [rows] = await bigquery.query(options);
-
-    return res.json({
-      success: true,
-      data: rows || [],
-    });
-  } catch (error) {
-    console.error("Error fetching item BOM routing items:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch item BOM routing items",
-      details: error.message,
-    });
-  }
-});
-
 
 export default router;

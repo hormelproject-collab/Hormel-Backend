@@ -1,7 +1,9 @@
 import express from "express";
 import crypto from "crypto";
+import os from "os";
 import pool from "../db/postgresClient.js";
 import { validateManualEntryPayload } from "../bigquery/manualentryValidation.js";
+import { fetchItemDetailsForPostgres } from "../services/bigqueryService.js";
 
 const router = express.Router();
 
@@ -10,6 +12,255 @@ const router = express.Router();
 ========================================================= */
 const norm = (v) => String(v ?? "").trim();
 const ensureArray = (v) => (Array.isArray(v) ? v : []);
+const ITEM_DETAIL_TABLE = process.env.PG_ITEM_DETAIL_TABLE || "item_details";
+
+function collectItemResourceRowsForItemDetail(dbRows) {
+  const itemResourceRows = [];
+
+  const resourceByBomLocation = new Map();
+
+  ensureArray(dbRows?.item_bom_routing).forEach((row) => {
+    const bomId = norm(row.bom_id);
+    const location = norm(row.location);
+    const resource =
+      norm(row.resource) ||
+      norm(String(row.routing_id || "").split("_").slice(3).join("_"));
+
+    if (bomId && location && resource) {
+      resourceByBomLocation.set(`${bomId}__${location}`, resource);
+    }
+  });
+
+  const getResource = (bomId, location) => {
+    const key = `${norm(bomId)}__${norm(location)}`;
+
+    if (resourceByBomLocation.has(key)) {
+      return resourceByBomLocation.get(key);
+    }
+
+    const byBom = [...resourceByBomLocation.entries()].find(([mapKey]) =>
+      mapKey.startsWith(`${norm(bomId)}__`)
+    );
+
+    return byBom?.[1] || "";
+  };
+
+  ensureArray(dbRows?.bom_produced).forEach((row) => {
+    itemResourceRows.push({
+      item: row.item,
+      resource: getResource(row.bom_id, row.location),
+    });
+  });
+
+  ensureArray(dbRows?.bom_consumed).forEach((row) => {
+    itemResourceRows.push({
+      item: row.item,
+      resource: getResource(row.bom_id, row.location),
+    });
+  });
+
+  ensureArray(dbRows?.item_bom_routing).forEach((row) => {
+    itemResourceRows.push({
+      item: row.item,
+      resource:
+        norm(row.resource) ||
+        norm(String(row.routing_id || "").split("_").slice(3).join("_")),
+    });
+  });
+
+  return Array.from(
+    new Map(
+      itemResourceRows
+        .map((row) => ({
+          item: norm(row.item),
+          resource: norm(row.resource),
+        }))
+        .filter((row) => row.item)
+        .map((row) => [row.item.toUpperCase(), row])
+    ).values()
+  );
+}
+
+async function upsertItemDetails(client, itemDetails = []) {
+  const rows = ensureArray(itemDetails).filter((row) => norm(row.item));
+
+  if (!rows.length) {
+    return 0;
+  }
+
+  const existingColumns = await getExistingColumns(client, ITEM_DETAIL_TABLE);
+
+  if (!existingColumns.includes("item")) {
+    throw new Error(`${ITEM_DETAIL_TABLE}.item column does not exist`);
+  }
+
+  let upsertedCount = 0;
+
+  for (const detail of rows) {
+    const row = {
+      item: norm(detail.item),
+      item_description: norm(detail.item_description),
+      resource_relevancy: norm(detail.resource_relevancy),
+      item_release_flag: norm(detail.item_release_flag),
+    };
+
+    const finalEntries = Object.entries(row).filter(([key]) =>
+      existingColumns.includes(key.toLowerCase())
+    );
+
+    if (!finalEntries.length) continue;
+
+    const columns = finalEntries.map(([key]) => key);
+    const values = finalEntries.map(([, value]) => value);
+    const placeholders = columns.map((_, index) => `$${index + 1}`);
+
+    const updateColumns = columns.filter((column) => column !== "item");
+
+    const updateSet = updateColumns
+      .map((column) => `${column} = EXCLUDED.${column}`)
+      .join(", ");
+
+    const query = `
+      INSERT INTO ${ITEM_DETAIL_TABLE} (${columns.join(", ")})
+      VALUES (${placeholders.join(", ")})
+      ON CONFLICT (item)
+      DO UPDATE SET
+        ${updateSet}
+      RETURNING item
+    `;
+
+    await client.query(query, values);
+    upsertedCount += 1;
+  }
+
+  return upsertedCount;
+}
+const getOsUserName = () => {
+  try {
+    return norm(os.userInfo()?.username) || "APPL_TEAM";
+  } catch (error) {
+    return "APPL_TEAM";
+  }
+};
+
+const firstNonEmpty = (...values) => {
+  for (const value of values) {
+    const text = norm(value);
+    if (text) return text;
+  }
+  return "";
+};
+
+const uniqueJoined = (values) =>
+  Array.from(
+    new Set(
+      ensureArray(values)
+        .map((v) => norm(v))
+        .filter(Boolean)
+    )
+  ).join(", ");
+
+function collectAdditionalChangeLogFields(dbRows, payloadRecords = []) {
+  const itemDescriptions = [];
+  const itemReleaseFlags = [];
+  const resourceRelevancies = [];
+  const consumedItems = [];
+
+  ensureArray(dbRows?.bom_produced).forEach((row) => {
+    itemDescriptions.push(
+      firstNonEmpty(
+        row.item_description,
+        row.item_desc,
+        row.description,
+        row.produced_item_description
+      )
+    );
+
+    itemReleaseFlags.push(
+      firstNonEmpty(
+        row.item_release_flag,
+        row.item_Release_flag,
+        row.release_flag,
+        row.itemReleaseFlag
+      )
+    );
+  });
+
+  ensureArray(dbRows?.bom_consumed).forEach((row) => {
+    consumedItems.push(
+      firstNonEmpty(row.item, row.component_item, row.consumed_item)
+    );
+  });
+
+  ensureArray(dbRows?.item_bom_routing).forEach((row) => {
+    resourceRelevancies.push(
+      firstNonEmpty(
+        row.resource_relevancy,
+        row.resourcePlanningRelevance,
+        row.resource_planning_relevance
+      )
+    );
+  });
+
+  ensureArray(payloadRecords).forEach((record) => {
+    itemDescriptions.push(
+      firstNonEmpty(
+        record.itemDescription,
+        record.item_description,
+        record.producedItemDescription,
+        record.produced_item_description
+      )
+    );
+
+    itemReleaseFlags.push(
+      firstNonEmpty(
+        record.itemReleaseFlag,
+        record.item_release_flag,
+        record.releaseFlag
+      )
+    );
+
+    resourceRelevancies.push(
+      firstNonEmpty(
+        record.resourceRelevancy,
+        record.resource_relevancy,
+        record.resourcePlanningRelevance,
+        record.resource_planning_relevance
+      )
+    );
+
+    consumedItems.push(firstNonEmpty(record.consumedItem, record.componentItem));
+
+    ensureArray(record.components).forEach((component) => {
+      consumedItems.push(
+        firstNonEmpty(
+          component.componentItem,
+          component.consumedItem,
+          component.item
+        )
+      );
+    });
+
+    ensureArray(record.locations).forEach((locationRow) => {
+      ensureArray(locationRow.components).forEach((component) => {
+        consumedItems.push(
+          firstNonEmpty(
+            component.componentItem,
+            component.consumedItem,
+            component.item
+          )
+        );
+      });
+    });
+  });
+
+  return {
+    itemDescription: uniqueJoined(itemDescriptions),
+    itemReleaseFlag: uniqueJoined(itemReleaseFlags),
+    resourceRelevancy: uniqueJoined(resourceRelevancies),
+    consumedItem: uniqueJoined(consumedItems),
+  };
+}
 
 const HARD_CODED_START_DATE = "2019-01-01";
 const HARD_CODED_END_DATE = "2099-01-25";
@@ -26,6 +277,7 @@ async function insertConsolidatedChangeLogRow(
     insertedCounts,
     notes,
     userDetails,
+    payloadRecords = [],
   }
 ) {
   const allowedColumns = await getExistingColumns(
@@ -76,6 +328,11 @@ async function insertConsolidatedChangeLogRow(
     )
   );
 
+  const additionalChangeLogFields = collectAdditionalChangeLogFields(
+    dbRows,
+    payloadRecords
+  );
+
   const totalBomRecordsCreated = allBomIds.length;
 
   const row = {
@@ -89,7 +346,7 @@ async function insertConsolidatedChangeLogRow(
     location: allLocations.join(", "),
     resource: allResources.join(", "),
     change_date: formatChicagoChangeDate(),
-    user_name: userDetails.user_name || "APPL_TEAM",
+    user_name: getOsUserName(),
     summarynotes: notes || "",
     change_summary: `Created ${totalBomRecordsCreated} BOM record${totalBomRecordsCreated === 1 ? "" : "s"}`,
   };
@@ -108,6 +365,18 @@ async function insertConsolidatedChangeLogRow(
   }
   if (allowedColumns.includes("bom_ids")) {
     row.bom_ids = allBomIds.join(", ");
+  }
+  if (allowedColumns.includes("item_description")) {
+    row.item_description = additionalChangeLogFields.itemDescription || "";
+  }
+  if (allowedColumns.includes("item_release_flag")) {
+    row.item_release_flag = additionalChangeLogFields.itemReleaseFlag || "";
+  }
+  if (allowedColumns.includes("resource_relevancy")) {
+    row.resource_relevancy = additionalChangeLogFields.resourceRelevancy || "";
+  }
+  if (allowedColumns.includes("consumed_item")) {
+    row.consumed_item = additionalChangeLogFields.consumedItem || "";
   }
 
   await insertDynamic(client, "planning_bom_change_log_summary", row);
@@ -220,26 +489,23 @@ async function insertDynamic(client, tableName, row) {
 function getUserDetails(payload) {
   const records = ensureArray(payload?.records);
   const record0 = records[0] || {};
+  const osUser = getOsUserName();
 
   return {
-    user_name:
-      norm(payload?.user?.name) ||
-      norm(record0?.user?.name) ||
-      norm(payload?.userName) ||
-      "APPL_TEAM",
+    user_name: osUser,
     user_email:
       norm(payload?.user?.email) ||
       norm(record0?.user?.email) ||
       norm(payload?.userEmail) ||
       "",
     user_id:
+      osUser ||
       norm(payload?.user?.id) ||
       norm(record0?.user?.id) ||
       norm(payload?.userId) ||
       "",
   };
 }
-
 function collectNotes(payload) {
   const uniqueNotes = Array.from(
     new Set(
@@ -442,7 +708,7 @@ async function insertChangeLogRow(
     produced_item: producedItem || "",
     location: location || "",
     change_date: formatChicagoChangeDate(),
-    user_name: userDetails.user_name || "APPL_TEAM",
+    user_name: getOsUserName(),
   };
 
   // store notes from Summary.jsx textarea
@@ -582,6 +848,21 @@ async function insertAllManualRows(
       );
 
   }
+  // item_detail table insert/update
+  const itemResourceRows = collectItemResourceRowsForItemDetail(dbRows);
+
+  let itemDetailUpsertCount = 0;
+
+  if (itemResourceRows.length) {
+    const itemDetailsFromBigQuery = await fetchItemDetailsForPostgres(
+      itemResourceRows
+    );
+
+    itemDetailUpsertCount = await upsertItemDetails(
+      client,
+      itemDetailsFromBigQuery
+    );
+  }
 
   await insertConsolidatedChangeLogRow(client, {
     ecNumber,
@@ -589,9 +870,13 @@ async function insertAllManualRows(
     insertedCounts,
     notes,
     userDetails,
+    payloadRecords,
   });
 
-  return insertedCounts;
+  return {
+    ...insertedCounts,
+    item_detail: itemDetailUpsertCount,
+  };
 }
 
 /* =========================================================
