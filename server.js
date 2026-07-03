@@ -14,6 +14,7 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import pool from "./src/db/postgresClient.js";
+import cron from "node-cron";
 
 import sampleRoute from "./src/routes/route.js";
 import bomExplosionRoute from "./src/routes/createbomliteRoute.js";
@@ -21,7 +22,9 @@ import bomDownloadRoutes from "./src/routes/bomDownload.routes.js";
 import bigqueryRoutes from "./src/routes/bigqueryRoutes.js";
 import engineeringChanges from "./src/DummyResponse/engineeringchanges.js";
 import engineeringChangeDetailById from "./src/DummyResponse/engineeringChangeDetailDummy.js";
-import bomValidateLoadRoutes from "./src/routes/bomValidateLoad.routes.js";
+import bomValidateLoadRoutes, {
+  performScheduledGcpSync,
+} from "./src/routes/bomValidateLoad.routes.js";
 import tableRoutes from "./src/routes/tableRoutes.js";
 
 const app = express();
@@ -120,4 +123,42 @@ console.log("DEBUG DB NAME from server.js:", process.env.PG_DATABASE);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
+
+  const SCHEDULE_TIME = process.env.CHICAGO_DAILY_SCHEDULE || "0 6 * * *";
+  cron.schedule(
+    SCHEDULE_TIME,
+    async () => {
+      console.log(
+        `[scheduler] Running scheduled GCP->Postgres sync at Chicago time: ${new Date().toISOString()}`
+      );
+
+      try {
+        const { result, fetchedCounts } = await performScheduledGcpSync();
+
+        if (!result.ok) {
+          console.error(
+            `[scheduler] Validation failed: ${result.errorCount} errors`,
+            result.errorsPreview?.slice(0, 10)
+          );
+          return;
+        }
+
+        console.log(
+          `[scheduler] Sync success. inserted=`,
+          result.inserted,
+          `fetchedCounts=`,
+          fetchedCounts
+        );
+      } catch (error) {
+        console.error("[scheduler] Scheduled sync error:", error);
+      }
+    },
+    {
+      timezone: "America/Chicago",
+    }
+  );
+
+  console.log(
+    `✅ Scheduled daily Chicago-time sync: ${SCHEDULE_TIME} (America/Chicago)`
+  );
 });
