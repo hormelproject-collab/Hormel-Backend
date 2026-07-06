@@ -2,21 +2,56 @@ import express from "express";
 import crypto from "crypto";
 import os from "os";
 import pool from "../db/postgresClient.js";
+import appConfig from "../config/appConfig.js";
 import { validateManualEntryPayload } from "../bigquery/manualentryValidation.js";
 import { fetchItemDetailsForPostgres } from "../services/bigqueryService.js";
 
 const router = express.Router();
 
 /* =========================================================
+   Config-driven sources
+   - BOM core tables are written/read from PostgreSQL.
+   - item details enrichment is delegated to bigqueryService.js:
+     itemReleaseFlag => BigQuery DEV, item/resource master => BigQuery PRD.
+========================================================= */
+const IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const assertSafeIdentifier = (value, label) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    throw new Error(`Missing identifier for ${label}`);
+  }
+  if (!IDENTIFIER_REGEX.test(normalized)) {
+    throw new Error(`Invalid SQL identifier for ${label}: ${normalized}`);
+  }
+  return normalized;
+};
+
+const PG_SCHEMA = assertSafeIdentifier(appConfig.postgres.schema || "planning_bom", "postgres.schema");
+
+const PG_TABLES = Object.freeze({
+  bomParameters: assertSafeIdentifier(appConfig.postgres.tables.bomParameters, "postgres.tables.bomParameters"),
+  bomProduced: assertSafeIdentifier(appConfig.postgres.tables.bomProduced, "postgres.tables.bomProduced"),
+  bomConsumed: assertSafeIdentifier(appConfig.postgres.tables.bomConsumed, "postgres.tables.bomConsumed"),
+  itemBomRouting: assertSafeIdentifier(appConfig.postgres.tables.itemBomRouting, "postgres.tables.itemBomRouting"),
+  changeLog: assertSafeIdentifier(appConfig.postgres.tables.changeLog, "postgres.tables.changeLog"),
+  itemDetails: assertSafeIdentifier(appConfig.postgres.tables.itemDetails, "postgres.tables.itemDetails"),
+});
+
+const ITEM_DETAIL_TABLE = PG_TABLES.itemDetails;
+const CHANGE_LOG_TABLE = PG_TABLES.changeLog;
+
+const quoteIdent = (value) => `"${String(value).replace(/"/g, '""')}"`;
+const pgTableRef = (tableName) => `${quoteIdent(PG_SCHEMA)}.${quoteIdent(assertSafeIdentifier(tableName, "postgres.table"))}`;
+
+/* =========================================================
    Helpers
 ========================================================= */
 const norm = (v) => String(v ?? "").trim();
 const ensureArray = (v) => (Array.isArray(v) ? v : []);
-const ITEM_DETAIL_TABLE = process.env.PG_ITEM_DETAIL_TABLE || "item_details";
 
 function collectItemResourceRowsForItemDetail(dbRows) {
   const itemResourceRows = [];
-
   const resourceByBomLocation = new Map();
 
   ensureArray(dbRows?.item_bom_routing).forEach((row) => {
@@ -113,21 +148,31 @@ async function upsertItemDetails(client, itemDetails = []) {
     const columns = finalEntries.map(([key]) => key);
     const values = finalEntries.map(([, value]) => value);
     const placeholders = columns.map((_, index) => `$${index + 1}`);
-
     const updateColumns = columns.filter((column) => column !== "item");
 
-    const updateSet = updateColumns
-      .map((column) => `${column} = EXCLUDED.${column}`)
-      .join(", ");
+    const insertColumnsSql = columns.map(quoteIdent).join(", ");
 
-    const query = `
-      INSERT INTO ${ITEM_DETAIL_TABLE} (${columns.join(", ")})
+    let query = `
+      INSERT INTO ${pgTableRef(ITEM_DETAIL_TABLE)} (${insertColumnsSql})
       VALUES (${placeholders.join(", ")})
-      ON CONFLICT (item)
-      DO UPDATE SET
-        ${updateSet}
-      RETURNING item
+      ON CONFLICT (${quoteIdent("item")})
     `;
+
+    if (updateColumns.length) {
+      const updateSet = updateColumns
+        .map((column) => `${quoteIdent(column)} = EXCLUDED.${quoteIdent(column)}`)
+        .join(", ");
+
+      query += `
+        DO UPDATE SET ${updateSet}
+        RETURNING ${quoteIdent("item")}
+      `;
+    } else {
+      query += `
+        DO NOTHING
+        RETURNING ${quoteIdent("item")}
+      `;
+    }
 
     await client.query(query, values);
     upsertedCount += 1;
@@ -135,6 +180,7 @@ async function upsertItemDetails(client, itemDetails = []) {
 
   return upsertedCount;
 }
+
 const getOsUserName = () => {
   try {
     return norm(os.userInfo()?.username) || "APPL_TEAM";
@@ -213,11 +259,7 @@ function collectAdditionalChangeLogFields(dbRows, payloadRecords = []) {
     );
 
     itemReleaseFlags.push(
-      firstNonEmpty(
-        record.itemReleaseFlag,
-        record.item_release_flag,
-        record.releaseFlag
-      )
+      firstNonEmpty(record.itemReleaseFlag, record.item_release_flag, record.releaseFlag)
     );
 
     resourceRelevancies.push(
@@ -233,22 +275,14 @@ function collectAdditionalChangeLogFields(dbRows, payloadRecords = []) {
 
     ensureArray(record.components).forEach((component) => {
       consumedItems.push(
-        firstNonEmpty(
-          component.componentItem,
-          component.consumedItem,
-          component.item
-        )
+        firstNonEmpty(component.componentItem, component.consumedItem, component.item)
       );
     });
 
     ensureArray(record.locations).forEach((locationRow) => {
       ensureArray(locationRow.components).forEach((component) => {
         consumedItems.push(
-          firstNonEmpty(
-            component.componentItem,
-            component.consumedItem,
-            component.item
-          )
+          firstNonEmpty(component.componentItem, component.consumedItem, component.item)
         );
       });
     });
@@ -271,19 +305,9 @@ const HARD_CODED_LOAD_DATETIME = null;
 
 async function insertConsolidatedChangeLogRow(
   client,
-  {
-    ecNumber,
-    dbRows,
-    insertedCounts,
-    notes,
-    userDetails,
-    payloadRecords = [],
-  }
+  { ecNumber, dbRows, insertedCounts, notes, userDetails, payloadRecords = [] }
 ) {
-  const allowedColumns = await getExistingColumns(
-    client,
-    "planning_bom_change_log_summary"
-  );
+  const allowedColumns = await getExistingColumns(client, CHANGE_LOG_TABLE);
 
   const allBomIds = Array.from(
     new Set(
@@ -309,12 +333,10 @@ async function insertConsolidatedChangeLogRow(
   const allResources = Array.from(
     new Set(
       ensureArray(dbRows?.item_bom_routing)
-        .map((r) => {
-          return (
-            norm(r.resource) ||
-            norm(String(r.routing_id || "").split("_").slice(3).join("_"))
-          );
-        })
+        .map((r) =>
+          norm(r.resource) ||
+          norm(String(r.routing_id || "").split("_").slice(3).join("_"))
+        )
         .filter(Boolean)
     )
   );
@@ -328,11 +350,7 @@ async function insertConsolidatedChangeLogRow(
     )
   );
 
-  const additionalChangeLogFields = collectAdditionalChangeLogFields(
-    dbRows,
-    payloadRecords
-  );
-
+  const additionalChangeLogFields = collectAdditionalChangeLogFields(dbRows, payloadRecords);
   const totalBomRecordsCreated = allBomIds.length;
 
   const row = {
@@ -348,24 +366,15 @@ async function insertConsolidatedChangeLogRow(
     change_date: formatChicagoChangeDate(),
     user_name: getOsUserName(),
     summarynotes: notes || "",
-    change_summary: `Created ${totalBomRecordsCreated} BOM record${totalBomRecordsCreated === 1 ? "" : "s"}`,
+    change_summary: `Created ${totalBomRecordsCreated} BOM record${
+      totalBomRecordsCreated === 1 ? "" : "s"
+    }`,
   };
 
-  // backward-compatible notes if column exists
-  if (allowedColumns.includes("notes")) {
-    row.notes = notes || "";
-  }
-
-  // plural columns if present
-  if (allowedColumns.includes("resources")) {
-    row.resources = allResources.join(", ");
-  }
-  if (allowedColumns.includes("locations")) {
-    row.locations = allLocations.join(", ");
-  }
-  if (allowedColumns.includes("bom_ids")) {
-    row.bom_ids = allBomIds.join(", ");
-  }
+  if (allowedColumns.includes("notes")) row.notes = notes || "";
+  if (allowedColumns.includes("resources")) row.resources = allResources.join(", ");
+  if (allowedColumns.includes("locations")) row.locations = allLocations.join(", ");
+  if (allowedColumns.includes("bom_ids")) row.bom_ids = allBomIds.join(", ");
   if (allowedColumns.includes("item_description")) {
     row.item_description = additionalChangeLogFields.itemDescription || "";
   }
@@ -379,7 +388,7 @@ async function insertConsolidatedChangeLogRow(
     row.consumed_item = additionalChangeLogFields.consumedItem || "";
   }
 
-  await insertDynamic(client, "planning_bom_change_log_summary", row);
+  await insertDynamic(client, CHANGE_LOG_TABLE, row);
 }
 
 function getCstTimestamp() {
@@ -387,6 +396,7 @@ function getCstTimestamp() {
     new Date().toLocaleString("en-US", { timeZone: "America/Chicago" })
   );
 }
+
 function formatChicagoChangeDate(dateInput = new Date()) {
   const chicagoDate = new Date(
     new Date(dateInput).toLocaleString("en-US", { timeZone: "America/Chicago" })
@@ -404,7 +414,6 @@ function formatChicagoChangeDate(dateInput = new Date()) {
 
 function getEcNumber() {
   const d = new Date();
-
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
@@ -417,9 +426,7 @@ function getEcNumber() {
 
 function generateUniqueBigInt() {
   const ts = Date.now().toString();
-  const rand = Math.floor(Math.random() * 1000)
-    .toString()
-    .padStart(3, "0");
+  const rand = Math.floor(Math.random() * 1000).toString().padStart(3, "0");
   return `${ts}${rand}`;
 }
 
@@ -441,37 +448,32 @@ async function getExistingColumns(client, tableName) {
     `
       SELECT column_name
       FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = $1
+      WHERE table_schema = $1
+        AND table_name = $2
       ORDER BY ordinal_position
     `,
-    [tableName]
+    [PG_SCHEMA, tableName]
   );
 
-  return result.rows.map((row) =>
-    String(row.column_name).trim().toLowerCase()
-  );
+  return result.rows.map((row) => String(row.column_name).trim().toLowerCase());
 }
 
 function buildInsertQuery(tableName, candidateData, allowedColumns) {
   const entries = Object.entries(candidateData).filter(([key, value]) => {
-    return (
-      allowedColumns.includes(String(key).toLowerCase()) &&
-      value !== undefined
-    );
+    return allowedColumns.includes(String(key).toLowerCase()) && value !== undefined;
   });
 
   if (entries.length === 0) {
     throw new Error(`No matching columns found for insert into ${tableName}`);
   }
 
-  const columns = entries.map(([key]) => key);
+  const columns = entries.map(([key]) => quoteIdent(key));
   const values = entries.map(([, value]) => value);
   const placeholders = entries.map((_, index) => `$${index + 1}`);
 
   return {
     query: `
-      INSERT INTO ${tableName} (${columns.join(", ")})
+      INSERT INTO ${pgTableRef(tableName)} (${columns.join(", ")})
       VALUES (${placeholders.join(", ")})
       RETURNING *
     `,
@@ -506,6 +508,7 @@ function getUserDetails(payload) {
       "",
   };
 }
+
 function collectNotes(payload) {
   const uniqueNotes = Array.from(
     new Set(
@@ -524,58 +527,50 @@ function collectNotes(payload) {
 function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes, payloadRecords = []) {
   const now = getCstTimestamp();
 
-  const bomParametersRows = ensureArray(normalizedTables?.bom_parameters).map(
-    (row) => ({
-      rec_id: generateUniqueBigInt(),
-      bom_id: row.bom_id,
-      erp_bom_start_date: HARD_CODED_START_DATE,
-      erp_bom_end_date: HARD_CODED_END_DATE,
-      engineering_change_id: ecNumber,
-      change_type: "Added",
-      load_datetime: HARD_CODED_LOAD_DATETIME,
-    })
-  );
+  const bomParametersRows = ensureArray(normalizedTables?.bom_parameters).map((row) => ({
+    rec_id: generateUniqueBigInt(),
+    bom_id: row.bom_id,
+    erp_bom_start_date: HARD_CODED_START_DATE,
+    erp_bom_end_date: HARD_CODED_END_DATE,
+    engineering_change_id: ecNumber,
+    change_type: "Added",
+    load_datetime: HARD_CODED_LOAD_DATETIME,
+  }));
 
-  const bomProducedRows = ensureArray(normalizedTables?.bom_produced).map(
-    (row) => ({
-      rec_id: generateUniqueBigInt(),
-      bom_id: row.bom_id,
-      item: row.item,
-      location: row.location,
-      bom_status: HARD_CODED_BOM_STATUS,
-      bom_version: getBomVersionFromBomId(row.bom_id),
-      prefix: HARD_CODED_PREFIX,
-      bom_plan_type: HARD_CODED_BOM_PLAN_TYPE,
-      erp_bom_qty_produced_per:
-        row.erp_bom_qty_produced_per ??
-        row.qty_produced_per ??
-        null,
-      engineering_change_id: ecNumber,
-      change_type: "Added",
-      load_datetime: HARD_CODED_LOAD_DATETIME,
-    })
-  );
+  const bomProducedRows = ensureArray(normalizedTables?.bom_produced).map((row) => ({
+    rec_id: generateUniqueBigInt(),
+    bom_id: row.bom_id,
+    item: row.item,
+    location: row.location,
+    bom_status: HARD_CODED_BOM_STATUS,
+    bom_version: getBomVersionFromBomId(row.bom_id),
+    prefix: HARD_CODED_PREFIX,
+    bom_plan_type: HARD_CODED_BOM_PLAN_TYPE,
+    erp_bom_qty_produced_per:
+      row.erp_bom_qty_produced_per ?? row.qty_produced_per ?? null,
+    engineering_change_id: ecNumber,
+    change_type: "Added",
+    load_datetime: HARD_CODED_LOAD_DATETIME,
+  }));
 
-  const bomConsumedRows = ensureArray(normalizedTables?.bom_consumed).map(
-    (row) => ({
-      rec_id: generateUniqueBigInt(),
-      bom_id: row.bom_id,
-      item: row.item,
-      location: row.location,
-      erp_bom_quantity_consumed_per:
-        row.bom_quantity_consumed_per ??
-        row.erp_bom_quantity_consumed_per ??
-        row.quantity_consumed_per ??
-        null,
-      erp_bom_component_start_date: HARD_CODED_START_DATE,
-      erp_bom_component_end_date: HARD_CODED_END_DATE,
-      engineering_change_id: ecNumber,
-      change_type: "Added",
-      load_datetime: HARD_CODED_LOAD_DATETIME,
-    })
-  );
-const baseItemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map(
-  (row) => {
+  const bomConsumedRows = ensureArray(normalizedTables?.bom_consumed).map((row) => ({
+    rec_id: generateUniqueBigInt(),
+    bom_id: row.bom_id,
+    item: row.item,
+    location: row.location,
+    erp_bom_quantity_consumed_per:
+      row.bom_quantity_consumed_per ??
+      row.erp_bom_quantity_consumed_per ??
+      row.quantity_consumed_per ??
+      null,
+    erp_bom_component_start_date: HARD_CODED_START_DATE,
+    erp_bom_component_end_date: HARD_CODED_END_DATE,
+    engineering_change_id: ecNumber,
+    change_type: "Added",
+    load_datetime: HARD_CODED_LOAD_DATETIME,
+  }));
+
+  const baseItemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map((row) => {
     const derivedResource =
       norm(row.resource) ||
       norm(String(row.routing_id || "").split("_").slice(3).join("_"));
@@ -585,49 +580,36 @@ const baseItemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).m
       bom_id: row.bom_id,
       item: row.item,
       routing_id: row.routing_id,
-
-      // kept only for deriving consolidated changelog data
       location: row.location,
       resource: derivedResource,
-
       erp_item_bom_routing_priority:
-        row.item_bom_routing_priority ??
-        row.priority ??
-        row.routingPriority ??
-        null,
-
+        row.item_bom_routing_priority ?? row.priority ?? row.routingPriority ?? null,
       erp_item_bom_routing_min_lot_size:
         row.item_bom_routing_min_lot_size ??
         row.erp_item_bom_routing_min_lot_size ??
         1,
-
       erp_item_bom_routing_lot_size_increment:
         row.item_bom_routing_lot_size_increment ??
         row.erp_item_bom_routing_lot_size_increment ??
         1,
-
       erp_item_bom_routing_wip_sweep_priority:
         row.item_bom_routing_wip_sweep_priority ??
         row.erp_item_bom_wip_sweep_priority ??
         1,
-
-      // produced-item row = blank / null association
       erp_co_product_association: null,
-
       erp_item_bom_routing_max_lot_size:
         row.item_bom_routing_max_lot_size ??
         row.erp_item_bom_routing_max_lot_size ??
         null,
-
       engineering_change_id: ecNumber,
       change_type: "Added",
       load_datetime: HARD_CODED_LOAD_DATETIME,
     };
-  }
-);
+  });
 
   const coProductRoutingRows = [];
   const baseRoutingRowsByBomId = new Map();
+
   for (const row of baseItemBomRoutingRows) {
     const bomId = norm(row.bom_id);
     if (!bomId) continue;
@@ -665,10 +647,7 @@ const baseItemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).m
     });
   });
 
-  const itemBomRoutingRows = [
-    ...baseItemBomRoutingRows,
-    ...coProductRoutingRows,
-  ];
+  const itemBomRoutingRows = [...baseItemBomRoutingRows, ...coProductRoutingRows];
 
   return {
     bom_parameters: bomParametersRows,
@@ -693,13 +672,10 @@ async function insertChangeLogRow(
     userDetails,
   }
 ) {
-  const allowedColumns = await getExistingColumns(
-    client,
-    "planning_bom_change_log_summary"
-  );
+  const allowedColumns = await getExistingColumns(client, CHANGE_LOG_TABLE);
 
   const row = {
-    rec_id: generateRandomSixDigit(), // 6-digit as requested
+    rec_id: generateRandomSixDigit(),
     engineering_change_id: ecNumber,
     postgresql_rec_id: postgresqlRecId,
     change_type: "Added",
@@ -711,33 +687,15 @@ async function insertChangeLogRow(
     user_name: getOsUserName(),
   };
 
-  // store notes from Summary.jsx textarea
-  if (allowedColumns.includes("summarynotes")) {
-    row.summarynotes = summarynotes || "";
-  }
-
-  // optional backward compatibility
-  if (allowedColumns.includes("notes")) {
-    row.notes = summarynotes || "";
-  }
-
-  // store resource
-  if (allowedColumns.includes("resource")) {
-    row.resource = resource || "";
-  }
-
-  // optional plural column if engineering log uses it
-  if (allowedColumns.includes("resources")) {
-    row.resources = resource || "";
-  }
-
-  
- if (allowedColumns.includes("change_summary")) {
+  if (allowedColumns.includes("summarynotes")) row.summarynotes = summarynotes || "";
+  if (allowedColumns.includes("notes")) row.notes = summarynotes || "";
+  if (allowedColumns.includes("resource")) row.resource = resource || "";
+  if (allowedColumns.includes("resources")) row.resources = resource || "";
+  if (allowedColumns.includes("change_summary")) {
     row.change_summary = changeSummary || targetTable || "Added";
   }
 
-
-  await insertDynamic(client, "planning_bom_change_log_summary", row);
+  await insertDynamic(client, CHANGE_LOG_TABLE, row);
 }
 
 async function insertAllManualRows(
@@ -763,18 +721,12 @@ async function insertAllManualRows(
     item_bom_routing: 0,
   };
 
-  // Build resource map from routing rows: key = bom_id__location
   const resourceByBomAndLocation = new Map();
 
   for (const row of dbRows.item_bom_routing) {
     const routingResource =
       norm(row.resource) ||
-      norm(
-        String(row.routing_id || "")
-          .split("_")
-          .slice(3)
-          .join("_")
-      );
+      norm(String(row.routing_id || "").split("_").slice(3).join("_"));
 
     const key = `${norm(row.bom_id)}__${norm(row.location)}`;
     if (!resourceByBomAndLocation.has(key) && routingResource) {
@@ -788,7 +740,6 @@ async function insertAllManualRows(
       return resourceByBomAndLocation.get(directKey);
     }
 
-    // fallback: if location missing (ex: bom_parameters), match by bom only
     const byBomOnly = [...resourceByBomAndLocation.entries()].find(([key]) =>
       key.startsWith(`${norm(bomId)}__`)
     );
@@ -796,72 +747,32 @@ async function insertAllManualRows(
     return byBomOnly?.[1] || "";
   };
 
-  // bom_parameters
   for (const row of dbRows.bom_parameters) {
-    const inserted = await insertDynamic(client, "bom_parameters", row);
+    await insertDynamic(client, PG_TABLES.bomParameters, row);
     insertedCounts.bom_parameters += 1;
-
-    const derivedLocation =
-      norm(row.location) ||
-      norm(String(row.bom_id || "").split("_").slice(-1)[0]);
-
-    const resource = getResourceForRow(row.bom_id, derivedLocation);
-
-
   }
 
-  // bom_produced
   for (const row of dbRows.bom_produced) {
-    const inserted = await insertDynamic(client, "bom_produced", row);
+    await insertDynamic(client, PG_TABLES.bomProduced, row);
     insertedCounts.bom_produced += 1;
-
-    const resource = getResourceForRow(row.bom_id, row.location);
-
-
-
   }
 
-  // bom_consumed
   for (const row of dbRows.bom_consumed) {
-    const inserted = await insertDynamic(client, "bom_consumed", row);
+    await insertDynamic(client, PG_TABLES.bomConsumed, row);
     insertedCounts.bom_consumed += 1;
-
-    const resource = getResourceForRow(row.bom_id, row.location);
-
-
-
-
   }
 
-  // item_bom_routing
   for (const row of dbRows.item_bom_routing) {
-    const inserted = await insertDynamic(client, "item_bom_routing", row);
+    await insertDynamic(client, PG_TABLES.itemBomRouting, row);
     insertedCounts.item_bom_routing += 1;
-
-    const routingResource =
-      norm(row.resource) ||
-      norm(
-        String(row.routing_id || "")
-          .split("_")
-          .slice(3)
-          .join("_")
-      );
-
   }
-  // item_detail table insert/update
-  const itemResourceRows = collectItemResourceRowsForItemDetail(dbRows);
 
+  const itemResourceRows = collectItemResourceRowsForItemDetail(dbRows);
   let itemDetailUpsertCount = 0;
 
   if (itemResourceRows.length) {
-    const itemDetailsFromBigQuery = await fetchItemDetailsForPostgres(
-      itemResourceRows
-    );
-
-    itemDetailUpsertCount = await upsertItemDetails(
-      client,
-      itemDetailsFromBigQuery
-    );
+    const itemDetailsFromBigQuery = await fetchItemDetailsForPostgres(itemResourceRows);
+    itemDetailUpsertCount = await upsertItemDetails(client, itemDetailsFromBigQuery);
   }
 
   await insertConsolidatedChangeLogRow(client, {
@@ -906,10 +817,8 @@ router.post("/", async (req, res) => {
   const notes = collectNotes(payload);
 
   try {
-    // 1) Validate manual entry via separate validator file
     const validation = await validateManualEntryPayload(payload, pool);
 
-    // 2) Failure -> return Summary.jsx expected structure (no report generation)
     if (!validation.isValid) {
       const remediationDetails = validation.errorList.flatMap((row) =>
         ensureArray(row?.messages).map((msg) => ({
@@ -932,7 +841,6 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // 3) Success -> insert target rows + change logs in one transaction
     const ecNumber = getEcNumber();
     const client = await pool.connect();
 

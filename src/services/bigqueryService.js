@@ -1,72 +1,185 @@
-import { BigQuery } from "@google-cloud/bigquery";
+import bigquery from "../db/bigqueryClient.js";
+import pool from "../db/postgresClient.js";
+import appConfig from "../config/appConfig.js";
 
-const bigquery = new BigQuery({
-  projectId: process.env.BQ_PROJECT_ID || process.env.GCP_PROJECT_ID,
+/* =========================================================
+   Source rules
+   - BOM core tables are fetched from PostgreSQL.
+   - item_mrp_rls_flg / itemReleaseFlag is fetched from BigQuery DEV.
+   - Remaining BigQuery master/reference tables are fetched from BigQuery PRD.
+========================================================= */
+const BQ_TABLE_KEYS = Object.freeze({
+  bomParameters: "bomParameters",
+  bomProduced: "bomProduced",
+  bomConsumed: "bomConsumed",
+  itemBomRouting: "itemBomRouting",
+  itemMaster: "itemMaster",
+  itemReleaseFlag: "itemReleaseFlag",
+  locationMaster: "locationMaster",
+  routingRescons: "routingRescons",
+  resourceMaster: "resourceMaster",
 });
 
+const PG_TABLE_KEYS_BY_TABLE_NAME = Object.freeze({
+  [appConfig.postgres.tables.bomParameters]: "bomParameters",
+  [appConfig.postgres.tables.bomProduced]: "bomProduced",
+  [appConfig.postgres.tables.bomConsumed]: "bomConsumed",
+  [appConfig.postgres.tables.itemBomRouting]: "itemBomRouting",
+});
+
+const BQ_TABLE_KEYS_BY_TABLE_NAME = Object.freeze(
+  Object.fromEntries(
+    Object.entries(appConfig.bigQuery.tables).map(([key, tableName]) => [tableName, key])
+  )
+);
+
+const BQ_TABLE_SOURCE_BY_KEY = Object.freeze({
+  bomParameters: "dev",
+  bomProduced: "dev",
+  bomConsumed: "dev",
+  itemBomRouting: "dev",
+  itemReleaseFlag: "dev",
+  itemMaster: "dev",
+  locationMaster: "dev",
+  routingRescons: "dev",
+  resourceMaster: "dev",
+  // itemMaster: "prd",
+  // locationMaster: "prd",
+  // routingRescons: "prd",
+  // resourceMaster: "prd",
+});
+
+const IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const assertSafeIdentifier = (value, label) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    throw new Error(`Missing identifier for ${label}`);
+  }
+  if (!IDENTIFIER_REGEX.test(normalized)) {
+    throw new Error(`Invalid identifier for ${label}: ${normalized}`);
+  }
+  return normalized;
+};
+
+const quoteIdent = (value) => `"${String(value).replace(/"/g, '""')}"`;
+const qCol = (columnName) => `\`${String(columnName).replace(/`/g, "")}\``;
+
+const PG_SCHEMA = assertSafeIdentifier(appConfig.postgres.schema || "planning_bom", "postgres.schema");
+const pgTableRef = (tableName) => `${quoteIdent(PG_SCHEMA)}.${quoteIdent(tableName)}`;
+
 const getBigQueryConfig = () => {
-  const projectId = process.env.BQ_PROJECT_ID || process.env.GCP_PROJECT_ID;
-  const dataset = process.env.BQ_DATASET;
-
-  if (!projectId || !dataset) {
-    throw new Error("BQ_PROJECT_ID or BQ_DATASET is not set in .env");
+  const dataset = appConfig.bigQuery.datasetId;
+  if (!dataset) {
+    throw new Error("BigQuery datasetId is missing in appConfig.js");
   }
-
-  return { projectId, dataset };
-};
-const findFirstExistingColumn = async (tableName, candidates = []) => {
-  const columns = await getTableColumns(tableName);
-  const columnMap = new Map(columns.map((col) => [String(col).toLowerCase(), col]));
-
-  for (const candidate of candidates) {
-    const matched = columnMap.get(String(candidate).toLowerCase());
-    if (matched) {
-      return matched;
-    }
-  }
-
-  return "";
+  return { dataset };
 };
 
-const getBomIdColumn = async (tableName) => {
-  const bomIdColumn = await findFirstExistingColumn(tableName, [
-    "bom_id",
-    "BOMID",
-    "bomId",
-  ]);
-
-  if (!bomIdColumn) {
-    throw new Error(
-      `No BOM ID column found in ${tableName}. Expected one of: bom_id, BOMID, bomId`
-    );
+const getBigQueryProjectId = (tableKey) => {
+  const source = BQ_TABLE_SOURCE_BY_KEY[tableKey] || "prd";
+  const projectId = appConfig.bigQuery.projectIds?.[source];
+  if (!projectId) {
+    throw new Error(`BigQuery projectId for source '${source}' is missing in appConfig.js`);
   }
-
-  return bomIdColumn;
+  return projectId;
 };
+
+const getBQTableNameByKey = (tableKey) => {
+  const tableName = appConfig.bigQuery.tables?.[tableKey];
+  return assertSafeIdentifier(tableName, `bigQuery.tables.${tableKey}`);
+};
+
+const bqTableRefByKey = (tableKey) => {
+  const { dataset } = getBigQueryConfig();
+  const projectId = getBigQueryProjectId(tableKey);
+  const tableName = getBQTableNameByKey(tableKey);
+  return `\`${projectId}.${assertSafeIdentifier(dataset, "BigQuery dataset")}.${tableName}\``;
+};
+
+const getTableKeyFromName = (tableName) => {
+  const requested = String(tableName || "").trim();
+  return PG_TABLE_KEYS_BY_TABLE_NAME[requested] || BQ_TABLE_KEYS_BY_TABLE_NAME[requested] || "";
+};
+
+const isPostgresTableName = (tableName) => {
+  const requested = String(tableName || "").trim();
+  return Boolean(PG_TABLE_KEYS_BY_TABLE_NAME[requested]);
+};
+
+const isKnownTableName = (tableName) => Boolean(getTableKeyFromName(tableName));
+
 const normalizeText = (value) => String(value ?? "").trim();
 const normalizeUpper = (value) => normalizeText(value).toUpperCase();
-const sanitizeIdPart = (value) =>
-  normalizeText(value).replace(/\s+/g, " ").trim();
 
 const runQuery = async (query, params = {}) => {
-  const [rows] = await bigquery.query({
-    query,
-    params,
-  });
-  return rows;
+  const [rows] = await bigquery.query({ query, params });
+  return rows || [];
 };
 
-const getTableColumns = async (tableName) => {
-  const { projectId, dataset } = getBigQueryConfig();
+const runPgQuery = async (query, params = []) => {
+  const result = await pool.query(query, params);
+  return result.rows || [];
+};
 
+const getPostgresTableColumns = async (tableName) => {
+  const rows = await runPgQuery(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name = $2
+      ORDER BY ordinal_position
+    `,
+    [PG_SCHEMA, tableName]
+  );
+  return rows.map((row) => String(row.column_name || "").trim());
+};
+
+const getBigQueryTableColumns = async (tableKey) => {
+  const { dataset } = getBigQueryConfig();
+  const projectId = getBigQueryProjectId(tableKey);
+  const tableName = getBQTableNameByKey(tableKey);
   const query = `
     SELECT column_name
     FROM \`${projectId}.${dataset}.INFORMATION_SCHEMA.COLUMNS\`
     WHERE table_name = @tableName
   `;
-
   const rows = await runQuery(query, { tableName });
-  return rows.map((row) => String(row.column_name || "").toLowerCase());
+  return rows.map((row) => String(row.column_name || "").trim());
+};
+
+const getTableColumns = async (tableName) => {
+  const tableKey = getTableKeyFromName(tableName);
+  if (!tableKey) {
+    throw new Error(`Invalid table name: ${tableName}`);
+  }
+  if (isPostgresTableName(tableName)) {
+    return getPostgresTableColumns(tableName);
+  }
+  return getBigQueryTableColumns(tableKey);
+};
+
+const findColumn = (columns, candidates = []) => {
+  const columnMap = new Map(columns.map((column) => [String(column).toLowerCase(), column]));
+  for (const candidate of candidates) {
+    const matched = columnMap.get(String(candidate).toLowerCase());
+    if (matched) return matched;
+  }
+  return "";
+};
+
+const findFirstExistingColumn = async (tableName, candidates = []) => {
+  const columns = await getTableColumns(tableName);
+  return findColumn(columns, candidates);
+};
+
+const getBomIdColumn = async (tableName) => {
+  const bomIdColumn = await findFirstExistingColumn(tableName, ["bom_id", "BOMID", "bomId", "bomid", "BOM_ID"]);
+  if (!bomIdColumn) {
+    throw new Error(`No BOM ID column found in ${tableName}. Expected one of: bom_id, BOMID, bomId`);
+  }
+  return bomIdColumn;
 };
 
 const pickFirstValue = (row, keys = []) => {
@@ -79,169 +192,344 @@ const pickFirstValue = (row, keys = []) => {
   return "";
 };
 
-export const fetchFromTable = async (tableName, filters = {}, limit = null) => {
-  const { projectId, dataset } = getBigQueryConfig();
+const buildPgWhere = (filters = {}, params = []) => {
+  const conditions = [];
+  Object.entries(filters || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || String(value).trim() === "") return;
+    conditions.push(`CAST(${quoteIdent(key)} AS TEXT) = $${params.length + 1}`);
+    params.push(String(value));
+  });
+  return { conditions, params };
+};
 
-  let query = `SELECT * FROM \`${projectId}.${dataset}.${tableName}\``;
+export const fetchFromTable = async (tableName, filters = {}, limit = null) => {
+  const safeTableName = String(tableName || "").trim();
+  if (!isKnownTableName(safeTableName)) {
+    throw new Error(`Invalid table name: ${safeTableName}`);
+  }
+
+  if (isPostgresTableName(safeTableName)) {
+    const params = [];
+    const { conditions } = buildPgWhere(filters, params);
+    let query = `SELECT * FROM ${pgTableRef(safeTableName)}`;
+    if (conditions.length) {
+      query += ` WHERE ${conditions.join(" AND ")}`;
+    }
+    if (limit !== null && limit !== undefined) {
+      const parsedLimit = Number(limit);
+      if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+        query += ` LIMIT ${Math.floor(parsedLimit)}`;
+      }
+    }
+    return runPgQuery(query, params);
+  }
+
+  const tableKey = getTableKeyFromName(safeTableName);
+  let query = `SELECT * FROM ${bqTableRefByKey(tableKey)}`;
   const conditions = [];
   const params = {};
 
   Object.entries(filters || {}).forEach(([key, value]) => {
     if (value === undefined || value === null || String(value).trim() === "") return;
-    conditions.push(`CAST(${key} AS STRING) = @${key}`);
-    params[key] = String(value);
+    const paramName = String(key).replace(/[^A-Za-z0-9_]/g, "_");
+    conditions.push(`CAST(${qCol(key)} AS STRING) = @${paramName}`);
+    params[paramName] = String(value);
   });
 
-  if (conditions.length > 0) {
+  if (conditions.length) {
     query += ` WHERE ${conditions.join(" AND ")}`;
   }
 
   if (limit !== null && limit !== undefined) {
-    query += ` LIMIT ${Number(limit)}`;
+    const parsedLimit = Number(limit);
+    if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+      query += ` LIMIT ${Math.floor(parsedLimit)}`;
+    }
   }
 
   return runQuery(query, params);
 };
 
 /**
- * Existing API support:
- * item_master + item_releaseflag
+ * item_master from BigQuery PRD + item_mrp_rls_flg from BigQuery DEV.
  */
-export const fetchItemMasterWithReleaseFlag = async (filters = {}, limit = null) => {
-  const itemMasterRows = await fetchFromTable("item_master", filters, limit);
-  const releaseFlagRows = await fetchFromTable("item_releaseflag", {}, null);
+export const fetchItemMasterWithReleaseFlag = async ({
+  page = 1,
+  pageSize = 50,
+  search = "",
+  filterBy = "item",
+} = {}) => {
+  const safePage = Math.max(1, Number.parseInt(page, 10) || 1);
+  const safePageSize = Math.min(200, Math.max(1, Number.parseInt(pageSize, 10) || 50));
+  const safeOffset = (safePage - 1) * safePageSize;
+  const searchText = normalizeText(search);
 
-  const releaseFlagMap = new Map();
+  const allowedFilterFields = new Set(["item", "item_description", "status", "releaseflag"]);
+  const normalizedFilterBy = allowedFilterFields.has(String(filterBy || "").trim())
+    ? String(filterBy || "").trim()
+    : "item";
 
-  for (const row of releaseFlagRows) {
-    const itemKey = normalizeUpper(row.item);
-    if (!itemKey) continue;
+  const itemMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
+  const releaseFlagColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
 
-    const releaseFlag = pickFirstValue(row, [
-      "release",
-      "release_flag",
-      "item_release_flag",
-      "planning_release_flag",
-      "status",
-    ]);
-
-    releaseFlagMap.set(itemKey, releaseFlag);
+  const itemColumn = findColumn(itemMasterColumns, ["item", "item_id", "item_number", "itemNumber"]);
+  if (!itemColumn) {
+    throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
   }
 
-  return itemMasterRows.map((row) => {
-    const itemKey = normalizeUpper(row.item);
-    return {
-      ...row,
-      item_release_flag: releaseFlagMap.get(itemKey) || "",
-    };
-  });
-};
+  const itemDescColumn = findColumn(itemMasterColumns, [
+    "item_desc",
+    "item_description",
+    "description",
+    "item_desc_1",
+  ]);
 
-/**
- * Existing API support:
- * selected items -> bom_produced -> location_master
- */
-export const fetchLocationsBySelectedItems = async (_itemIds) => {
-  const { projectId, dataset } = getBigQueryConfig();
+  const itemStatusColumn = findColumn(itemMasterColumns, ["item_status", "status"]);
 
-  const query = `
-    SELECT DISTINCT
-      TRIM(CAST(location AS STRING)) AS location,
-      COALESCE(CAST(location_description AS STRING), '') AS location_description,
-      COALESCE(CAST(location_status AS STRING), '') AS location_status,
-      COALESCE(CAST(location_country AS STRING), '') AS location_country,
-      COALESCE(CAST(location_region AS STRING), '') AS location_region,
-      COALESCE(CAST(location_type AS STRING), '') AS location_type,
-      COALESCE(CAST(reporting_location AS STRING), '') AS reporting_location,
-      COALESCE(CAST(city AS STRING), '') AS city,
-      COALESCE(CAST(zip AS STRING), '') AS zip,
-      COALESCE(CAST(address AS STRING), '') AS address
-    FROM \`${projectId}.${dataset}.location_master\`
-    WHERE location IS NOT NULL
-      AND TRIM(CAST(location AS STRING)) != ''
-    ORDER BY location
-  `;
+  const releaseItemColumn = findColumn(releaseFlagColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
 
-  return runQuery(query);
-};
-
-/**
- * Pull all distinct resources from routing_rescons
- */
-export const fetchAllResourcesFromRoutingResCons = async () => {
-  const { projectId, dataset } = getBigQueryConfig();
-
-  const query = `
-    SELECT DISTINCT
-      TRIM(CAST(rr.resource AS STRING)) AS resource,
-      COALESCE(CAST(rm.resource_planning_relevance AS STRING), '') AS resource_planning_relevance
-    FROM \`${projectId}.${dataset}.routing_rescons\` rr
-    LEFT JOIN \`${projectId}.${dataset}.resource_master\` rm
-      ON UPPER(TRIM(CAST(rr.resource AS STRING))) = UPPER(TRIM(CAST(rm.resource AS STRING)))
-    WHERE rr.resource IS NOT NULL
-      AND TRIM(CAST(rr.resource AS STRING)) != ''
-    ORDER BY resource
-  `;
-
-  const rows = await runQuery(query);
-
-  return rows.map((row) => ({
-    resource: normalizeText(row.resource),
-    resourcePlanningRelevance: pickFirstValue(row, [
-      "resource_planning_relevance",
-    ]),
-  }));
-};
-
-  const resourceColumnCandidates = [
-    "resource",
-    "resource_id",
-    "res",
-  ];
-
-
-
-
-export const fetchItemReleaseFlagByItem = async (item) => {
-  const { projectId, dataset } = getBigQueryConfig();
-
-  const columns = await getTableColumns("item_releaseflag");
-
-  const releaseColumnCandidates = [
+  const releaseColumn = findColumn(releaseFlagColumns, [
     "release",
     "release_flag",
     "releaseflag",
+    "item_releaseflag",
     "item_release_flag",
+    "item_mrp_rls_flg",
     "planning_release_flag",
     "status",
-  ];
+  ]);
 
-  const releaseColumn = releaseColumnCandidates.find((col) =>
-    columns.includes(col)
-  );
+  const itemDescExpr = itemDescColumn
+    ? `COALESCE(CAST(im.${qCol(itemDescColumn)} AS STRING), '')`
+    : `''`;
 
-  if (!releaseColumn) {
-    return {
-      item: normalizeText(item),
-      itemReleaseFlag: "",
-    };
-  }
+  const itemStatusExpr = itemStatusColumn
+    ? `COALESCE(CAST(im.${qCol(itemStatusColumn)} AS STRING), '')`
+    : `''`;
+
+ const releaseFlagCte =
+  releaseItemColumn && releaseColumn
+    ? `
+    release_flag_base AS (
+      SELECT
+        UPPER(TRIM(CAST(${qCol(releaseItemColumn)} AS STRING))) AS item_key,
+        ANY_VALUE(COALESCE(CAST(${qCol(releaseColumn)} AS STRING), '')) AS item_release_flag
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemReleaseFlag)}
+      WHERE ${qCol(releaseItemColumn)} IS NOT NULL
+        AND TRIM(CAST(${qCol(releaseItemColumn)} AS STRING)) != ''
+      GROUP BY item_key
+    ),`
+    : `
+    release_flag_base AS (
+      SELECT
+        CAST(NULL AS STRING) AS item_key,
+        CAST(NULL AS STRING) AS item_release_flag
+      FROM UNNEST([]) AS empty_rows
+    ),`;
+    
+
+  const filterColumnExprMap = {
+    item: "item",
+    item_description: "item_desc",
+    status: "item_status",
+    releaseflag: "item_release_flag",
+  };
+
+  const filterColumnExpr = filterColumnExprMap[normalizedFilterBy] || "item";
 
   const query = `
+    WITH item_master_base AS (
+  SELECT
+    TRIM(CAST(im.${qCol(itemColumn)} AS STRING)) AS item,
+    ${itemDescExpr} AS item_desc,
+    ${itemStatusExpr} AS item_status
+  FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemMaster)} im
+  WHERE im.${qCol(itemColumn)} IS NOT NULL
+    AND TRIM(CAST(im.${qCol(itemColumn)} AS STRING)) != ''
+    AND (
+      CASE
+        WHEN @searchText = '' THEN UPPER(TRIM(CAST(im.${qCol(itemColumn)} AS STRING))) LIKE '%HRL%'
+        ELSE TRUE
+      END
+    )
+    ),
+    ${releaseFlagCte}
+    joined_rows AS (
+      SELECT
+        im.item,
+        im.item_desc,
+        im.item_status,
+        COALESCE(rf.item_release_flag, '') AS item_release_flag
+      FROM item_master_base im
+      LEFT JOIN release_flag_base rf
+        ON rf.item_key = UPPER(TRIM(im.item))
+    ),
+    filtered_rows AS (
+      SELECT *
+      FROM joined_rows
+      WHERE @searchText = ''
+         OR LOWER(CAST(${filterColumnExpr} AS STRING)) LIKE CONCAT('%', LOWER(@searchText), '%')
+    ),
+    counted_rows AS (
+      SELECT *, COUNT(1) OVER() AS total_count
+      FROM filtered_rows
+    )
     SELECT
-      TRIM(CAST(item AS STRING)) AS item,
-      COALESCE(CAST(${releaseColumn} AS STRING), '') AS release
-    FROM \`${projectId}.${dataset}.item_releaseflag\`
-    WHERE UPPER(TRIM(CAST(item AS STRING))) = @item
-    LIMIT 1
+      item,
+      item_desc,
+      item_status,
+      item_release_flag,
+      total_count
+    FROM counted_rows
+    ORDER BY item
+    LIMIT ${safePageSize}
+    OFFSET ${safeOffset}
   `;
 
-  const rows = await runQuery(query, {
-    item: normalizeUpper(item),
-  });
+  const rows = await runQuery(query, { searchText });
+
+  console.log("fetchItemMasterWithReleaseFlag rows:", rows.length);
+
+  const total = rows.length ? Number(rows[0].total_count || 0) : 0;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+
+  return {
+    data: rows.map((row) => ({
+      item: normalizeText(row.item),
+      item_desc: normalizeText(row.item_desc),
+      item_status: normalizeText(row.item_status),
+      item_release_flag: normalizeText(row.item_release_flag),
+    })),
+    pagination: {
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages,
+      hasPrev: safePage > 1,
+      hasNext: safePage < totalPages,
+      filterBy: normalizedFilterBy,
+      search: searchText,
+    },
+  };
+};
+
+/**
+ * bom_produced from PostgreSQL + location_master from BigQuery PRD.
+ */
+export const fetchLocationsBySelectedItems = async (itemIds = []) => {
+  const normalizedItemIds = Array.isArray(itemIds)
+    ? itemIds.map((id) => normalizeText(id)).filter(Boolean)
+    : [];
+
+  if (!normalizedItemIds.length) return [];
+
+  const producedRows = await runPgQuery(
+    `
+      SELECT DISTINCT
+        CAST(item AS TEXT) AS item,
+        CAST(location AS TEXT) AS location
+      FROM ${pgTableRef(appConfig.postgres.tables.bomProduced)}
+      WHERE TRIM(CAST(item AS TEXT)) = ANY($1::text[])
+        AND COALESCE(TRIM(CAST(location AS TEXT)), '') <> ''
+      ORDER BY CAST(item AS TEXT), CAST(location AS TEXT)
+    `,
+    [normalizedItemIds]
+  );
+
+  const locations = Array.from(new Set(producedRows.map((row) => normalizeText(row.location)).filter(Boolean)));
+  if (!locations.length) return [];
+
+  const locationRows = await runQuery(
+    `
+      SELECT
+        TRIM(CAST(location AS STRING)) AS location,
+        COALESCE(CAST(location_description AS STRING), '') AS location_description,
+        COALESCE(CAST(location_status AS STRING), '') AS location_status,
+        COALESCE(CAST(location_country AS STRING), '') AS location_country,
+        COALESCE(CAST(location_region AS STRING), '') AS location_region,
+        COALESCE(CAST(location_type AS STRING), '') AS location_type,
+        COALESCE(CAST(reporting_location AS STRING), '') AS reporting_location,
+        COALESCE(CAST(city AS STRING), '') AS city,
+        COALESCE(CAST(zip AS STRING), '') AS zip,
+        COALESCE(CAST(address AS STRING), '') AS address
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.locationMaster)}
+      WHERE UPPER(TRIM(CAST(location AS STRING))) IN UNNEST(@locations)
+      ORDER BY location
+    `,
+    { locations: locations.map((location) => location.toUpperCase()) }
+  );
+
+  const locationMap = new Map(locationRows.map((row) => [normalizeUpper(row.location), row]));
+
+  return producedRows.map((row) => ({
+    ...row,
+    ...(locationMap.get(normalizeUpper(row.location)) || {}),
+  }));
+};
+
+export const fetchAllResourcesFromRoutingResCons = async () => {
+  const columns = await getBigQueryTableColumns(BQ_TABLE_KEYS.resourceMaster);
+  const resourceColumn = findColumn(columns, ["resource", "resource_id", "resourceId"]);
+  if (!resourceColumn) {
+    throw new Error(`${appConfig.bigQuery.tables.resourceMaster}.resource column does not exist`);
+  }
+
+  const relevancyColumn = findColumn(columns, ["resource_planning_relevance", "resource_relevancy"]);
+  const relevancyExpr = relevancyColumn ? `COALESCE(CAST(${qCol(relevancyColumn)} AS STRING), '')` : `''`;
+
+  const rows = await runQuery(`
+    SELECT DISTINCT
+      TRIM(CAST(${qCol(resourceColumn)} AS STRING)) AS resource,
+      ${relevancyExpr} AS resource_planning_relevance
+    FROM ${bqTableRefByKey(BQ_TABLE_KEYS.resourceMaster)}
+    WHERE ${qCol(resourceColumn)} IS NOT NULL
+      AND TRIM(CAST(${qCol(resourceColumn)} AS STRING)) != ''
+    ORDER BY resource
+  `);
+
+  return rows.map((row) => ({
+    resource: normalizeText(row.resource),
+    resourcePlanningRelevance: pickFirstValue(row, ["resource_planning_relevance"]),
+    resource_relevancy: pickFirstValue(row, ["resource_planning_relevance"]),
+  }));
+};
+
+export const fetchItemReleaseFlagByItem = async (item) => {
+  const columns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
+  const itemColumn = findColumn(columns, ["item", "item_id", "item_number", "itemNumber"]);
+  const releaseColumn = findColumn(columns, [
+    "release",
+    "release_flag",
+    "releaseflag",
+    "item_releaseflag",
+    "item_release_flag",
+    "item_mrp_rls_flg",
+    "planning_release_flag",
+    "status",
+  ]);
+
+  if (!itemColumn || !releaseColumn) {
+    return { item: normalizeText(item), itemReleaseFlag: "", release: "" };
+  }
+
+  const rows = await runQuery(
+    `
+      SELECT
+        TRIM(CAST(${qCol(itemColumn)} AS STRING)) AS item,
+        COALESCE(CAST(${qCol(releaseColumn)} AS STRING), '') AS release
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemReleaseFlag)}
+      WHERE UPPER(TRIM(CAST(${qCol(itemColumn)} AS STRING))) = @item
+      LIMIT 1
+    `,
+    { item: normalizeUpper(item) }
+  );
 
   const row = rows?.[0] || {};
-
   return {
     item: normalizeText(item),
     itemReleaseFlag: pickFirstValue(row, ["release"]),
@@ -249,128 +537,175 @@ export const fetchItemReleaseFlagByItem = async (item) => {
   };
 };
 
-
-
-/**
- * Resource relevancy from resource_master
- */
 export const fetchResourceRelevancyByResource = async (resource) => {
-  const { projectId, dataset } = getBigQueryConfig();
-
-  const query = `
-    SELECT
-      TRIM(CAST(resource AS STRING)) AS resource,
-      COALESCE(CAST(resource_planning_relevance AS STRING), '') AS resource_planning_relevance
-    FROM \`${projectId}.${dataset}.resource_master\`
-    WHERE UPPER(TRIM(CAST(resource AS STRING))) = @resource
-    LIMIT 1
-  `;
-
-  const rows = await runQuery(query, {
-    resource: normalizeUpper(resource),
-  });
+  const rows = await runQuery(
+    `
+      SELECT
+        TRIM(CAST(resource AS STRING)) AS resource,
+        COALESCE(CAST(resource_planning_relevance AS STRING), '') AS resource_planning_relevance
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.resourceMaster)}
+      WHERE UPPER(TRIM(CAST(resource AS STRING))) = @resource
+      LIMIT 1
+    `,
+    { resource: normalizeUpper(resource) }
+  );
 
   const row = rows[0] || {};
-
   return {
     resource: normalizeText(row.resource),
-    resourcePlanningRelevance: pickFirstValue(row, [
-      "resource_planning_relevance",
-    ]),
+    resourcePlanningRelevance: pickFirstValue(row, ["resource_planning_relevance"]),
   };
 };
 
-/**
- * Pull all BOM IDs from bom_parameters
- */
 export const fetchBomIdsFromBomParameters = async () => {
-  const { projectId, dataset } = getBigQueryConfig();
-  const bomIdColumn = await getBomIdColumn("bom_parameters");
+  const tableName = appConfig.postgres.tables.bomParameters;
+  const bomIdColumn = await getBomIdColumn(tableName);
+  const rows = await runPgQuery(`
+    SELECT DISTINCT TRIM(CAST(${quoteIdent(bomIdColumn)} AS TEXT)) AS "bomId"
+    FROM ${pgTableRef(tableName)}
+    WHERE ${quoteIdent(bomIdColumn)} IS NOT NULL
+      AND TRIM(CAST(${quoteIdent(bomIdColumn)} AS TEXT)) <> ''
+    ORDER BY "bomId"
+  `);
 
-  const query = `
-    SELECT DISTINCT TRIM(CAST(${bomIdColumn} AS STRING)) AS bomId
-    FROM \`${projectId}.${dataset}.bom_parameters\`
-    WHERE ${bomIdColumn} IS NOT NULL
-      AND TRIM(CAST(${bomIdColumn} AS STRING)) != ''
-    ORDER BY bomId
-  `;
-
-  const rows = await runQuery(query);
-
-  return rows.map((row) => ({
-    bomId: normalizeText(row.bomId),
-  }));
+  return rows.map((row) => ({ bomId: normalizeText(row.bomId) }));
 };
+
 export const fetchCoProductsByBomId = async (bomId) => {
-  const { projectId, dataset } = getBigQueryConfig();
-  const columns = await getTableColumns("bom_consumed");
+  const tableName = appConfig.postgres.tables.bomConsumed;
+  const columns = await getPostgresTableColumns(tableName);
+  const itemColumn = findColumn(columns, ["item", "consumed_item", "component_item", "material_item"]);
+  if (!itemColumn) return [];
 
-  const itemColumnCandidates = [
-    "item",
-    "consumed_item",
-    "component_item",
-    "material_item",
-  ];
-
-  const itemColumn = itemColumnCandidates.find((col) =>
-    columns.includes(col.toLowerCase())
+  const bomIdColumn = await getBomIdColumn(tableName);
+  const rows = await runPgQuery(
+    `
+      SELECT DISTINCT TRIM(CAST(${quoteIdent(itemColumn)} AS TEXT)) AS item
+      FROM ${pgTableRef(tableName)}
+      WHERE UPPER(TRIM(CAST(${quoteIdent(bomIdColumn)} AS TEXT))) = $1
+        AND ${quoteIdent(itemColumn)} IS NOT NULL
+        AND TRIM(CAST(${quoteIdent(itemColumn)} AS TEXT)) <> ''
+      ORDER BY item
+    `,
+    [normalizeUpper(bomId)]
   );
 
-  if (!itemColumn) {
-    return [];
-  }
-
-  const bomIdColumn = await getBomIdColumn("bom_consumed");
-
-  const query = `
-    SELECT DISTINCT TRIM(CAST(${itemColumn} AS STRING)) AS item
-    FROM \`${projectId}.${dataset}.bom_consumed\`
-    WHERE UPPER(TRIM(CAST(${bomIdColumn} AS STRING))) = @bomId
-      AND ${itemColumn} IS NOT NULL
-      AND TRIM(CAST(${itemColumn} AS STRING)) != ''
-    ORDER BY item
-  `;
-
-  const rows = await runQuery(query, {
-    bomId: normalizeUpper(bomId),
-  });
-
-  return rows.map((row) => ({
-    item: normalizeText(row.item),
-  }));
+  return rows.map((row) => ({ item: normalizeText(row.item) }));
 };
-/**
- * Based on selected BOM ID:
- * 1) fetch produced item + location from bom_produced
- * 2) fetch release flag from item_releaseflag using item
- */
-export const fetchItemDetailsForPostgres = async (itemResourceRows = []) => {
-  const { projectId, dataset } = getBigQueryConfig();
 
+export const fetchItemDetailsForPostgres = async (itemResourceRows = []) => {
   const cleanedRows = Array.from(
     new Map(
       (Array.isArray(itemResourceRows) ? itemResourceRows : [])
         .map((row) => {
           const item = normalizeText(row?.item);
           const resource = normalizeText(row?.resource);
-
           if (!item) return null;
-
-          return [
-            normalizeUpper(item),
-            {
-              item,
-              resource,
-            },
-          ];
+          return [normalizeUpper(item), { item, resource }];
         })
         .filter(Boolean)
     ).values()
   );
 
-  if (!cleanedRows.length) {
-    return [];
+  if (!cleanedRows.length) return [];
+
+  const itemMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
+  const releaseFlagColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
+  const resourceMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.resourceMaster);
+
+  const itemMasterItemColumn = findColumn(itemMasterColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
+  const itemDescColumn = findColumn(itemMasterColumns, [
+    "item_description",
+    "item_desc",
+    "item_desc_1",
+    "description",
+  ]);
+
+  const releaseItemColumn = findColumn(releaseFlagColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
+  const releaseColumn = findColumn(releaseFlagColumns, [
+    "release",
+    "release_flag",
+    "releaseflag",
+    "item_release_flag",
+    "item_releaseflag",
+    "item_mrp_rls_flg",
+    "planning_release_flag",
+    "status",
+  ]);
+
+  const resourceColumn = findColumn(resourceMasterColumns, [
+    "resource",
+    "resource_id",
+    "resource_number",
+    "resourceNumber",
+  ]);
+
+  const resourceRelevancyColumn = findColumn(resourceMasterColumns, [
+    "resource_planning_relevance",
+    "resource_relevancy",
+    "planning_relevance",
+    "resource_relevance",
+  ]);
+
+  if (!itemMasterItemColumn) {
+    throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
   }
+
+  const itemDescriptionExpr = itemDescColumn
+    ? `ANY_VALUE(COALESCE(CAST(${qCol(itemDescColumn)} AS STRING), ''))`
+    : `''`;
+
+  const releaseFlagCte =
+    releaseItemColumn && releaseColumn
+      ? `
+    item_release_data AS (
+      SELECT
+        UPPER(TRIM(CAST(${qCol(releaseItemColumn)} AS STRING))) AS item_key,
+        ANY_VALUE(COALESCE(CAST(${qCol(releaseColumn)} AS STRING), '')) AS item_release_flag
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemReleaseFlag)}
+      WHERE ${qCol(releaseItemColumn)} IS NOT NULL
+        AND TRIM(CAST(${qCol(releaseItemColumn)} AS STRING)) != ''
+      GROUP BY item_key
+    ),`
+      : `
+    item_release_data AS (
+      SELECT
+        CAST(NULL AS STRING) AS item_key,
+        CAST(NULL AS STRING) AS item_release_flag
+      FROM UNNEST([]) AS empty_rows
+    ),`;
+
+  const resourceMasterCte =
+    resourceColumn && resourceRelevancyColumn
+      ? `
+    resource_master_data AS (
+      SELECT
+        UPPER(TRIM(CAST(${qCol(resourceColumn)} AS STRING))) AS resource_key,
+        ANY_VALUE(COALESCE(CAST(${qCol(resourceRelevancyColumn)} AS STRING), '')) AS resource_relevancy
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.resourceMaster)}
+      WHERE ${qCol(resourceColumn)} IS NOT NULL
+        AND TRIM(CAST(${qCol(resourceColumn)} AS STRING)) != ''
+      GROUP BY resource_key
+    )`
+      : `
+    resource_master_data AS (
+      SELECT
+        CAST(NULL AS STRING) AS resource_key,
+        CAST(NULL AS STRING) AS resource_relevancy
+      FROM UNNEST([]) AS empty_rows
+    )`;
 
   const query = `
     WITH requested_items AS (
@@ -383,34 +718,17 @@ export const fetchItemDetailsForPostgres = async (itemResourceRows = []) => {
       WHERE row.item IS NOT NULL
         AND TRIM(CAST(row.item AS STRING)) != ''
     ),
-
     item_master_data AS (
       SELECT
-        UPPER(TRIM(CAST(item AS STRING))) AS item_key,
-        ANY_VALUE(COALESCE(CAST(item_desc AS STRING), '')) AS item_description
-      FROM \`${projectId}.${dataset}.item_master\`
-      WHERE item IS NOT NULL
+        UPPER(TRIM(CAST(${qCol(itemMasterItemColumn)} AS STRING))) AS item_key,
+        ${itemDescriptionExpr} AS item_description
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemMaster)}
+      WHERE ${qCol(itemMasterItemColumn)} IS NOT NULL
+        AND TRIM(CAST(${qCol(itemMasterItemColumn)} AS STRING)) != ''
       GROUP BY item_key
     ),
-
-    item_release_data AS (
-      SELECT
-        UPPER(TRIM(CAST(item AS STRING))) AS item_key,
-        ANY_VALUE(COALESCE(CAST(release AS STRING), '')) AS item_release_flag
-      FROM \`${projectId}.${dataset}.item_releaseflag\`
-      WHERE item IS NOT NULL
-      GROUP BY item_key
-    ),
-
-    resource_master_data AS (
-      SELECT
-        UPPER(TRIM(CAST(resource AS STRING))) AS resource_key,
-        ANY_VALUE(COALESCE(CAST(resource_planning_relevance AS STRING), '')) AS resource_relevancy
-      FROM \`${projectId}.${dataset}.resource_master\`
-      WHERE resource IS NOT NULL
-      GROUP BY resource_key
-    )
-
+    ${releaseFlagCte}
+    ${resourceMasterCte}
     SELECT
       ri.item,
       COALESCE(im.item_description, '') AS item_description,
@@ -426,9 +744,10 @@ export const fetchItemDetailsForPostgres = async (itemResourceRows = []) => {
     ORDER BY ri.item
   `;
 
-  const rows = await runQuery(query, {
-    itemResourceRows: cleanedRows,
-  });
+  console.log("fetchItemDetailsForPostgres query:");
+  console.log(query);
+
+  const rows = await runQuery(query, { itemResourceRows: cleanedRows });
 
   return rows.map((row) => ({
     item: normalizeText(row.item),
@@ -437,324 +756,250 @@ export const fetchItemDetailsForPostgres = async (itemResourceRows = []) => {
     item_release_flag: pickFirstValue(row, ["item_release_flag"]),
   }));
 };
+
 export const fetchBomDetailsByBomId = async (bomId) => {
-  const { projectId, dataset } = getBigQueryConfig();
-  const bomIdColumn = await getBomIdColumn("bom_produced");
+  const tableName = appConfig.postgres.tables.bomProduced;
+  const bomIdColumn = await getBomIdColumn(tableName);
 
-  const producedQuery = `
-    SELECT
-      CAST(bp.${bomIdColumn} AS STRING) AS bom_id,
-      CAST(bp.item AS STRING) AS item,
-      CAST(bp.location AS STRING) AS location,
-      SAFE_CAST(bp.erp_bom_qty_produced_per AS FLOAT64) AS qty_produced_per
-    FROM \`${projectId}.${dataset}.bom_produced\` bp
-    WHERE UPPER(TRIM(CAST(bp.${bomIdColumn} AS STRING))) = @bomId
-    ORDER BY
-      CASE
-        WHEN SAFE_CAST(bp.erp_bom_qty_produced_per AS FLOAT64) = 1 THEN 0
-        ELSE 1
-      END,
-      CAST(bp.item AS STRING)
-    LIMIT 1
-  `;
-
-  const producedRows = await runQuery(producedQuery, {
-    bomId: normalizeUpper(bomId),
-  });
+  const producedRows = await runPgQuery(
+    `
+      SELECT
+        CAST(bp.${quoteIdent(bomIdColumn)} AS TEXT) AS bom_id,
+        CAST(bp.item AS TEXT) AS item,
+        CAST(bp.location AS TEXT) AS location,
+        CAST(bp.erp_bom_qty_produced_per AS TEXT) AS qty_produced_per
+      FROM ${pgTableRef(tableName)} bp
+      WHERE UPPER(TRIM(CAST(bp.${quoteIdent(bomIdColumn)} AS TEXT))) = $1
+      ORDER BY
+        CASE
+          WHEN CAST(bp.erp_bom_qty_produced_per AS TEXT) IN ('1', '1.0', '1.00') THEN 0
+          ELSE 1
+        END,
+        CAST(bp.item AS TEXT)
+      LIMIT 1
+    `,
+    [normalizeUpper(bomId)]
+  );
 
   const producedRow = producedRows[0];
-
   if (!producedRow) {
     const bomParts = normalizeText(bomId).split("_");
     const fallbackProducedItem = bomParts.length >= 2 ? bomParts[1] : "";
     const fallbackLocation = bomParts.length >= 3 ? bomParts.slice(2).join("_") : "";
-
     let itemReleaseFlag = "";
     if (fallbackProducedItem) {
       const releaseData = await fetchItemReleaseFlagByItem(fallbackProducedItem);
       itemReleaseFlag = releaseData?.itemReleaseFlag || "";
     }
-
-    return {
-      bomId: normalizeText(bomId),
-      producedItem: fallbackProducedItem,
-      location: fallbackLocation,
-      itemReleaseFlag,
-    };
+    return { bomId: normalizeText(bomId), producedItem: fallbackProducedItem, location: fallbackLocation, itemReleaseFlag };
   }
 
   const producedItem = normalizeText(producedRow.item);
   const location = normalizeText(producedRow.location);
-
   let itemReleaseFlag = "";
   if (producedItem) {
     const releaseData = await fetchItemReleaseFlagByItem(producedItem);
     itemReleaseFlag = releaseData?.itemReleaseFlag || "";
   }
 
-  return {
-    bomId: normalizeText(bomId),
-    producedItem,
-    location,
-    itemReleaseFlag,
-  };
+  return { bomId: normalizeText(bomId), producedItem, location, itemReleaseFlag };
 };
 
-/**
- * Co-product options for selected item from item_master
- *
- * This tries to adapt to whichever item_master schema exists in GCP.
- * Supported patterns:
- *  - parent_item / co_product_item
- *  - produced_item / co_product_item
- *  - base_item / co_product_item
- *  - main_item / co_product_item
- *  - item / co_product_item
- *
- * If no supported co-product columns exist, returns [] safely.
- */
 export const fetchCoProductsByItem = async (item) => {
-  const { projectId, dataset } = getBigQueryConfig();
-  const columns = await getTableColumns("item_bom_routing");
+  const tableName = appConfig.postgres.tables.itemBomRouting;
+  const columns = await getPostgresTableColumns(tableName);
+  const associationColumn = findColumn(columns, ["erp_co_product_association", "co_product_association"]);
+  const itemColumn = findColumn(columns, ["item", "produced_item", "erp_parent_item", "main_item"]);
 
-  console.log("item_bom_routing columns:", columns);
+  if (!associationColumn || !itemColumn) return [];
 
-  const associationColumn = columns.includes("erp_co_product_association")
-    ? "erp_co_product_association"
-    : columns.includes("co_product_association")
-    ? "co_product_association"
-    : null;
-
-  const parentColumnCandidates = [
-    "produced_item",
-    "erp_parent_item",
-    "main_item",
-    "item",
-  ];
-
-  const parentColumn = parentColumnCandidates.find((c) => columns.includes(c));
-
-  if (!associationColumn || !parentColumn) {
-    console.log("Missing required columns", {
-      associationColumn,
-      parentColumn,
-    });
-    return [];
-  }
-
-  const query = `
-    SELECT DISTINCT
-      TRIM(CAST(item AS STRING)) AS item
-    FROM \`${projectId}.${dataset}.item_bom_routing\`
-    WHERE SAFE_CAST(${associationColumn} AS INT64) = 1
+  const rows = await runPgQuery(`
+    SELECT DISTINCT TRIM(CAST(${quoteIdent(itemColumn)} AS TEXT)) AS item
+    FROM ${pgTableRef(tableName)}
+    WHERE COALESCE(NULLIF(TRIM(CAST(${quoteIdent(associationColumn)} AS TEXT)), ''), '0') IN ('1', 'true', 'TRUE', 'Y', 'y')
+      AND ${quoteIdent(itemColumn)} IS NOT NULL
+      AND TRIM(CAST(${quoteIdent(itemColumn)} AS TEXT)) <> ''
     ORDER BY item
-  `;
+  `);
 
-  console.log("Co-product query using parentColumn:", parentColumn);
-  console.log("Selected item:", item);
-
-  const rows = await runQuery(query, {
-    item: normalizeUpper(item),
-  });
-
-  console.log("Co-product rows:", rows);
-
-  return rows.map((row) => ({
-    item: normalizeText(row.item),
-  }));
+  return rows.map((row) => ({ item: normalizeText(row.item) })).filter((row) => row.item !== normalizeText(item));
 };
 
-/**
- * Existing internal helper:
- * Fetch all distinct resources from resource_rescons.
- * If that table doesn't exist, fallback to routing_rescons.
- */
 const fetchAllDistinctResources = async () => {
-  const { projectId, dataset } = getBigQueryConfig();
-
-  const tableCandidates = ["resource_rescons", "routing_rescons"];
-  let lastError = null;
-
-  for (const tableName of tableCandidates) {
-    try {
-      const query = `
-        SELECT DISTINCT
-          TRIM(CAST(resource AS STRING)) AS resource
-        FROM \`${projectId}.${dataset}.${tableName}\`
-        WHERE resource IS NOT NULL
-          AND TRIM(CAST(resource AS STRING)) != ''
-        ORDER BY resource
-      `;
-
-      const rows = await runQuery(query);
-      return rows;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw new Error(
-    `Failed to fetch resources. Neither resource_rescons nor routing_rescons could be queried. ${lastError?.message || ""}`
-  );
+  return runQuery(`
+    SELECT DISTINCT TRIM(CAST(resource AS STRING)) AS resource
+    FROM ${bqTableRefByKey(BQ_TABLE_KEYS.routingRescons)}
+    WHERE resource IS NOT NULL
+      AND TRIM(CAST(resource AS STRING)) != ''
+    ORDER BY resource
+  `);
 };
 
-/**
- * Existing API:
- * Step 3 metadata for Resource / Component / Co-Product Info
- */
-export const fetchResourceComponentMetadata = async (
-  items = [],
-  locations = []
-) => {
-  const [resourceRows, resourceMasterRows, itemMasterRows] = await Promise.all([
-    fetchAllDistinctResources(),
-    fetchFromTable("resource_master", {}, null),
-    fetchFromTable("item_master", {}, null),
-  ]);
-
-  const resourceMasterMap = new Map();
-
-  for (const row of resourceMasterRows) {
-    const resourceKey = normalizeUpper(row.resource);
-    if (!resourceKey) continue;
-
-    resourceMasterMap.set(
-      resourceKey,
-      pickFirstValue(row, ["resource_planning_relevance"])
-    );
-  }
-
+export const fetchResourceComponentMetadata = async (items = [], locations = []) => {
+  const resourceRows = await fetchAllResourcesFromRoutingResCons();
   const resourceOptions = [];
   const seenResources = new Set();
 
   for (const row of resourceRows) {
     const resourceValue = normalizeText(row.resource);
     const resourceKey = normalizeUpper(resourceValue);
-
     if (!resourceKey || seenResources.has(resourceKey)) continue;
     seenResources.add(resourceKey);
-
     resourceOptions.push({
       resource: resourceValue,
-      resource_planning_relevance: resourceMasterMap.get(resourceKey) || "",
+      resourcePlanningRelevance: row.resourcePlanningRelevance ?? row.resource_planning_relevance ?? row.resource_relevancy ?? "",
+      resource_relevancy: row.resource_relevancy ?? row.resourcePlanningRelevance ?? row.resource_planning_relevance ?? "",
     });
   }
 
-  const itemOptions = [];
-  const seenItems = new Set();
-
-  for (const row of itemMasterRows) {
-    const itemValue = normalizeText(row.item);
-    const itemKey = normalizeUpper(itemValue);
-
-    if (!itemKey || seenItems.has(itemKey)) continue;
-    seenItems.add(itemKey);
-
-    itemOptions.push({
-      item: itemValue,
-      description: pickFirstValue(row, [
-        "item_description",
-        "description",
-      ]),
-    });
-  }
-
-  const bomVersions = [
-    "PRIMARY",
-    ...Array.from({ length: 20 }, (_, index) => `BOM${index + 1}`),
-  ];
-
+  const bomVersions = ["PRIMARY", ...Array.from({ length: 20 }, (_, index) => `BOM${index + 1}`)];
   return {
     bomVersions,
     resourceOptions,
-    itemOptions,
+    itemOptions: [],
     selectedItems: Array.isArray(items) ? items : [],
     selectedLocations: Array.isArray(locations) ? locations : [],
   };
 };
 
-/**
- * Existing API:
- * Existing BOM search rows
- */
 export const fetchExistingBomSearchRows = async () => {
-  const { projectId, dataset } = getBigQueryConfig();
-
-  const query = `
-    WITH base_produced AS (
+  const producedRows = await runPgQuery(`
+    WITH ranked_produced AS (
       SELECT
-        CAST(bp.bom_id AS STRING) AS bom_id,
-        CAST(bp.item AS STRING) AS produced_item,
-        CAST(bp.location AS STRING) AS location,
-        SAFE_CAST(bp.erp_bom_qty_produced_per AS FLOAT64) AS qty_produced_per,
+        CAST(bp.bom_id AS TEXT) AS bom_id,
+        CAST(bp.item AS TEXT) AS produced_item,
+        CAST(bp.location AS TEXT) AS location,
+        CAST(bp.erp_bom_qty_produced_per AS TEXT) AS qty_produced_per,
         ROW_NUMBER() OVER (
-          PARTITION BY CAST(bp.bom_id AS STRING)
+          PARTITION BY CAST(bp.bom_id AS TEXT)
           ORDER BY
             CASE
-              WHEN SAFE_CAST(bp.erp_bom_qty_produced_per AS FLOAT64) = 1 THEN 0
+              WHEN CAST(bp.erp_bom_qty_produced_per AS TEXT) IN ('1', '1.0', '1.00') THEN 0
               ELSE 1
             END,
-            CAST(bp.item AS STRING)
+            CAST(bp.item AS TEXT)
         ) AS rn
-      FROM \`${projectId}.${dataset}.bom_produced\` bp
+      FROM ${pgTableRef(appConfig.postgres.tables.bomProduced)} bp
       WHERE bp.bom_id IS NOT NULL
-    ),
-    release_flags AS (
-      SELECT
-        CAST(item AS STRING) AS item,
-        COALESCE(
-          CAST(release AS STRING),
-          CAST(release_flag AS STRING),
-          CAST(item_release_flag AS STRING),
-          CAST(planning_release_flag AS STRING),
-          CAST(status AS STRING),
-          ''
-        ) AS item_release_flag
-      FROM \`${projectId}.${dataset}.item_releaseflag\`
-    ),
-    produced_desc AS (
-      SELECT
-        CAST(item AS STRING) AS item,
-        COALESCE(
-          CAST(item_description AS STRING),
-          CAST(description AS STRING),
-          ''
-        ) AS produced_item_desc
-      FROM \`${projectId}.${dataset}.item_master\`
-    ),
-    routing_rows AS (
-      SELECT
-        CAST(ibr.bom_id AS STRING) AS bom_id,
-        CAST(ibr.routing_id AS STRING) AS routing_id
-      FROM \`${projectId}.${dataset}.item_bom_routing\` ibr
-    ),
-    resource_rows AS (
-      SELECT
-        CAST(rr.routing_id AS STRING) AS routing_id,
-        CAST(rr.resource AS STRING) AS resource
-      FROM \`${projectId}.${dataset}.routing_rescons\` rr
     )
-    SELECT
-      bp.bom_id AS id,
-      bp.location,
-      bp.produced_item,
-      COALESCE(pd.produced_item_desc, '') AS produced_item_desc,
-      bp.bom_id,
-      COALESCE(rr.resource, '') AS resource,
-      COALESCE(rf.item_release_flag, '') AS item_release_flag,
-      COALESCE(rt.routing_id, '') AS routing_id
-    FROM base_produced bp
-    LEFT JOIN produced_desc pd
-      ON UPPER(TRIM(pd.item)) = UPPER(TRIM(bp.produced_item))
-    LEFT JOIN release_flags rf
-      ON UPPER(TRIM(rf.item)) = UPPER(TRIM(bp.produced_item))
-    LEFT JOIN routing_rows rt
-      ON UPPER(TRIM(rt.bom_id)) = UPPER(TRIM(bp.bom_id))
-    LEFT JOIN resource_rows rr
-      ON UPPER(TRIM(rr.routing_id)) = UPPER(TRIM(rt.routing_id))
-    WHERE bp.rn = 1
-    ORDER BY bp.bom_id, rr.resource
-  `;
+    SELECT bom_id, produced_item, location, qty_produced_per
+    FROM ranked_produced
+    WHERE rn = 1
+    ORDER BY bom_id
+  `);
 
-  return runQuery(query);
+  const routingRows = await runPgQuery(`
+    SELECT
+      CAST(ibr.bom_id AS TEXT) AS bom_id,
+      CAST(ibr.routing_id AS TEXT) AS routing_id
+    FROM ${pgTableRef(appConfig.postgres.tables.itemBomRouting)} ibr
+    WHERE ibr.routing_id IS NOT NULL
+      AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
+  `);
+
+  const producedItems = Array.from(new Set(producedRows.map((row) => normalizeUpper(row.produced_item)).filter(Boolean)));
+  const routingIds = Array.from(new Set(routingRows.map((row) => normalizeUpper(row.routing_id)).filter(Boolean)));
+
+  const itemMasterRows = producedItems.length
+    ? await runQuery(
+      `
+          SELECT *
+          FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemMaster)}
+          WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+        `,
+      { items: producedItems }
+    )
+    : [];
+
+  const releaseFlagRows = producedItems.length
+    ? await runQuery(
+      `
+          SELECT *
+          FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemReleaseFlag)}
+          WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+        `,
+      { items: producedItems }
+    )
+    : [];
+
+  const resourceRows = routingIds.length
+    ? await runQuery(
+      `
+          SELECT *
+          FROM ${bqTableRefByKey(BQ_TABLE_KEYS.routingRescons)}
+          WHERE UPPER(TRIM(CAST(routing_id AS STRING))) IN UNNEST(@routingIds)
+        `,
+      { routingIds }
+    )
+    : [];
+
+  const itemDescMap = new Map();
+  for (const row of itemMasterRows) {
+    const key = normalizeUpper(row.item);
+    if (!key) continue;
+    itemDescMap.set(key, pickFirstValue(row, ["item_description", "item_desc", "description", "item_desc_1"]));
+  }
+
+  const releaseFlagMap = new Map();
+  for (const row of releaseFlagRows) {
+    const key = normalizeUpper(row.item);
+    if (!key) continue;
+    releaseFlagMap.set(
+      key,
+      pickFirstValue(row, ["release", "release_flag", "releaseflag", "item_releaseflag", "item_release_flag", "item_mrp_rls_flg", "planning_release_flag", "status"])
+    );
+  }
+
+  const resourceByRoutingId = new Map();
+  for (const row of resourceRows) {
+    const key = normalizeUpper(row.routing_id);
+    if (!key) continue;
+    resourceByRoutingId.set(key, pickFirstValue(row, ["resource"]));
+  }
+
+  const routingByBomId = new Map();
+  for (const row of routingRows) {
+    const bomId = normalizeText(row.bom_id);
+    if (!bomId) continue;
+    if (!routingByBomId.has(bomId)) routingByBomId.set(bomId, []);
+    routingByBomId.get(bomId).push(row);
+  }
+
+  const result = [];
+  for (const bp of producedRows) {
+    const bomId = normalizeText(bp.bom_id);
+    const producedItem = normalizeText(bp.produced_item);
+    const itemKey = normalizeUpper(producedItem);
+    const matchingRoutingRows = routingByBomId.get(bomId) || [];
+
+    if (!matchingRoutingRows.length) {
+      result.push({
+        id: `${bomId}__NOROUTING`,
+        location: normalizeText(bp.location),
+        produced_item: producedItem,
+        produced_item_desc: itemDescMap.get(itemKey) || "",
+        bom_id: bomId,
+        resource: "",
+        item_release_flag: releaseFlagMap.get(itemKey) || "",
+        routing_id: "",
+      });
+      continue;
+    }
+
+    for (const rt of matchingRoutingRows) {
+      const routingId = normalizeText(rt.routing_id);
+      result.push({
+        id: `${bomId}__${routingId || "ROW"}`,
+        location: normalizeText(bp.location),
+        produced_item: producedItem,
+        produced_item_desc: itemDescMap.get(itemKey) || "",
+        bom_id: bomId,
+        resource: resourceByRoutingId.get(normalizeUpper(routingId)) || "",
+        item_release_flag: releaseFlagMap.get(itemKey) || "",
+        routing_id: routingId,
+      });
+    }
+  }
+
+  return result.sort((a, b) => String(a.bom_id).localeCompare(String(b.bom_id)) || String(a.resource).localeCompare(String(b.resource)));
 };

@@ -3,20 +3,23 @@ import path from "path";
 import fs from "fs";
 import { BigQuery } from "@google-cloud/bigquery";
 import { validateAndLoadAllCsv } from "../postgres/ValidateOneTimeUpload.js";
+import appConfig from "../config/appConfig.js";
 
 const router = express.Router();
 const ROOT = process.cwd();
 const REPORTS_DIR = path.join(ROOT, "reports");
 
-// Keep only table names at top if needed
 const BQ_TABLE_BOM_PARAMETERS =
-  process.env.BQ_TABLE_BOM_PARAMETERS || "bom_parameters";
+  appConfig.bigQuery.tables.bomParameters;
+
 const BQ_TABLE_BOM_PRODUCED =
-  process.env.BQ_TABLE_BOM_PRODUCED || "bom_produced";
+  appConfig.bigQuery.tables.bomProduced;
+
 const BQ_TABLE_BOM_CONSUMED =
-  process.env.BQ_TABLE_BOM_CONSUMED || "bom_consumed";
+  appConfig.bigQuery.tables.bomConsumed;
+
 const BQ_TABLE_ITEM_BOM_ROUTING =
-  process.env.BQ_TABLE_ITEM_BOM_ROUTING || "item_bom_routing";
+  appConfig.bigQuery.tables.itemBomRouting;
 
 function sendValidateLoadResponse(res, result) {
   if (!result.ok) {
@@ -38,28 +41,24 @@ function sendValidateLoadResponse(res, result) {
     reportDownloadUrl: result.report?.reportFileName
       ? `/api/bom-upload/report/${result.report.reportFileName}`
       : null,
-    message: "CSV files validated and loaded into PostgreSQL successfully.",
+    message:
+      "CSV files validated and loaded into PostgreSQL successfully.",
   });
 }
 
-async function fetchBigQueryTable(tableName) {
-  const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || "";
-  const BQ_PROJECT_ID = process.env.BQ_PROJECT_ID || GCP_PROJECT_ID || "";
-  const BQ_DATASET = process.env.BQ_DATASET || "";
+async function fetchBigQueryTable(tableConfig) {
+  const projectId =
+    appConfig.bigQuery.projectIds[tableConfig.source];
 
-  if (!BQ_PROJECT_ID || !BQ_DATASET ) {
-    throw new Error(
-      "BQ_PROJECT_ID or BQ_DATASET  is not set in .env"
-    );
-  }
+  const datasetId = appConfig.bigQuery.datasetId;
 
   const bigquery = new BigQuery({
-    projectId: BQ_PROJECT_ID,
+    projectId,
   });
 
   const query = `
     SELECT *
-    FROM \`${BQ_PROJECT_ID}.${BQ_DATASET}.${tableName}\`
+    FROM \`${projectId}.${datasetId}.${tableConfig.table}\`
   `;
 
   const [job] = await bigquery.createQueryJob({
@@ -81,10 +80,12 @@ async function fetchBigQueryTable(tableName) {
       row.erp_bom_quantity_consumed_per ??
       row.ERPBOMQuantityConsumedPer ??
       "",
+
     erp_bom_component_start_date:
       row.erp_bom_component_start_date ??
       row.ERPBOMComponentStartDate ??
       "",
+
     erp_bom_component_end_date:
       row.erp_bom_component_end_date ??
       row.ERPBOMComponentEndDate ??
@@ -102,27 +103,37 @@ async function fetchBigQueryTable(tableName) {
       "",
 
     // item_bom_routing aliases
-    routing_id: row.routing_id ?? row.RoutingID ?? row.routingId ?? "",
+    routing_id:
+      row.routing_id ??
+      row.RoutingID ??
+      row.routingId ??
+      "",
+
     erp_item_bom_routing_priority:
       row.erp_item_bom_routing_priority ??
       row.ERPItemBOMRoutingPriority ??
       "",
+
     erp_item_bom_routing_min_lot_size:
       row.erp_item_bom_routing_min_lot_size ??
       row.ERPItemBOMRoutingMinLotSize ??
       "",
+
     erp_item_bom_routing_lot_size_increment:
       row.erp_item_bom_routing_lot_size_increment ??
       row.ERPItemBOMRoutingLotSizeIncrement ??
       "",
+
     erp_item_bom_routing_max_lot_size:
       row.erp_item_bom_routing_max_lot_size ??
       row.ERPItemBOMRoutingMaxLotSize ??
       "",
+
     erp_item_bom_wip_sweep_priority:
       row.erp_item_bom_wip_sweep_priority ??
       row.ERPItemBOMWIPSweepPriority ??
       "",
+
     erp_item_bom_routing_wip_sweep_priority:
       row.erp_item_bom_routing_wip_sweep_priority ??
       row.ERPItemBOMRoutingWIPSweepPriority ??
@@ -138,7 +149,6 @@ async function fetchBigQueryTable(tableName) {
 
   return normalizedRows;
 }
-
 
 router.post("/validate-and-load", async (req, res) => {
   try {

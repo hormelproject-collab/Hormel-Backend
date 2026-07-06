@@ -15,7 +15,7 @@ import fs from "fs";
 import path from "path";
 import pool from "./src/db/postgresClient.js";
 
-import sampleRoute from "./src/routes/route.js";
+
 import bomExplosionRoute from "./src/routes/createbomliteRoute.js";
 import bomDownloadRoutes from "./src/routes/bomDownload.routes.js";
 import bigqueryRoutes from "./src/routes/bigqueryRoutes.js";
@@ -53,11 +53,12 @@ console.log("✅ BigQuery routes loaded");
 
 app.use("/api/bigquery/table", bigqueryRoutes);
 app.use("/api/bom", bomDownloadRoutes);
-app.use("/api/bigquery", sampleRoute);
+
 // one-time upload
 app.use("/api/bom-upload", bomValidateLoadRoutes);
 // BOM Explosion: create bom manual validation
 app.use("/bom-explosion", bomExplosionRoute);
+app.use("/api/bom-explosion", bomExplosionRoute);
 // BOM editing from existing records - PostgreSQL to UI
 app.use("/api/tables", tableRoutes);
 
