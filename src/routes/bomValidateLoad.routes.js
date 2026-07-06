@@ -150,6 +150,41 @@ async function fetchBigQueryTable(tableConfig) {
   return normalizedRows;
 }
 
+<<<<<<< HEAD
+=======
+export async function performScheduledGcpSync() {
+  const [
+    bom_parameters,
+    bom_produced,
+    bom_consumed,
+    item_bom_routing,
+  ] = await Promise.all([
+    fetchBigQueryTable(BQ_TABLE_BOM_PARAMETERS),
+    fetchBigQueryTable(BQ_TABLE_BOM_PRODUCED),
+    fetchBigQueryTable(BQ_TABLE_BOM_CONSUMED),
+    fetchBigQueryTable(BQ_TABLE_ITEM_BOM_ROUTING),
+  ]);
+
+  const payload = {
+    bom_parameters,
+    bom_produced,
+    bom_consumed,
+    item_bom_routing,
+  };
+
+  const result = await validateAndLoadAllCsv(payload);
+  return {
+    result,
+    fetchedCounts: {
+      bom_parameters: bom_parameters.length,
+      bom_produced: bom_produced.length,
+      bom_consumed: bom_consumed.length,
+      item_bom_routing: item_bom_routing.length,
+    },
+  };
+}
+
+>>>>>>> 5324ea06f0eec05854503f3e87c4f3593922f18b
 router.post("/validate-and-load", async (req, res) => {
   try {
     const payload = req.body || {};
@@ -166,37 +201,13 @@ router.post("/validate-and-load", async (req, res) => {
 
 router.post("/sync-gcp-to-postgres", async (req, res) => {
   try {
-    const [
-      bom_parameters,
-      bom_produced,
-      bom_consumed,
-      item_bom_routing,
-    ] = await Promise.all([
-      fetchBigQueryTable(BQ_TABLE_BOM_PARAMETERS),
-      fetchBigQueryTable(BQ_TABLE_BOM_PRODUCED),
-      fetchBigQueryTable(BQ_TABLE_BOM_CONSUMED),
-      fetchBigQueryTable(BQ_TABLE_ITEM_BOM_ROUTING),
-    ]);
-
-    const payload = {
-      bom_parameters,
-      bom_produced,
-      bom_consumed,
-      item_bom_routing,
-    };
-
-    const result = await validateAndLoadAllCsv(payload);
+    const { result, fetchedCounts } = await performScheduledGcpSync();
 
     if (!result.ok) {
       return res.status(400).json({
         status: "FAILED",
         source: "sync-gcp-to-postgres",
-        fetchedCounts: {
-          bom_parameters: bom_parameters.length,
-          bom_produced: bom_produced.length,
-          bom_consumed: bom_consumed.length,
-          item_bom_routing: item_bom_routing.length,
-        },
+        fetchedCounts,
         errorCount: result.errorCount || 0,
         reportFileName: result.report?.reportFileName || null,
         reportDownloadUrl: result.report?.reportFileName
@@ -209,12 +220,7 @@ router.post("/sync-gcp-to-postgres", async (req, res) => {
     return res.json({
       status: "SUCCESS",
       source: "sync-gcp-to-postgres",
-      fetchedCounts: {
-        bom_parameters: bom_parameters.length,
-        bom_produced: bom_produced.length,
-        bom_consumed: bom_consumed.length,
-        item_bom_routing: item_bom_routing.length,
-      },
+      fetchedCounts,
       inserted: result.inserted || {},
       reportFileName: result.report?.reportFileName || null,
       reportDownloadUrl: result.report?.reportFileName
