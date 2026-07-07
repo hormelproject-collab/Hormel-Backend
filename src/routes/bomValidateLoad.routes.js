@@ -150,8 +150,6 @@ async function fetchBigQueryTable(tableConfig) {
   return normalizedRows;
 }
 
-<<<<<<< HEAD
-=======
 export async function performScheduledGcpSync() {
   const [
     bom_parameters,
@@ -184,7 +182,6 @@ export async function performScheduledGcpSync() {
   };
 }
 
->>>>>>> 5324ea06f0eec05854503f3e87c4f3593922f18b
 router.post("/validate-and-load", async (req, res) => {
   try {
     const payload = req.body || {};

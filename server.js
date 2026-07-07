@@ -15,8 +15,6 @@ import fs from "fs";
 import path from "path";
 import pool from "./src/db/postgresClient.js";
 import cron from "node-cron";
-
-
 import bomExplosionRoute from "./src/routes/createbomliteRoute.js";
 import bomDownloadRoutes from "./src/routes/bomDownload.routes.js";
 import bigqueryRoutes from "./src/routes/bigqueryRoutes.js";
@@ -125,7 +123,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
 
-  const SCHEDULE_TIME = process.env.CHICAGO_DAILY_SCHEDULE || "0 6 * * *";
+  const SCHEDULE_TIME = "15 8 * * *";
   cron.schedule(
     SCHEDULE_TIME,
     async () => {
