@@ -6,7 +6,7 @@ const appConfig = {
       prd: "bommanagement",
     },
     datasetId: "bom_sandbox",
-
+  
     tables: {
       bomParameters: "bom_parameters",
       bomProduced: "bom_produced",
