@@ -136,6 +136,7 @@ router.post("/locations-by-items", async (req, res) => {
     }
 
     const data = await fetchLocationsBySelectedItems(itemIds);
+    console.log(JSON.stringify(data));
     return res.status(200).json({ success: true, data });
   } catch (error) {
     console.error("Error fetching locations by selected items:", error);
