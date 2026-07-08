@@ -994,3 +994,211 @@ export const fetchResourceComponentMetadata = async (items = [], locations = [])
     selectedLocations: Array.isArray(locations) ? locations : [],
   };
 };
+
+/*
+  Add these exports to your existing services/bigqueryService.js.
+  Saved as .jsx only because you requested backend files in .jsx format.
+*/
+
+export const fetchBomIdsLazy = async ({
+  page = 1,
+  pageSize = 50,
+  search = "",
+} = {}) => {
+  const safePage = Math.max(1, Number.parseInt(page, 10) || 1);
+  const safePageSize = Math.min(100, Math.max(1, Number.parseInt(pageSize, 10) || 50));
+  const offset = (safePage - 1) * safePageSize;
+  const searchText = normalizeText(search);
+
+  const params = [];
+  const filters = ["bom_id IS NOT NULL", "TRIM(CAST(bom_id AS TEXT)) <> ''"];
+
+  if (searchText) {
+    params.push(`%${searchText}%`);
+    filters.push(`CAST(bom_id AS TEXT) ILIKE $${params.length}`);
+  }
+
+  params.push(safePageSize);
+  const limitParam = `$${params.length}`;
+
+  params.push(offset);
+  const offsetParam = `$${params.length}`;
+
+  const rows = await runPgQuery(
+    `
+      WITH filtered_rows AS (
+        SELECT DISTINCT TRIM(CAST(bom_id AS TEXT)) AS bom_id
+        FROM ${pgTableRef(appConfig.postgres.tables.bomParameters)}
+        WHERE ${filters.join(" AND ")}
+      ),
+      counted_rows AS (
+        SELECT bom_id, COUNT(1) OVER() AS total_count
+        FROM filtered_rows
+      )
+      SELECT bom_id, total_count
+      FROM counted_rows
+      ORDER BY bom_id
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    `,
+    params
+  );
+
+  const total = rows.length ? Number(rows[0].total_count || 0) : 0;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+
+  return {
+    data: rows.map((row) => ({ bomId: normalizeText(row.bom_id) })),
+    pagination: {
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages,
+      hasPrev: safePage > 1,
+      hasNext: safePage < totalPages,
+      search: searchText,
+    },
+  };
+};
+
+export const fetchResourcesLazy = async ({
+  page = 1,
+  pageSize = 50,
+  search = "",
+} = {}) => {
+  const safePage = Math.max(1, Number.parseInt(page, 10) || 1);
+  const safePageSize = Math.min(100, Math.max(1, Number.parseInt(pageSize, 10) || 50));
+  const offset = (safePage - 1) * safePageSize;
+  const searchText = normalizeText(search);
+
+  const rows = await runQuery(
+    `
+      WITH filtered_rows AS (
+        SELECT DISTINCT
+          TRIM(CAST(resource AS STRING)) AS resource,
+          COALESCE(CAST(resource_planning_relevance AS STRING), '') AS resource_planning_relevance
+        FROM ${bqTableRefByKey(BQ_TABLE_KEYS.resourceMaster)}
+        WHERE resource IS NOT NULL
+          AND TRIM(CAST(resource AS STRING)) != ''
+          AND (
+            @searchText = ''
+            OR LOWER(TRIM(CAST(resource AS STRING))) LIKE CONCAT('%', LOWER(@searchText), '%')
+          )
+      ),
+      counted_rows AS (
+        SELECT *, COUNT(1) OVER() AS total_count
+        FROM filtered_rows
+      )
+      SELECT resource, resource_planning_relevance, total_count
+      FROM counted_rows
+      ORDER BY resource
+      LIMIT ${safePageSize}
+      OFFSET ${offset}
+    `,
+    { searchText }
+  );
+
+  const total = rows.length ? Number(rows[0].total_count || 0) : 0;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+
+  return {
+    data: rows.map((row) => ({
+      resource: normalizeText(row.resource),
+      resourcePlanningRelevance: normalizeText(row.resource_planning_relevance),
+      resource_relevancy: normalizeText(row.resource_planning_relevance),
+    })),
+    pagination: {
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages,
+      hasPrev: safePage > 1,
+      hasNext: safePage < totalPages,
+      search: searchText,
+    },
+  };
+};
+
+export const fetchCoProductItemsLazy = async ({
+  page = 1,
+  pageSize = 50,
+  search = "",
+} = {}) => {
+  const safePage = Math.max(1, Number.parseInt(page, 10) || 1);
+  const safePageSize = Math.min(100, Math.max(1, Number.parseInt(pageSize, 10) || 50));
+  const offset = (safePage - 1) * safePageSize;
+  const searchText = normalizeText(search);
+
+  const itemMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
+
+  const itemColumn = findColumn(itemMasterColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
+  const descColumn = findColumn(itemMasterColumns, [
+    "item_desc",
+    "item_description",
+    "description",
+    "item_desc_1",
+  ]);
+
+  if (!itemColumn) {
+    throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
+  }
+
+  const itemExpr = `TRIM(CAST(${qCol(itemColumn)} AS STRING))`;
+  const descExpr = descColumn ? `COALESCE(CAST(${qCol(descColumn)} AS STRING), '')` : `''`;
+
+  const rows = await runQuery(
+    `
+      WITH filtered_rows AS (
+        SELECT DISTINCT
+          ${itemExpr} AS item,
+          ${descExpr} AS item_desc
+        FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemMaster)}
+        WHERE ${qCol(itemColumn)} IS NOT NULL
+          AND TRIM(CAST(${qCol(itemColumn)} AS STRING)) != ''
+          AND UPPER(TRIM(CAST(${qCol(itemColumn)} AS STRING))) LIKE 'HRL%'
+          AND (
+            @searchText = ''
+            OR LOWER(TRIM(CAST(${qCol(itemColumn)} AS STRING))) LIKE CONCAT('%', LOWER(@searchText), '%')
+            OR LOWER(${descExpr}) LIKE CONCAT('%', LOWER(@searchText), '%')
+          )
+      ),
+      counted_rows AS (
+        SELECT *, COUNT(1) OVER() AS total_count
+        FROM filtered_rows
+      )
+      SELECT item, item_desc, total_count
+      FROM counted_rows
+      ORDER BY item
+      LIMIT ${safePageSize}
+      OFFSET ${offset}
+    `,
+    { searchText }
+  );
+
+  const total = rows.length ? Number(rows[0].total_count || 0) : 0;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+
+  return {
+    data: rows.map((row) => ({
+      item: normalizeText(row.item),
+      item_desc: normalizeText(row.item_desc),
+      description: normalizeText(row.item_desc),
+    })),
+    pagination: {
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages,
+      hasPrev: safePage > 1,
+      hasNext: safePage < totalPages,
+      search: searchText,
+    },
+  };
+};
+

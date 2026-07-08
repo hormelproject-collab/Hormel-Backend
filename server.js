@@ -1,14 +1,6 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-console.log("DEBUG BQ_PROJECT_ID from server.js:", process.env.BQ_PROJECT_ID);
-console.log("DEBUG BQ_DATASET from server.js:", process.env.BQ_DATASET);
-console.log("DEBUG BQ_LOCATION from server.js:", process.env.BQ_LOCATION);
-console.log(
-  "DEBUG GOOGLE_APPLICATION_CREDENTIALS from server.js:",
-  process.env.GOOGLE_APPLICATION_CREDENTIALS
-);
-
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -47,10 +39,8 @@ app.use(
   })
 );
 
-/* =============================
-   ✅ BigQuery APIs - GCP to UI
-============================= */
-console.log("✅ BigQuery routes loaded");
+/* BigQuery APIs - GCP to UI */
+
 
 app.use("/api/bigquery/table", bigqueryRoutes);
 app.use("/api/bom", bomDownloadRoutes);
@@ -66,10 +56,7 @@ app.use("/api/tables", tableRoutes);
 app.get("/health", (req, res) => res.json({ status: "UP" }));
 app.get("/", (req, res) => res.send("✅ BOM API Server Running"));
 
-/* -----------------------------------------------------
-   ✅ GET ENGINEERING CHANGE DETAIL (BY ID)
-   Query Param: EngineeringchangeID=EC-001234
-------------------------------------------------------*/
+
 app.get("/api/engineering-changes/detail", (req, res) => {
   const id =
     req.query.EngineeringchangeID ||
@@ -96,13 +83,9 @@ app.get("/api/engineering-changes/detail", (req, res) => {
   });
 });
 
-console.log("DEBUG DB USER from server.js:", process.env.PG_USER);
-console.log("DEBUG DB HOST from server.js:", process.env.PG_HOST);
-console.log("DEBUG DB NAME from server.js:", process.env.PG_DATABASE);
 
-/* =============================
-   ✅ PostgreSQL connection test
-============================= */
+
+/* PostgreSQL connection test */
 (async () => {
   try {
     const client = await pool.connect();
@@ -116,9 +99,7 @@ console.log("DEBUG DB NAME from server.js:", process.env.PG_DATABASE);
   }
 })();
 
-/* =============================
-   ✅ Start Server
-============================= */
+/* Start Server */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);

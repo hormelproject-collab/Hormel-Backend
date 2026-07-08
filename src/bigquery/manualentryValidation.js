@@ -1,8 +1,6 @@
 import { validationRules } from "../postgres/ValidationRules.js";
 
-/* =========================================================
-   Helpers
-========================================================= */
+/* Helpers */
 const norm = (v) => String(v ?? "").trim();
 const ensureArray = (v) => (Array.isArray(v) ? v : []);
 const toNum = (v) => {
@@ -87,9 +85,7 @@ const buildErrorRow = ({
   ],
 });
 
-/* =========================================================
-   Summary payload -> normalized table arrays
-========================================================= */
+/* Summary payload -> normalized table arrays */
 export function convertSummaryPayloadToTables(payload) {
   const records = Array.isArray(payload?.records) ? payload.records : [];
 
@@ -182,9 +178,7 @@ export function convertSummaryPayloadToTables(payload) {
   };
 }
 
-/* =========================================================
-   DB helpers for duplicate checks
-========================================================= */
+/* DB helpers for duplicate checks */
 async function fetchExistingBomIds(pool, tableName, bomIds = []) {
   if (!Array.isArray(bomIds) || bomIds.length === 0) return new Set();
 
@@ -198,9 +192,7 @@ async function fetchExistingBomIds(pool, tableName, bomIds = []) {
   return new Set(result.rows.map((r) => norm(r.bom_id)).filter(Boolean));
 }
 
-/* =========================================================
-   Main manual validator
-========================================================= */
+/*  Main manual validator */
 export async function validateManualEntryPayload(payload, pool) {
   const tables = convertSummaryPayloadToTables(payload);
 
@@ -226,9 +218,7 @@ export async function validateManualEntryPayload(payload, pool) {
     fetchExistingBomIds(pool, "bom_produced", bomIdsProduced),
   ]);
 
-  /* ======================================================
-     1001: BOM_PARAMETERS bom_id must exist in produced + routing
-  ====================================================== */
+  /*  1001: BOM_PARAMETERS bom_id must exist in produced + routing */
   for (const p of params) {
     const b = norm(p.bom_id);
     if (!b) continue;
@@ -266,9 +256,7 @@ export async function validateManualEntryPayload(payload, pool) {
     }
   }
 
-  /* ======================================================
-     1002: BOM_PARAMETERS duplicate
-  ====================================================== */
+  /* 1002: BOM_PARAMETERS duplicate*/
   {
     const seen = new Set();
     for (const p of params) {

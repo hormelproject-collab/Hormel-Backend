@@ -1172,67 +1172,295 @@ router.post("/locations-by-items", async (req, res) => {
 ========================================================= */
 router.get("/existing-bom-search", async (req, res) => {
   try {
-    const producedResult = await pool.query(`
-      WITH ranked_produced AS (
-        SELECT
-          TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
-          TRIM(CAST(bp.item AS TEXT)) AS produced_item,
-          TRIM(CAST(bp.location AS TEXT)) AS location,
-          ROW_NUMBER() OVER (
-            PARTITION BY TRIM(CAST(bp.bom_id AS TEXT))
-            ORDER BY
-              CASE
-                WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
-                  THEN 0
-                ELSE 1
-              END,
-              TRIM(CAST(bp.item AS TEXT))
-          ) AS rn
-        FROM ${pgRef(T.bomProduced)} bp
-        WHERE bp.bom_id IS NOT NULL
-          AND TRIM(CAST(bp.bom_id AS TEXT)) <> ''
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.pageSize, 10) || 50)
+    );
+    const offset = (page - 1) * pageSize;
+
+    const normalizeField = (value) => {
+      const allowed = new Set([
+        "",
+        "location",
+        "bom_id",
+        "bomId",
+        "produced_item",
+        "producedItem",
+        "produced_item_desc",
+        "producedItemDescription",
+        "item_release_flag",
+        "releaseFlag",
+      ]);
+
+      const field = String(value || "").trim();
+      if (!allowed.has(field)) return "";
+
+      const fieldMap = {
+        bomId: "bom_id",
+        producedItem: "produced_item",
+        producedItemDescription: "produced_item_desc",
+        releaseFlag: "item_release_flag",
+      };
+
+      return fieldMap[field] || field;
+    };
+
+    const searchBy1 = normalizeField(req.query.searchBy1);
+    const query1 = normalizeText(req.query.query1 || "");
+    const searchBy2 = normalizeField(req.query.searchBy2);
+    const query2 = normalizeText(req.query.query2 || "");
+
+    const pgParams = [];
+    const pgFilters = [];
+
+    const addPgParam = (value) => {
+      pgParams.push(value);
+      return `$${pgParams.length}`;
+    };
+
+    const addProducedItemInFilter = (items) => {
+      const cleaned = Array.from(
+        new Set((items || []).map(normalizeUpper).filter(Boolean))
+      );
+
+      if (!cleaned.length) {
+        pgFilters.push("1 = 0");
+        return;
+      }
+
+      const placeholders = cleaned.map((item) => addPgParam(item)).join(", ");
+      pgFilters.push(
+        `UPPER(TRIM(CAST(produced_item AS TEXT))) IN (${placeholders})`
+      );
+    };
+
+    const findItemsByDescription = async (descriptionText) => {
+      const q = normalizeText(descriptionText);
+      if (!q) return [];
+
+      const rows = await runBigQuery(
+        `
+          SELECT DISTINCT UPPER(TRIM(CAST(item AS STRING))) AS item
+          FROM ${bqTableRefByKey("itemMaster")}
+          WHERE item IS NOT NULL
+            AND TRIM(CAST(item AS STRING)) != ''
+            AND (
+              LOWER(COALESCE(CAST(item_description AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(description AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(item_desc AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(item_desc_1 AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+            )
+        `,
+        { q }
+      );
+
+      return rows.map((row) => normalizeUpper(row.item)).filter(Boolean);
+    };
+
+    const findItemsByReleaseFlag = async (releaseText) => {
+      const q = normalizeText(releaseText);
+      if (!q) return [];
+
+      const rows = await runBigQuery(
+        `
+          SELECT DISTINCT UPPER(TRIM(CAST(item AS STRING))) AS item
+          FROM ${bqTableRefByKey("itemReleaseFlag")}
+          WHERE item IS NOT NULL
+            AND TRIM(CAST(item AS STRING)) != ''
+            AND (
+              LOWER(COALESCE(CAST(item_releaseflag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(release_flag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(releaseflag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(mrp_release_flag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+              OR LOWER(COALESCE(CAST(item_mrp_rls_flg AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+            )
+        `,
+        { q }
+      );
+
+      return rows.map((row) => normalizeUpper(row.item)).filter(Boolean);
+    };
+
+    const appendSearchFilter = async (field, value) => {
+      const q = normalizeText(value);
+      if (!field || !q) return;
+
+      if (field === "location") {
+        pgFilters.push(
+          `TRIM(CAST(location AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
+      if (field === "bom_id") {
+        pgFilters.push(
+          `TRIM(CAST(bom_id AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
+      if (field === "produced_item") {
+        pgFilters.push(
+          `TRIM(CAST(produced_item AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
+      if (field === "produced_item_desc") {
+        const items = await findItemsByDescription(q);
+        addProducedItemInFilter(items);
+        return;
+      }
+
+      if (field === "item_release_flag") {
+        const items = await findItemsByReleaseFlag(q);
+        addProducedItemInFilter(items);
+      }
+    };
+
+    await appendSearchFilter(searchBy1, query1);
+    await appendSearchFilter(searchBy2, query2);
+
+    const whereClause = pgFilters.length
+      ? `WHERE ${pgFilters.join(" AND ")}`
+      : "";
+
+    const limitParam = addPgParam(pageSize);
+    const offsetParam = addPgParam(offset);
+
+    const producedResult = await pool.query(
+      `
+        WITH ranked_produced AS (
+          SELECT
+            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(bp.item AS TEXT)) AS produced_item,
+            TRIM(CAST(bp.location AS TEXT)) AS location,
+            ROW_NUMBER() OVER (
+              PARTITION BY TRIM(CAST(bp.bom_id AS TEXT))
+              ORDER BY
+                CASE
+                  WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
+                    THEN 0
+                  ELSE 1
+                END,
+                TRIM(CAST(bp.item AS TEXT))
+            ) AS rn
+          FROM ${pgRef(T.bomProduced)} bp
+          WHERE bp.bom_id IS NOT NULL
+            AND TRIM(CAST(bp.bom_id AS TEXT)) <> ''
+        ),
+        base_rows AS (
+          SELECT bom_id, produced_item, location
+          FROM ranked_produced
+          WHERE rn = 1
+        ),
+        filtered_rows AS (
+          SELECT *
+          FROM base_rows
+          ${whereClause}
+        ),
+        counted_rows AS (
+          SELECT *, COUNT(1) OVER() AS total_count
+          FROM filtered_rows
+        )
+        SELECT bom_id, produced_item, location, total_count
+        FROM counted_rows
+        ORDER BY bom_id, produced_item, location
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
+      `,
+      pgParams
+    );
+
+    const producedRows = producedResult.rows || [];
+    const total = producedRows.length
+      ? Number(producedRows[0].total_count || 0)
+      : 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+    const pageBomIds = producedRows
+      .map((row) => normalizeText(row.bom_id))
+      .filter(Boolean);
+
+    const pageItems = Array.from(
+      new Set(
+        producedRows
+          .map((row) => normalizeUpper(row.produced_item))
+          .filter(Boolean)
       )
-      SELECT
-        bom_id,
-        produced_item,
-        location
-      FROM ranked_produced
-      WHERE rn = 1
-      ORDER BY location, produced_item, bom_id
-    `);
+    );
 
-    const routingResult = await pool.query(`
-      SELECT
-        TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
-        TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
-        TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id
-      FROM ${pgRef(T.itemBomRouting)} ibr
-      WHERE ibr.routing_id IS NOT NULL
-        AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
-      ORDER BY TRIM(CAST(ibr.bom_id AS TEXT)), TRIM(CAST(ibr.routing_id AS TEXT))
-    `);
+    const routingResult = pageBomIds.length
+      ? await pool.query(
+          `
+            SELECT
+              TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+              TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
+              TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id,
+              COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') AS erp_co_product_association
+            FROM ${pgRef(T.itemBomRouting)} ibr
+            WHERE ibr.routing_id IS NOT NULL
+              AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
+              AND TRIM(CAST(ibr.bom_id AS TEXT)) = ANY($1)
+            ORDER BY
+              TRIM(CAST(ibr.bom_id AS TEXT)),
+              CASE
+                WHEN COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') = '1'
+                  THEN 1
+                ELSE 0
+              END,
+              TRIM(CAST(ibr.item AS TEXT)),
+              TRIM(CAST(ibr.routing_id AS TEXT))
+          `,
+          [pageBomIds]
+        )
+      : { rows: [] };
 
-    const itemMasterRows = await runBigQuery(`
-      SELECT *
-      FROM ${bqTableRefByKey("itemMaster")}
-    `);
+    const routingItems = Array.from(
+      new Set(
+        (routingResult.rows || [])
+          .map((row) => normalizeUpper(row.produced_item))
+          .filter(Boolean)
+      )
+    );
 
-    const releaseFlagRows = await runBigQuery(`
-      SELECT *
-      FROM ${bqTableRefByKey("itemReleaseFlag")}
-    `);
+    const allPageItems = Array.from(new Set([...pageItems, ...routingItems]));
+
+    const itemMasterRows = allPageItems.length
+      ? await runBigQuery(
+          `
+            SELECT *
+            FROM ${bqTableRefByKey("itemMaster")}
+            WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+          `,
+          { items: allPageItems }
+        )
+      : [];
+
+    const releaseFlagRows = allPageItems.length
+      ? await runBigQuery(
+          `
+            SELECT *
+            FROM ${bqTableRefByKey("itemReleaseFlag")}
+            WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+          `,
+          { items: allPageItems }
+        )
+      : [];
 
     const itemDescMap = new Map();
+
     for (const row of itemMasterRows) {
       const itemKey = normalizeUpper(row.item);
       if (!itemKey) continue;
 
       const description = normalizeText(
         row.item_description ??
-        row.description ??
-        row.item_desc ??
-        row.item_desc_1 ??
-        ""
+          row.description ??
+          row.item_desc ??
+          row.item_desc_1 ??
+          ""
       );
 
       if (!itemDescMap.has(itemKey)) {
@@ -1241,17 +1469,18 @@ router.get("/existing-bom-search", async (req, res) => {
     }
 
     const releaseFlagMap = new Map();
+
     for (const row of releaseFlagRows) {
       const itemKey = normalizeUpper(row.item);
       if (!itemKey) continue;
 
       const releaseFlag = normalizeText(
         row.item_releaseflag ??
-        row.release_flag ??
-        row.releaseflag ??
-        row.mrp_release_flag ??
-        row.item_mrp_rls_flg ??
-        ""
+          row.release_flag ??
+          row.releaseflag ??
+          row.mrp_release_flag ??
+          row.item_mrp_rls_flg ??
+          ""
       );
 
       if (!releaseFlagMap.has(itemKey)) {
@@ -1262,18 +1491,21 @@ router.get("/existing-bom-search", async (req, res) => {
     const getResourceFromRoutingIdValue = (routingId) => {
       const value = normalizeText(routingId);
       if (!value) return "";
-      const parts = value.split("_").map((p) => p.trim()).filter(Boolean);
 
-      // ROUTING_item_resource...
+      const parts = value
+        .split("_")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
       if (parts.length >= 3 && parts[0].toUpperCase() === "ROUTING") {
         return parts.slice(2).join("_");
       }
 
-      // fallback for other patterns
       return parts.length >= 2 ? parts.slice(1).join("_") : "";
     };
 
     const routingsByBomId = new Map();
+
     for (const row of routingResult.rows || []) {
       const bomId = normalizeText(row.bom_id);
       if (!bomId) continue;
@@ -1286,64 +1518,117 @@ router.get("/existing-bom-search", async (req, res) => {
         produced_item: normalizeText(row.produced_item),
         routing_id: normalizeText(row.routing_id),
         resource: getResourceFromRoutingIdValue(row.routing_id),
+        erp_co_product_association: normalizeText(
+          row.erp_co_product_association
+        ),
       });
     }
 
     const mergedRows = [];
-    for (const row of producedResult.rows) {
+
+    for (const row of producedRows) {
       const bomId = normalizeText(row.bom_id);
-      const producedItem = normalizeText(row.produced_item);
+      const mainProducedItem = normalizeText(row.produced_item);
       const location = normalizeText(row.location);
-      if (!bomId || !producedItem) continue;
 
-      const producedItemKey = normalizeUpper(producedItem);
-      const producedItemDesc = itemDescMap.get(producedItemKey) ?? "";
-      const itemReleaseFlag = releaseFlagMap.get(producedItemKey) ?? "";
+      if (!bomId || !mainProducedItem) continue;
 
-      const routingRows = (routingsByBomId.get(bomId) || []).filter(
-        (r) => !r.produced_item || r.produced_item === producedItem
-      );
+      const routingRows = routingsByBomId.get(bomId) || [];
 
       if (routingRows.length === 0) {
+        const mainItemKey = normalizeUpper(mainProducedItem);
+
         mergedRows.push({
           id: `${bomId}__NOROUTING`,
           location,
-          produced_item: producedItem,
-          produced_item_desc: producedItemDesc,
+          produced_item: mainProducedItem,
+          produced_item_desc: itemDescMap.get(mainItemKey) ?? "",
           bom_id: bomId,
           resource: "",
           routing_id: "",
-          item_release_flag: itemReleaseFlag,
+          item_release_flag: releaseFlagMap.get(mainItemKey) ?? "",
+          erp_co_product_association: "",
         });
+
         continue;
       }
 
       for (const routing of routingRows) {
+        const rowProducedItem = normalizeText(
+          routing.produced_item || mainProducedItem
+        );
+        const rowProducedItemKey = normalizeUpper(rowProducedItem);
+        const isCoProduct =
+          String(routing.erp_co_product_association || "").trim() === "1";
+
         mergedRows.push({
-          id: `${bomId}__${routing.routing_id || routing.resource || "ROW"}`,
+          id: `${bomId}__${
+            routing.routing_id || routing.resource || rowProducedItem || "ROW"
+          }`,
           location,
-          produced_item: producedItem,
-          produced_item_desc: producedItemDesc,
+          produced_item: rowProducedItem,
+          produced_item_desc: itemDescMap.get(rowProducedItemKey) ?? "",
           bom_id: bomId,
           resource: routing.resource || "",
           routing_id: routing.routing_id || "",
-          item_release_flag: itemReleaseFlag,
+          item_release_flag: releaseFlagMap.get(rowProducedItemKey) ?? "",
+          erp_co_product_association: isCoProduct ? "1" : "",
         });
       }
     }
 
+    mergedRows.sort((a, b) => {
+      const bomCompare = String(a.bom_id || "").localeCompare(
+        String(b.bom_id || "")
+      );
+      if (bomCompare !== 0) return bomCompare;
+
+      const aIsCoProduct =
+        String(a.erp_co_product_association || "").trim() === "1";
+      const bIsCoProduct =
+        String(b.erp_co_product_association || "").trim() === "1";
+
+      if (aIsCoProduct !== bIsCoProduct) {
+        return aIsCoProduct ? 1 : -1;
+      }
+
+      const itemCompare = String(a.produced_item || "").localeCompare(
+        String(b.produced_item || "")
+      );
+      if (itemCompare !== 0) return itemCompare;
+
+      return String(a.routing_id || "").localeCompare(
+        String(b.routing_id || "")
+      );
+    });
+
     return res.status(200).json({
       success: true,
       data: mergedRows,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasPrev: page > 1,
+        hasNext: page < totalPages,
+        searchBy1,
+        query1,
+        searchBy2,
+        query2,
+      },
     });
   } catch (error) {
     console.error("DB Error (existing-bom-search):", error);
+
     return res.status(500).json({
+      success: false,
       error: "Failed to fetch existing BOM search rows",
       details: error.message,
     });
   }
 });
+
 
 
 router.get("/existing-bom-details", async (req, res) => {
@@ -3778,82 +4063,198 @@ router.post("/delete-bom/execute", async (req, res) => {
 /* =========================================================
    EXISTING ITEM BOM ROUTING SEARCH - Step 1
 ========================================================= */
+
+// Assumes these are already available in your backend file:
+// router, pool, pgRef, T
+
 router.get("/existing-item-bom-routing-search", async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        TRIM(CAST(ibr.rec_id AS TEXT)) AS rec_id,
-        TRIM(CAST(ibr.item AS TEXT)) AS item,
-        TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
-        TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id,
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const requestedPageSize = Number.parseInt(req.query.pageSize, 10) || 50;
+    const pageSize = Math.min(50, Math.max(1, requestedPageSize));
+    const offset = (page - 1) * pageSize;
 
-        COALESCE(
-          NULLIF(
-            TRIM(CAST(ibr.erp_co_product_association AS TEXT)),
-            ''
-          ),
-          ''
-        ) AS erp_co_product_association,
+    const normalizeTextLocal = (value) => String(value ?? "").trim();
 
-        COALESCE(
-          NULLIF(
-            SUBSTRING(
-              TRIM(CAST(ibr.routing_id AS TEXT))
-              FROM '^[^_]+_[^_]+_([^_]+)_[^_]+$'
-            ),
-            ''
-          ),
-          ''
-        ) AS location,
+    const normalizeField = (value) => {
+      const field = normalizeTextLocal(value);
+      const fieldMap = {
+        "": "",
+        location: "location",
+        item: "item",
+        producedItem: "item",
+        bomId: "bomId",
+        bom_id: "bomId",
+        resource: "resource",
+        routingId: "routingId",
+        routing_id: "routingId",
+        componentItem: "componentItem",
+        coProductItem: "coProductItem",
+      };
+      return fieldMap[field] || "";
+    };
 
-        COALESCE(
-          NULLIF(
-            SUBSTRING(
-              TRIM(CAST(ibr.routing_id AS TEXT))
-              FROM '^[^_]+_[^_]+_[^_]+_(.+)$'
-            ),
-            ''
-          ),
-          ''
-        ) AS resource
+    const searchBy1 = normalizeField(req.query.searchBy1);
+    const query1 = normalizeTextLocal(req.query.query1);
+    const searchBy2 = normalizeField(req.query.searchBy2);
+    const query2 = normalizeTextLocal(req.query.query2);
 
-      FROM ${pgRef(T.itemBomRouting)} ibr
-      WHERE ibr.routing_id IS NOT NULL
-        AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
+    const pgParams = [];
+    const addPgParam = (value) => {
+      pgParams.push(value);
+      return `$${pgParams.length}`;
+    };
 
-      ORDER BY
-        TRIM(CAST(ibr.bom_id AS TEXT)) ASC,
+    const routingValueExpr = `TRIM(CAST(ibr.routing_id AS TEXT))`;
+    const itemValueExpr = `TRIM(CAST(ibr.item AS TEXT))`;
+    const bomValueExpr = `TRIM(CAST(ibr.bom_id AS TEXT))`;
+    const associationExpr = `COALESCE(NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), ''), '')`;
+    const locationExpr = `COALESCE(NULLIF(SUBSTRING(TRIM(CAST(ibr.routing_id AS TEXT)) FROM '^[^_]+_[^_]+_([^_]+)_[^_]+$'), ''), '')`;
+    const resourceExpr = `COALESCE(NULLIF(SUBSTRING(TRIM(CAST(ibr.routing_id AS TEXT)) FROM '^[^_]+_[^_]+_[^_]+_(.+)$'), ''), '')`;
 
-        CASE
-          -- Blank/null association should come first
-          WHEN NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') IS NULL
-            THEN 0
+    const componentAssociationCondition = `(
+      NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') IS NULL
+      OR (
+        TRIM(CAST(ibr.erp_co_product_association AS TEXT)) ~ '^-?[0-9]+(\\.[0-9]+)?$'
+        AND TRIM(CAST(ibr.erp_co_product_association AS TEXT))::numeric < 1
+      )
+    )`;
 
-          -- Then parent/non co-product rows like 0, 0.0, 0.00
-          WHEN TRIM(CAST(ibr.erp_co_product_association AS TEXT)) ~ '^-?[0-9]+(\\.[0-9]+)?$'
-            AND TRIM(CAST(ibr.erp_co_product_association AS TEXT))::numeric < 1
-            THEN 1
+    const coProductAssociationCondition = `(
+      TRIM(CAST(ibr.erp_co_product_association AS TEXT)) ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      AND TRIM(CAST(ibr.erp_co_product_association AS TEXT))::numeric >= 1
+    )`;
 
-          -- Then co-product rows like 1, 1.0, 1.00
-          ELSE 2
-        END ASC,
+    const whereParts = [
+      `ibr.routing_id IS NOT NULL`,
+      `TRIM(CAST(ibr.routing_id AS TEXT)) <> ''`,
+    ];
 
-        TRIM(CAST(ibr.routing_id AS TEXT)) ASC,
-        TRIM(CAST(ibr.item AS TEXT)) ASC
-    `);
+    const appendSearchFilter = (field, value) => {
+      const q = normalizeTextLocal(value);
+      if (!field || !q) return;
+
+      const likeParam = addPgParam(`%${q}%`);
+
+      if (field === "location") {
+        whereParts.push(`${locationExpr} ILIKE ${likeParam}`);
+        return;
+      }
+
+      if (field === "item") {
+        whereParts.push(`${itemValueExpr} ILIKE ${likeParam}`);
+        return;
+      }
+
+      if (field === "bomId") {
+        whereParts.push(`${bomValueExpr} ILIKE ${likeParam}`);
+        return;
+      }
+
+      if (field === "resource") {
+        whereParts.push(`${resourceExpr} ILIKE ${likeParam}`);
+        return;
+      }
+
+      if (field === "routingId") {
+        whereParts.push(`${routingValueExpr} ILIKE ${likeParam}`);
+        return;
+      }
+
+      if (field === "componentItem") {
+        whereParts.push(`(${componentAssociationCondition} AND ${itemValueExpr} ILIKE ${likeParam})`);
+        return;
+      }
+
+      if (field === "coProductItem") {
+        whereParts.push(`(${coProductAssociationCondition} AND ${itemValueExpr} ILIKE ${likeParam})`);
+      }
+    };
+
+    appendSearchFilter(searchBy1, query1);
+    appendSearchFilter(searchBy2, query2);
+
+    const whereClause = `WHERE ${whereParts.join(" AND ")}`;
+    const limitParam = addPgParam(pageSize);
+    const offsetParam = addPgParam(offset);
+
+    const result = await pool.query(
+      `
+        WITH filtered_rows AS (
+          SELECT
+            TRIM(CAST(ibr.rec_id AS TEXT)) AS rec_id,
+            ${itemValueExpr} AS item,
+            ${bomValueExpr} AS bom_id,
+            ${routingValueExpr} AS routing_id,
+            ${associationExpr} AS erp_co_product_association,
+            ${locationExpr} AS location,
+            ${resourceExpr} AS resource
+          FROM ${pgRef(T.itemBomRouting)} ibr
+          ${whereClause}
+        ),
+        counted_rows AS (
+          SELECT fr.*, COUNT(1) OVER() AS total_count
+          FROM filtered_rows fr
+        )
+        SELECT
+          rec_id,
+          item,
+          bom_id,
+          routing_id,
+          erp_co_product_association,
+          location,
+          resource,
+          total_count
+        FROM counted_rows
+        ORDER BY
+          bom_id ASC,
+          CASE
+            WHEN NULLIF(erp_co_product_association, '') IS NULL
+              THEN 0
+            WHEN erp_co_product_association ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              AND erp_co_product_association::numeric < 1
+              THEN 1
+            ELSE 2
+          END ASC,
+          routing_id ASC,
+          item ASC
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
+      `,
+      pgParams
+    );
+
+    const rows = result.rows || [];
+    const total = rows.length ? Number(rows[0].total_count || 0) : 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const data = rows.map(({ total_count, ...row }) => row);
 
     return res.status(200).json({
       success: true,
-      data: result.rows || [],
+      data,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasPrev: page > 1,
+        hasNext: page < totalPages,
+        searchBy1,
+        query1,
+        searchBy2,
+        query2,
+      },
     });
   } catch (error) {
     console.error("DB Error (existing-item-bom-routing-search):", error);
     return res.status(500).json({
+      success: false,
       error: "Failed to fetch existing item BOM routing rows",
       details: error.message,
     });
   }
 });
+
 
 
 
@@ -6705,7 +7106,50 @@ router.post("/download-bom-excel", async (req, res) => {
     });
   }
 });
+router.post("/item-details/by-items", async (req, res) => {
+  try {
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = Array.from(
+      new Set(rawItems.map((x) => String(x || "").trim()).filter(Boolean))
+    );
 
+    if (!items.length) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const result = await pool.query(
+      `
+        SELECT
+          TRIM(CAST(item AS TEXT)) AS item,
+          COALESCE(
+            NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
+            NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
+            ''
+          ) AS item_desc,
+          COALESCE(
+            NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
+            NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
+            ''
+          ) AS item_description
+        FROM ${pgRef(T.itemDetails)}
+        WHERE UPPER(TRIM(CAST(item AS TEXT))) = ANY($1)
+      `,
+      [items.map((x) => x.toUpperCase())]
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: result.rows || [],
+    });
+  } catch (error) {
+    console.error("DB Error (item-details/by-items):", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch item details",
+      details: error.message,
+    });
+  }
+});
 
 
 

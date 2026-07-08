@@ -1,21 +1,8 @@
 import bigquery from "./bigquery.js";
 
-/**
- * validateWithGCP(payload)
- * CSV upload payload expected:
- * {
- *   bom_parameters?: [],
- *   bom_produced?: [],
- *   bom_consumed?: [],
- *   item_bom_routing?: []
- * }
- * Supports partial uploads too (for example only 2 files uploaded).
- * Cross-table validations run only when the dependent tables are present.
- */
 
-/* =========================================================
-   Env + table name helpers
-========================================================= */
+
+/*  Env + table name helpers */
 const assertEnv = (name, value) => {
   if (!value) throw new Error(`Missing env: ${name}`);
 };
@@ -27,10 +14,7 @@ const qTbl = (project, dataset, tableName) =>
 
 const qCol = (colName) => `\`${String(colName).replace(/`/g, "")}\``;
 
-/* =========================================================
-   Dynamic BigQuery column resolution
-   (Avoid hard-coding BOMID vs bom_id vs RecordID)
-========================================================= */
+
 const canon = (v) =>
   String(v ?? "")
     .trim()
@@ -124,9 +108,7 @@ async function resolveBomTableColumns(tableName, project, dataset) {
   return { bomIdCol, recIdCol };
 }
 
-/* =========================================================
-   Common helpers
-========================================================= */
+/* Common helpers */
 const norm = (v) => (v == null ? "" : String(v).trim());
 
 const uniq = (arr) => [...new Set(arr)];
@@ -185,9 +167,7 @@ const deriveBomLocation = (bomId) => {
   return parts.length >= 1 ? parts[parts.length - 1] : "";
 };
 
-/* =========================================================
-   CSV payload normalization
-========================================================= */
+/* CSV payload normalization */
 const detectCsvArrayKind = (arr) => {
   const first = arr?.[0];
   if (!first || typeof first !== "object" || Array.isArray(first)) return null;
@@ -372,9 +352,7 @@ function normalizeRow(tableKey, row) {
   };
 }
 
-/* =========================================================
-   Error message helper
-========================================================= */
+/* Error message helper */
 function defaultMessageForSeq(seq, values = {}) {
   switch (Number(seq)) {
     case 1001:
@@ -408,9 +386,6 @@ function defaultMessageForSeq(seq, values = {}) {
   }
 }
 
-/* =========================================================
-   Main
-========================================================= */
 export const validateWithGCP = async (payload) => {
   const PROJECT = process.env.GCP_PROJECT_ID;
   const DATASET = process.env.BQ_DATASET;
@@ -615,10 +590,7 @@ export const validateWithGCP = async (payload) => {
       DATASET
     );
 
-    console.log("fetchRecIds tableKey:", tableKey);
-    console.log("fetchRecIds tableName:", tableName);
-    console.log("fetchRecIds bomIdCol:", bomIdCol);
-    console.log("fetchRecIds recIdCol:", recIdCol);
+    
 
     const query = `
       SELECT
@@ -632,8 +604,7 @@ export const validateWithGCP = async (payload) => {
       WHERE CAST(${qCol(bomIdCol)} AS STRING) IN UNNEST(@bomIds)
     `;
 
-    console.log("fetchRecIds query:", query);
-    console.log("fetchRecIds bomIds:", allBomIdsStr);
+   
 
     const [rows] = await bigquery.query({
       query,

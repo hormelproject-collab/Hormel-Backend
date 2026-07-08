@@ -10,6 +10,9 @@ import {
   fetchAllResourcesFromRoutingResCons,
   fetchResourceRelevancyByResource,
   fetchItemReleaseFlagByItem,
+  fetchResourcesLazy,
+  fetchCoProductItemsLazy,
+  fetchBomIdsLazy
 } from "../services/bigqueryService.js";
 
 const router = express.Router();
@@ -136,7 +139,7 @@ router.post("/locations-by-items", async (req, res) => {
     }
 
     const data = await fetchLocationsBySelectedItems(itemIds);
-    console.log(JSON.stringify(data));
+    
     return res.status(200).json({ success: true, data });
   } catch (error) {
     console.error("Error fetching locations by selected items:", error);
@@ -321,6 +324,86 @@ router.get("/bom-routing-step1/co-products/:bomIdOrItem", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch co-products", details: error.message });
   }
 });
+/*
+  Add these imports/routes to your existing routes/bigqueryRoutes.js.
+  Place the routes BEFORE router.get("/:table", ...).
+  Saved as .jsx only because you requested backend files in .jsx format.
+*/
+
+// Add these in the existing service import block:
+// fetchBomIdsLazy,
+// fetchResourcesLazy,
+// fetchCoProductItemsLazy,
+
+router.get("/bom-routing-step1/bom-ids-lazy", async (req, res) => {
+  try {
+    const result = await fetchBomIdsLazy({
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+      search: req.query.search,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result.data,
+      pagination: result.pagination,
+    });
+  } catch (error) {
+    console.error("Error fetching lazy BOM IDs:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch BOM IDs",
+      details: error.message,
+    });
+  }
+});
+
+router.get("/bom-routing-step1/resources-lazy", async (req, res) => {
+  try {
+    const result = await fetchResourcesLazy({
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+      search: req.query.search,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result.data,
+      pagination: result.pagination,
+    });
+  } catch (error) {
+    console.error("Error fetching lazy resources:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch resources",
+      details: error.message,
+    });
+  }
+});
+
+router.get("/bom-routing-step1/co-product-items-lazy", async (req, res) => {
+  try {
+    const result = await fetchCoProductItemsLazy({
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+      search: req.query.search,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: result.data,
+      pagination: result.pagination,
+    });
+  } catch (error) {
+    console.error("Error fetching lazy co-product items:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch co-product items",
+      details: error.message,
+    });
+  }
+});
+
 
 router.get("/:table", async (req, res) => {
   try {
