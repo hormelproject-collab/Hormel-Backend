@@ -800,56 +800,188 @@ router.post("/", async (req, res) => {
   if (String(payload?.entryMode || "").toLowerCase() !== "manual") {
     return res.status(400).json({
       status: "failure",
+      success: false,
       message:
         "This /bom-explosion endpoint currently supports manual entry flow only. CSV upload flow will be handled separately.",
+      validationErrors: [
+        {
+          code: "ENTRY_MODE",
+          desc: "Invalid entry mode",
+          error:
+            "Only manual entry flow is supported by this endpoint.",
+          rm: "Submit the BOM payload with entryMode = manual.",
+        },
+      ],
     });
   }
 
   const records = ensureArray(payload?.records);
+
   if (records.length === 0) {
     return res.status(400).json({
       status: "failure",
+      success: false,
       message: "No manual entry records received from summary page.",
+      validationErrors: [
+        {
+          code: "NO_RECORDS",
+          desc: "Payload records check",
+          error: "No manual entry records received from summary page.",
+          rm: "Please complete the previous steps and submit again.",
+        },
+      ],
     });
   }
 
-  const userDetails = getUserDetails(payload);
-  const notes = collectNotes(payload);
+  const normalizeValidationErrorArray = (validation) => {
+    if (!validation) return [];
+
+    if (Array.isArray(validation.validationErrors)) {
+      return validation.validationErrors;
+    }
+
+    if (Array.isArray(validation.errors)) {
+      return validation.errors;
+    }
+
+    if (Array.isArray(validation.errorList)) {
+      return validation.errorList.flatMap((row, rowIndex) => {
+        const messages = Array.isArray(row?.messages) ? row.messages : [];
+
+        if (messages.length === 0) {
+          return [
+            {
+              code:
+                row?.seq ??
+                row?.sequence ??
+                row?.code ??
+                `VALIDATION-${rowIndex + 1}`,
+              desc:
+                row?.desc ??
+                row?.description ??
+                row?.validation ??
+                "Validation failed",
+              error:
+                row?.error ??
+                row?.message ??
+                row?.detail ??
+                JSON.stringify(row),
+              rm:
+                row?.rm ??
+                row?.remediation ??
+                row?.remediationMessage ??
+                "",
+            },
+          ];
+        }
+
+        return messages.map((msg, msgIndex) => ({
+          code:
+            msg?.seq ??
+            msg?.sequence ??
+            msg?.code ??
+            row?.seq ??
+            row?.sequence ??
+            row?.code ??
+            `VALIDATION-${rowIndex + 1}-${msgIndex + 1}`,
+          desc:
+            msg?.desc ??
+            msg?.description ??
+            msg?.validation ??
+            row?.desc ??
+            row?.description ??
+            row?.validation ??
+            "Validation failed",
+          error:
+            msg?.error ??
+            msg?.message ??
+            msg?.detail ??
+            row?.error ??
+            row?.message ??
+            row?.detail ??
+            "",
+          rm:
+            msg?.rm ??
+            msg?.remediation ??
+            msg?.remediationMessage ??
+            row?.rm ??
+            row?.remediation ??
+            row?.remediationMessage ??
+            "",
+        }));
+      });
+    }
+
+    if (validation.error) {
+      return [
+        {
+          code: validation.code ?? "VALIDATION_ERROR",
+          desc: validation.desc ?? "Validation failed",
+          error: validation.error,
+          rm: validation.rm ?? validation.remediation ?? "",
+        },
+      ];
+    }
+
+    return [];
+  };
+
+  const getNormalizedTablesFromValidation = (validation) => {
+    return (
+      validation?.normalizedTables ||
+      validation?.normalized ||
+      validation?.tables ||
+      validation?.data?.normalizedTables ||
+      validation?.data?.normalized ||
+      null
+    );
+  };
 
   try {
     const validation = await validateManualEntryPayload(payload, pool);
 
-    if (!validation.isValid) {
-      const remediationDetails = validation.errorList.flatMap((row) =>
-        ensureArray(row?.messages).map((msg) => ({
-          record: row?.csvRecId ?? null,
-          location: row?.location ?? null,
-          component: null,
-          coProduct: null,
-          field: row?.field ?? null,
-          remediation: msg?.remediationMessage || "",
-        }))
-      );
+    const validationErrors = normalizeValidationErrorArray(validation);
 
+    const validationPassed =
+      validation?.isValid === true ||
+      validation?.valid === true ||
+      String(validation?.status || "").toLowerCase() === "success";
+
+    if (!validationPassed || validationErrors.length > 0) {
       return res.status(400).json({
         status: "failure",
-        message: "Validation failed",
-        errors: validation.errorCodes,
-        errorList: validation.errorList,
-        errorDetails: validation.errorList,
-        remediationDetails,
+        success: false,
+        message: "Validation failed.",
+        validationErrors,
       });
     }
 
-    const ecNumber = getEcNumber();
+    const normalizedTables = getNormalizedTablesFromValidation(validation);
+
+    if (!normalizedTables) {
+      return res.status(200).json({
+        status: "failure",
+        success: false,
+        message:
+          "Validation is successful but the records are not yet pushed to PostgreSQL table.",
+        messageForUser:
+          "Validation is successful but the records are not yet pushed to PostgreSQL table.",
+        engineeringChangeId: "",
+      });
+    }
+
     const client = await pool.connect();
 
     try {
       await client.query("BEGIN");
 
-      const insertedCounts = await insertAllManualRows(
+      const ecNumber = getEcNumber();
+      const userDetails = getUserDetails(payload);
+      const notes = collectNotes(payload);
+
+      await insertAllManualRows(
         client,
-        validation.normalizedTables,
+        normalizedTables,
         ecNumber,
         userDetails,
         notes,
@@ -860,24 +992,38 @@ router.post("/", async (req, res) => {
 
       return res.status(200).json({
         status: "success",
-        message: "Validation successful and records saved successfully.",
-        ecNumber,
+        success: true,
+        message: `Validation was successful and the records are saved successfully with ${ecNumber}.`,
         engineeringChangeId: ecNumber,
-        insertedCounts,
       });
-    } catch (dbErr) {
+    } catch (insertErr) {
       await client.query("ROLLBACK");
-      throw dbErr;
+
+      console.error(
+        "BOM submit PostgreSQL insert failed after validation success:",
+        insertErr
+      );
+
+      return res.status(200).json({
+        status: "failure",
+        success: false,
+        message:
+          "Validation is successful but the records are not yet pushed to PostgreSQL table.",
+        messageForUser:
+          "Validation is successful but the records are not yet pushed to PostgreSQL table.",
+        engineeringChangeId: "",
+      });
     } finally {
       client.release();
     }
   } catch (err) {
     console.error("bom-explosion manual flow error:", err);
+
     return res.status(500).json({
       status: "failure",
+      success: false,
       message: err.message || "Internal server error",
-      errorDetails: [],
-      remediationDetails: [],
+      error: err.message || "Internal server error",
     });
   }
 });

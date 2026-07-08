@@ -592,17 +592,42 @@ export const fetchItemMasterWithReleaseFlag = async ({
   filterBy = "item",
 } = {}) => {
   const safePage = Math.max(1, Number.parseInt(page, 10) || 1);
-  const safePageSize = Math.min(200, Math.max(1, Number.parseInt(pageSize, 10) || 50));
+  const safePageSize = Math.min(
+    200,
+    Math.max(1, Number.parseInt(pageSize, 10) || 50)
+  );
   const safeOffset = (safePage - 1) * safePageSize;
   const searchText = normalizeText(search);
 
   const itemMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
   const releaseFlagColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
 
-  const itemColumn = findColumn(itemMasterColumns, ["item", "item_id", "item_number", "itemNumber"]);
-  const itemDescColumn = findColumn(itemMasterColumns, ["item_desc", "item_description", "description", "item_desc_1"]);
-  const itemStatusColumn = findColumn(itemMasterColumns, ["item_status", "status"]);
-  const releaseItemColumn = findColumn(releaseFlagColumns, ["item", "item_id", "item_number", "itemNumber"]);
+  const itemColumn = findColumn(itemMasterColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
+  const itemDescColumn = findColumn(itemMasterColumns, [
+    "item_desc",
+    "item_description",
+    "description",
+    "item_desc_1",
+  ]);
+
+  const itemStatusColumn = findColumn(itemMasterColumns, [
+    "item_status",
+    "status",
+  ]);
+
+  const releaseItemColumn = findColumn(releaseFlagColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
   const releaseColumn = findColumn(releaseFlagColumns, [
     "release",
     "release_flag",
@@ -614,13 +639,21 @@ export const fetchItemMasterWithReleaseFlag = async ({
     "status",
   ]);
 
-  if (!itemColumn) throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
+  if (!itemColumn) {
+    throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
+  }
 
-  const itemDescExpr = itemDescColumn ? `COALESCE(CAST(im.${qCol(itemDescColumn)} AS STRING), '')` : `''`;
-  const itemStatusExpr = itemStatusColumn ? `COALESCE(CAST(im.${qCol(itemStatusColumn)} AS STRING), '')` : `''`;
+  const itemDescExpr = itemDescColumn
+    ? `COALESCE(CAST(im.${qCol(itemDescColumn)} AS STRING), '')`
+    : `''`;
 
-  const releaseFlagCte = releaseItemColumn && releaseColumn
-    ? `
+  const itemStatusExpr = itemStatusColumn
+    ? `COALESCE(CAST(im.${qCol(itemStatusColumn)} AS STRING), '')`
+    : `''`;
+
+  const releaseFlagCte =
+    releaseItemColumn && releaseColumn
+      ? `
       release_flag_base AS (
         SELECT
           UPPER(TRIM(CAST(${qCol(releaseItemColumn)} AS STRING))) AS item_key,
@@ -630,9 +663,11 @@ export const fetchItemMasterWithReleaseFlag = async ({
           AND TRIM(CAST(${qCol(releaseItemColumn)} AS STRING)) != ''
         GROUP BY item_key
       ),`
-    : `
+      : `
       release_flag_base AS (
-        SELECT CAST(NULL AS STRING) AS item_key, CAST(NULL AS STRING) AS item_release_flag
+        SELECT
+          CAST(NULL AS STRING) AS item_key,
+          CAST(NULL AS STRING) AS item_release_flag
         FROM UNNEST([]) AS empty_rows
       ),`;
 
@@ -642,12 +677,15 @@ export const fetchItemMasterWithReleaseFlag = async ({
     status: "item_status",
     releaseflag: "item_release_flag",
   };
-  const filterColumnExpr = filterColumnExprMap[String(filterBy || "item").trim()] || "item";
+
+  const filterColumnExpr =
+    filterColumnExprMap[String(filterBy || "item").trim()] || "item";
 
   const rows = await runQuery(
     `
-      WITH item_master_base AS (
+      WITH item_master_raw AS (
         SELECT
+          UPPER(TRIM(CAST(im.${qCol(itemColumn)} AS STRING))) AS item_key,
           TRIM(CAST(im.${qCol(itemColumn)} AS STRING)) AS item,
           ${itemDescExpr} AS item_desc,
           ${itemStatusExpr} AS item_status
@@ -656,7 +694,30 @@ export const fetchItemMasterWithReleaseFlag = async ({
           AND TRIM(CAST(im.${qCol(itemColumn)} AS STRING)) != ''
           AND UPPER(TRIM(CAST(im.${qCol(itemColumn)} AS STRING))) LIKE 'HRL%'
       ),
+
+      item_master_base AS (
+        SELECT
+          item_key,
+          item,
+          item_desc,
+          item_status
+        FROM (
+          SELECT
+            *,
+            ROW_NUMBER() OVER (
+              PARTITION BY item_key
+              ORDER BY
+                CASE WHEN TRIM(item_desc) != '' THEN 0 ELSE 1 END,
+                CASE WHEN TRIM(item_status) != '' THEN 0 ELSE 1 END,
+                item
+            ) AS rn
+          FROM item_master_raw
+        )
+        WHERE rn = 1
+      ),
+
       ${releaseFlagCte}
+
       joined_rows AS (
         SELECT
           im.item,
@@ -665,19 +726,29 @@ export const fetchItemMasterWithReleaseFlag = async ({
           COALESCE(rf.item_release_flag, '') AS item_release_flag
         FROM item_master_base im
         LEFT JOIN release_flag_base rf
-          ON rf.item_key = UPPER(TRIM(im.item))
+          ON rf.item_key = im.item_key
       ),
+
       filtered_rows AS (
         SELECT *
         FROM joined_rows
         WHERE @searchText = ''
            OR LOWER(CAST(${filterColumnExpr} AS STRING)) LIKE CONCAT('%', LOWER(@searchText), '%')
       ),
+
       counted_rows AS (
-        SELECT *, COUNT(1) OVER() AS total_count
+        SELECT
+          *,
+          COUNT(1) OVER() AS total_count
         FROM filtered_rows
       )
-      SELECT item, item_desc, item_status, item_release_flag, total_count
+
+      SELECT
+        item,
+        item_desc,
+        item_status,
+        item_release_flag,
+        total_count
       FROM counted_rows
       ORDER BY item
       LIMIT ${safePageSize}
@@ -708,7 +779,6 @@ export const fetchItemMasterWithReleaseFlag = async ({
     },
   };
 };
-
 export const fetchLocationsBySelectedItems = async () => {
   return runQuery(
     `
