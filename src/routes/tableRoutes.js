@@ -4745,6 +4745,13 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 ========================================================= */
 router.get("/engineering-change-log", async (req, res) => {
   try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.pageSize, 10) || 50)
+    );
+    const offset = (page - 1) * pageSize;
+
     const PG_SCHEMA = S;
     const TABLES = {
       changeLog: T.changeLog,
@@ -4760,13 +4767,16 @@ router.get("/engineering-change-log", async (req, res) => {
     const q = (name) => `"${String(name).replace(/"/g, '""')}"`;
     const tbl = (name) => `${q(PG_SCHEMA)}.${q(name)}`;
 
-    const normalizeText = (value) => (value == null ? "" : String(value).trim());
+    const normalizeText = (value) =>
+      value == null ? "" : String(value).trim();
+
     const uniqueValues = (arr) => [
       ...new Set((arr || []).map((v) => normalizeText(v)).filter(Boolean)),
     ];
 
     const formatChangeDate = (value) => {
       if (!value) return "";
+
       if (value instanceof Date) {
         const yyyy = value.getFullYear();
         const mm = String(value.getMonth() + 1).padStart(2, "0");
@@ -4774,8 +4784,10 @@ router.get("/engineering-change-log", async (req, res) => {
         const hh = String(value.getHours()).padStart(2, "0");
         const mi = String(value.getMinutes()).padStart(2, "0");
         const ss = String(value.getSeconds()).padStart(2, "0");
+
         return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
       }
+
       return String(value);
     };
 
@@ -4784,17 +4796,79 @@ router.get("/engineering-change-log", async (req, res) => {
     `;
 
     const routingIdExpr = (locationSql, resourceSql) => `
-      CONCAT_WS('_', 'ROUTING', NULLIF(TRIM(${locationSql}::TEXT), ''), NULLIF(TRIM(${resourceSql}::TEXT), ''))
+      CONCAT_WS(
+        '_',
+        'ROUTING',
+        NULLIF(TRIM(${locationSql}::TEXT), ''),
+        NULLIF(TRIM(${resourceSql}::TEXT), '')
+      )
     `;
 
     /*
-      IMPORTANT FIXES:
-      1. Split cl.bom_id first. Many rows store multiple BOM IDs comma-separated.
-      2. Main BOM / Co-product are fetched from item_bom_routing by BOM ID, not from cl.produced_item only.
-      3. Component details use bom_consumed by BOM ID, with cl.consumed_item as optional filter.
-      4. Deleted records prefer _og tables; Added/Modified records prefer main tables.
-      5. Modified comparison compares main vs _og for bom_consumed and bom_produced only, de-duplicated by EC + BOM + item.
+      Pagination approach:
+      1. Fetch only 50 distinct engineering_change_id values for current page.
+      2. Run all heavy detail queries only for those EC IDs.
+      3. Return pagination metadata to frontend.
     */
+
+    const pageEcResult = await pool.query(
+      `
+        WITH distinct_ec AS (
+          SELECT
+            cl.engineering_change_id::TEXT AS engineering_change_id,
+            MAX(cl.change_date) AS latest_change_date,
+            MAX(cl.rec_id::TEXT) AS latest_rec_id
+          FROM ${tbl(TABLES.changeLog)} cl
+          WHERE cl.engineering_change_id IS NOT NULL
+            AND TRIM(cl.engineering_change_id::TEXT) <> ''
+          GROUP BY cl.engineering_change_id::TEXT
+        ),
+        counted AS (
+          SELECT
+            *,
+            COUNT(*) OVER() AS total_count
+          FROM distinct_ec
+        )
+        SELECT
+          engineering_change_id,
+          total_count
+        FROM counted
+        ORDER BY
+          latest_change_date DESC NULLS LAST,
+          engineering_change_id DESC,
+          latest_rec_id DESC
+        LIMIT $1
+        OFFSET $2
+      `,
+      [pageSize, offset]
+    );
+
+    const pageEcIds = (pageEcResult.rows || [])
+      .map((row) => normalizeText(row.engineering_change_id))
+      .filter(Boolean);
+
+    const total = pageEcResult.rows.length
+      ? Number(pageEcResult.rows[0].total_count || 0)
+      : 0;
+
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+    if (!pageEcIds.length) {
+      return res.status(200).json({
+        success: true,
+        data: [],
+        pagination: {
+          page,
+          pageSize,
+          total,
+          totalPages,
+          hasPrev: page > 1,
+          hasNext: page < totalPages,
+        },
+      });
+    }
+
+    const queryParams = [pageEcIds];
 
     const baseQuery = `
       SELECT
@@ -4813,6 +4887,7 @@ router.get("/engineering-change-log", async (req, res) => {
         cl.summarynotes,
         cl.change_summary
       FROM ${tbl(TABLES.changeLog)} cl
+      WHERE cl.engineering_change_id::TEXT = ANY($1)
       ORDER BY
         cl.change_date DESC NULLS LAST,
         cl.engineering_change_id DESC,
@@ -4831,7 +4906,8 @@ router.get("/engineering-change-log", async (req, res) => {
           cl.user_name
         FROM ${tbl(TABLES.changeLog)} cl
         CROSS JOIN LATERAL ${csvSplitExpr("cl.bom_id")} AS b(bom_id)
-        WHERE TRIM(b.bom_id) <> ''
+        WHERE cl.engineering_change_id::TEXT = ANY($1)
+          AND TRIM(b.bom_id) <> ''
       ),
       routing_union AS (
         SELECT
@@ -4860,7 +4936,12 @@ router.get("/engineering-change-log", async (req, res) => {
           ON UPPER(TRIM(og_ibr.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
       ),
       main_routing AS (
-        SELECT DISTINCT ON (engineering_change_id, bom_id, item, COALESCE(erp_item_bom_routing_priority::TEXT, ''))
+        SELECT DISTINCT ON (
+          engineering_change_id,
+          bom_id,
+          item,
+          COALESCE(erp_item_bom_routing_priority::TEXT, '')
+        )
           *
         FROM routing_union
         WHERE COALESCE(erp_co_product_association, 0) <> 1
@@ -4869,7 +4950,11 @@ router.get("/engineering-change-log", async (req, res) => {
           bom_id,
           item,
           COALESCE(erp_item_bom_routing_priority::TEXT, ''),
-          CASE WHEN LOWER(COALESCE(change_type, '')) LIKE '%delete%' THEN source_priority * -1 ELSE source_priority END
+          CASE
+            WHEN LOWER(COALESCE(change_type, '')) LIKE '%delete%'
+              THEN source_priority * -1
+            ELSE source_priority
+          END
       ),
       produced_qty AS (
         SELECT
@@ -4926,7 +5011,12 @@ router.get("/engineering-change-log", async (req, res) => {
        AND UPPER(TRIM(pq.item::TEXT)) = UPPER(TRIM(mr.item::TEXT))
       LEFT JOIN ${tbl(TABLES.itemDetails)} id
         ON UPPER(TRIM(id.item::TEXT)) = UPPER(TRIM(mr.item::TEXT))
-      ORDER BY mr.engineering_change_id, mr.bom_id, mr.item, mr.resource, mr.erp_item_bom_routing_priority
+      ORDER BY
+        mr.engineering_change_id,
+        mr.bom_id,
+        mr.item,
+        mr.resource,
+        mr.erp_item_bom_routing_priority
     `;
 
     const componentQuery = `
@@ -4942,7 +5032,8 @@ router.get("/engineering-change-log", async (req, res) => {
           cl.consumed_item
         FROM ${tbl(TABLES.changeLog)} cl
         CROSS JOIN LATERAL ${csvSplitExpr("cl.bom_id")} AS b(bom_id)
-        WHERE TRIM(b.bom_id) <> ''
+        WHERE cl.engineering_change_id::TEXT = ANY($1)
+          AND TRIM(b.bom_id) <> ''
       ),
       main_items AS (
         SELECT
@@ -4994,7 +5085,8 @@ router.get("/engineering-change-log", async (req, res) => {
         WHERE LOWER(COALESCE(lb.change_type, '')) NOT LIKE '%delete%'
           AND (
             NOT EXISTS (
-              SELECT 1 FROM consumed_filter cf2
+              SELECT 1
+              FROM consumed_filter cf2
               WHERE cf2.engineering_change_id = lb.engineering_change_id
                 AND UPPER(TRIM(cf2.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
             )
@@ -5018,7 +5110,8 @@ router.get("/engineering-change-log", async (req, res) => {
         WHERE LOWER(COALESCE(lb.change_type, '')) LIKE '%delete%'
           AND (
             NOT EXISTS (
-              SELECT 1 FROM consumed_filter cf2
+              SELECT 1
+              FROM consumed_filter cf2
               WHERE cf2.engineering_change_id = lb.engineering_change_id
                 AND UPPER(TRIM(cf2.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
             )
@@ -5062,7 +5155,8 @@ router.get("/engineering-change-log", async (req, res) => {
           cl.user_name
         FROM ${tbl(TABLES.changeLog)} cl
         CROSS JOIN LATERAL ${csvSplitExpr("cl.bom_id")} AS b(bom_id)
-        WHERE TRIM(b.bom_id) <> ''
+        WHERE cl.engineering_change_id::TEXT = ANY($1)
+          AND TRIM(b.bom_id) <> ''
       ),
       main_items AS (
         SELECT
@@ -5090,7 +5184,10 @@ router.get("/engineering-change-log", async (req, res) => {
         GROUP BY lb.engineering_change_id, lb.bom_id
       ),
       coproduct_routing AS (
-        SELECT lb.*, ibr.item AS co_product_item, 1 AS source_priority
+        SELECT
+          lb.*,
+          ibr.item AS co_product_item,
+          1 AS source_priority
         FROM log_boms lb
         INNER JOIN ${tbl(TABLES.itemBomRouting)} ibr
           ON UPPER(TRIM(ibr.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
@@ -5099,7 +5196,10 @@ router.get("/engineering-change-log", async (req, res) => {
 
         UNION ALL
 
-        SELECT lb.*, og_ibr.item AS co_product_item, 2 AS source_priority
+        SELECT
+          lb.*,
+          og_ibr.item AS co_product_item,
+          2 AS source_priority
         FROM log_boms lb
         INNER JOIN ${tbl(TABLES.itemBomRoutingOg)} og_ibr
           ON UPPER(TRIM(og_ibr.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
@@ -5113,7 +5213,12 @@ router.get("/engineering-change-log", async (req, res) => {
         ORDER BY engineering_change_id, bom_id, co_product_item, source_priority
       ),
       qty_union AS (
-        SELECT lb.engineering_change_id, lb.bom_id, bp.item, bp.erp_bom_qty_produced_per, 1 AS source_priority
+        SELECT
+          lb.engineering_change_id,
+          lb.bom_id,
+          bp.item,
+          bp.erp_bom_qty_produced_per,
+          1 AS source_priority
         FROM log_boms lb
         INNER JOIN ${tbl(TABLES.bomProduced)} bp
           ON UPPER(TRIM(bp.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
@@ -5121,7 +5226,12 @@ router.get("/engineering-change-log", async (req, res) => {
 
         UNION ALL
 
-        SELECT lb.engineering_change_id, lb.bom_id, og_bp.item, og_bp.erp_bom_qty_produced_per, 2 AS source_priority
+        SELECT
+          lb.engineering_change_id,
+          lb.bom_id,
+          og_bp.item,
+          og_bp.erp_bom_qty_produced_per,
+          2 AS source_priority
         FROM log_boms lb
         INNER JOIN ${tbl(TABLES.bomProducedOg)} og_bp
           ON UPPER(TRIM(og_bp.bom_id::TEXT)) = UPPER(TRIM(lb.bom_id::TEXT))
@@ -5159,243 +5269,240 @@ router.get("/engineering-change-log", async (req, res) => {
       ORDER BY cp.engineering_change_id, cp.bom_id, cp.co_product_item
     `;
 
-const modifiedComparisonQuery = `
-  WITH modified_boms AS (
-    SELECT DISTINCT
-      cl.engineering_change_id,
-      cl.change_date,
-      cl.change_type,
-      TRIM(b.bom_id) AS bom_id,
-      cl.location,
-      cl.resource,
-      cl.user_name
-    FROM ${tbl(TABLES.changeLog)} cl
-    CROSS JOIN LATERAL ${csvSplitExpr("cl.bom_id")} AS b(bom_id)
-    WHERE LOWER(COALESCE(cl.change_type, '')) LIKE '%modif%'
-      AND TRIM(b.bom_id) <> ''
-  ),
+    const modifiedComparisonQuery = `
+      WITH modified_boms AS (
+        SELECT DISTINCT
+          cl.engineering_change_id,
+          cl.change_date,
+          cl.change_type,
+          TRIM(b.bom_id) AS bom_id,
+          cl.location,
+          cl.resource,
+          cl.user_name
+        FROM ${tbl(TABLES.changeLog)} cl
+        CROSS JOIN LATERAL ${csvSplitExpr("cl.bom_id")} AS b(bom_id)
+        WHERE cl.engineering_change_id::TEXT = ANY($1)
+          AND LOWER(COALESCE(cl.change_type, '')) LIKE '%modif%'
+          AND TRIM(b.bom_id) <> ''
+      ),
+      main_items AS (
+        SELECT DISTINCT
+          mb.engineering_change_id,
+          mb.change_date,
+          mb.change_type,
+          mb.bom_id,
+          mb.location,
+          mb.resource,
+          mb.user_name,
+          COALESCE(main_ibr.item, og_ibr.item)::TEXT AS produced_item
+        FROM modified_boms mb
+        LEFT JOIN ${tbl(TABLES.itemBomRouting)} main_ibr
+          ON UPPER(TRIM(main_ibr.bom_id::TEXT)) = UPPER(TRIM(mb.bom_id::TEXT))
+         AND COALESCE(main_ibr.erp_co_product_association, 0) <> 1
+        LEFT JOIN ${tbl(TABLES.itemBomRoutingOg)} og_ibr
+          ON UPPER(TRIM(og_ibr.bom_id::TEXT)) = UPPER(TRIM(mb.bom_id::TEXT))
+         AND COALESCE(og_ibr.erp_co_product_association, 0) <> 1
+        WHERE COALESCE(main_ibr.item, og_ibr.item) IS NOT NULL
+      ),
+      component_keys AS (
+        SELECT DISTINCT
+          mi.engineering_change_id,
+          mi.change_date,
+          mi.change_type,
+          mi.produced_item,
+          mi.bom_id,
+          mi.resource,
+          mi.user_name,
+          main_bc.item::TEXT AS item
+        FROM main_items mi
+        INNER JOIN ${tbl(TABLES.bomConsumed)} main_bc
+          ON UPPER(TRIM(main_bc.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
 
-  main_items AS (
-    SELECT DISTINCT
-      mb.engineering_change_id,
-      mb.change_date,
-      mb.change_type,
-      mb.bom_id,
-      mb.location,
-      mb.resource,
-      mb.user_name,
-      COALESCE(main_ibr.item, og_ibr.item)::TEXT AS produced_item
-    FROM modified_boms mb
-    LEFT JOIN ${tbl(TABLES.itemBomRouting)} main_ibr
-      ON UPPER(TRIM(main_ibr.bom_id::TEXT)) = UPPER(TRIM(mb.bom_id::TEXT))
-     AND COALESCE(main_ibr.erp_co_product_association, 0) <> 1
-    LEFT JOIN ${tbl(TABLES.itemBomRoutingOg)} og_ibr
-      ON UPPER(TRIM(og_ibr.bom_id::TEXT)) = UPPER(TRIM(mb.bom_id::TEXT))
-     AND COALESCE(og_ibr.erp_co_product_association, 0) <> 1
-    WHERE COALESCE(main_ibr.item, og_ibr.item) IS NOT NULL
-  ),
+        UNION
 
-  component_keys AS (
-    SELECT DISTINCT
-      mi.engineering_change_id,
-      mi.change_date,
-      mi.change_type,
-      mi.produced_item,
-      mi.bom_id,
-      mi.resource,
-      mi.user_name,
-      main_bc.item::TEXT AS item
-    FROM main_items mi
-    INNER JOIN ${tbl(TABLES.bomConsumed)} main_bc
-      ON UPPER(TRIM(main_bc.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
-
-    UNION
-
-    SELECT DISTINCT
-      mi.engineering_change_id,
-      mi.change_date,
-      mi.change_type,
-      mi.produced_item,
-      mi.bom_id,
-      mi.resource,
-      mi.user_name,
-      og_bc.item::TEXT AS item
-    FROM main_items mi
-    INNER JOIN ${tbl(TABLES.bomConsumedOg)} og_bc
-      ON UPPER(TRIM(og_bc.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
-  ),
-
-  component_diffs AS (
-    SELECT DISTINCT
-      ck.engineering_change_id,
-      ck.change_date,
-      ck.change_type,
-      ck.produced_item,
-      ck.bom_id,
-      ck.resource,
-      ck.user_name,
-      'Component' AS section,
-      CASE
-        WHEN og_bc.item IS NULL THEN 'Added'
-        WHEN main_bc.item IS NULL THEN 'Deleted'
-        WHEN COALESCE(og_bc.erp_bom_quantity_consumed_per::TEXT, '')
+        SELECT DISTINCT
+          mi.engineering_change_id,
+          mi.change_date,
+          mi.change_type,
+          mi.produced_item,
+          mi.bom_id,
+          mi.resource,
+          mi.user_name,
+          og_bc.item::TEXT AS item
+        FROM main_items mi
+        INNER JOIN ${tbl(TABLES.bomConsumedOg)} og_bc
+          ON UPPER(TRIM(og_bc.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
+      ),
+      component_diffs AS (
+        SELECT DISTINCT
+          ck.engineering_change_id,
+          ck.change_date,
+          ck.change_type,
+          ck.produced_item,
+          ck.bom_id,
+          ck.resource,
+          ck.user_name,
+          'Component' AS section,
+          CASE
+            WHEN og_bc.item IS NULL THEN 'Added'
+            WHEN main_bc.item IS NULL THEN 'Deleted'
+            WHEN COALESCE(og_bc.erp_bom_quantity_consumed_per::TEXT, '')
+                 IS DISTINCT FROM COALESCE(main_bc.erp_bom_quantity_consumed_per::TEXT, '')
+              THEN 'Modified'
+          END AS action,
+          ck.item,
+          'Standard Usage' AS field,
+          og_bc.erp_bom_quantity_consumed_per::TEXT AS original_value,
+          main_bc.erp_bom_quantity_consumed_per::TEXT AS updated_value
+        FROM component_keys ck
+        LEFT JOIN ${tbl(TABLES.bomConsumed)} main_bc
+          ON UPPER(TRIM(main_bc.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
+         AND UPPER(TRIM(main_bc.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
+        LEFT JOIN ${tbl(TABLES.bomConsumedOg)} og_bc
+          ON UPPER(TRIM(og_bc.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
+         AND UPPER(TRIM(og_bc.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
+        WHERE
+          og_bc.item IS NULL
+          OR main_bc.item IS NULL
+          OR COALESCE(og_bc.erp_bom_quantity_consumed_per::TEXT, '')
              IS DISTINCT FROM COALESCE(main_bc.erp_bom_quantity_consumed_per::TEXT, '')
-          THEN 'Modified'
-      END AS action,
-      ck.item,
-      'Standard Usage' AS field,
-      og_bc.erp_bom_quantity_consumed_per::TEXT AS original_value,
-      main_bc.erp_bom_quantity_consumed_per::TEXT AS updated_value
-    FROM component_keys ck
-    LEFT JOIN ${tbl(TABLES.bomConsumed)} main_bc
-      ON UPPER(TRIM(main_bc.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
-     AND UPPER(TRIM(main_bc.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
-    LEFT JOIN ${tbl(TABLES.bomConsumedOg)} og_bc
-      ON UPPER(TRIM(og_bc.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
-     AND UPPER(TRIM(og_bc.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
-    WHERE
-      og_bc.item IS NULL
-      OR main_bc.item IS NULL
-      OR COALESCE(og_bc.erp_bom_quantity_consumed_per::TEXT, '')
-         IS DISTINCT FROM COALESCE(main_bc.erp_bom_quantity_consumed_per::TEXT, '')
-  ),
+      ),
+      coproduct_keys AS (
+        SELECT DISTINCT
+          mi.engineering_change_id,
+          mi.change_date,
+          mi.change_type,
+          mi.produced_item,
+          mi.bom_id,
+          mi.resource,
+          mi.user_name,
+          main_bp.item::TEXT AS item
+        FROM main_items mi
+        INNER JOIN ${tbl(TABLES.bomProduced)} main_bp
+          ON UPPER(TRIM(main_bp.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
+        INNER JOIN ${tbl(TABLES.itemBomRouting)} main_ibr
+          ON UPPER(TRIM(main_ibr.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
+         AND UPPER(TRIM(main_ibr.item::TEXT)) = UPPER(TRIM(main_bp.item::TEXT))
+         AND COALESCE(main_ibr.erp_co_product_association, 0) = 1
 
-  coproduct_keys AS (
-    SELECT DISTINCT
-      mi.engineering_change_id,
-      mi.change_date,
-      mi.change_type,
-      mi.produced_item,
-      mi.bom_id,
-      mi.resource,
-      mi.user_name,
-      main_bp.item::TEXT AS item
-    FROM main_items mi
-    INNER JOIN ${tbl(TABLES.bomProduced)} main_bp
-      ON UPPER(TRIM(main_bp.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
-    INNER JOIN ${tbl(TABLES.itemBomRouting)} main_ibr
-      ON UPPER(TRIM(main_ibr.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
-     AND UPPER(TRIM(main_ibr.item::TEXT)) = UPPER(TRIM(main_bp.item::TEXT))
-     AND COALESCE(main_ibr.erp_co_product_association, 0) = 1
+        UNION
 
-    UNION
-
-    SELECT DISTINCT
-      mi.engineering_change_id,
-      mi.change_date,
-      mi.change_type,
-      mi.produced_item,
-      mi.bom_id,
-      mi.resource,
-      mi.user_name,
-      og_bp.item::TEXT AS item
-    FROM main_items mi
-    INNER JOIN ${tbl(TABLES.bomProducedOg)} og_bp
-      ON UPPER(TRIM(og_bp.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
-    INNER JOIN ${tbl(TABLES.itemBomRoutingOg)} og_ibr
-      ON UPPER(TRIM(og_ibr.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
-     AND UPPER(TRIM(og_ibr.item::TEXT)) = UPPER(TRIM(og_bp.item::TEXT))
-     AND COALESCE(og_ibr.erp_co_product_association, 0) = 1
-  ),
-
-  coproduct_diffs AS (
-    SELECT DISTINCT
-      ck.engineering_change_id,
-      ck.change_date,
-      ck.change_type,
-      ck.produced_item,
-      ck.bom_id,
-      ck.resource,
-      ck.user_name,
-      'Co-Product' AS section,
-      CASE
-        WHEN og_bp.item IS NULL THEN 'Added'
-        WHEN main_bp.item IS NULL THEN 'Deleted'
-        WHEN COALESCE(og_bp.erp_bom_qty_produced_per::TEXT, '')
+        SELECT DISTINCT
+          mi.engineering_change_id,
+          mi.change_date,
+          mi.change_type,
+          mi.produced_item,
+          mi.bom_id,
+          mi.resource,
+          mi.user_name,
+          og_bp.item::TEXT AS item
+        FROM main_items mi
+        INNER JOIN ${tbl(TABLES.bomProducedOg)} og_bp
+          ON UPPER(TRIM(og_bp.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
+        INNER JOIN ${tbl(TABLES.itemBomRoutingOg)} og_ibr
+          ON UPPER(TRIM(og_ibr.bom_id::TEXT)) = UPPER(TRIM(mi.bom_id::TEXT))
+         AND UPPER(TRIM(og_ibr.item::TEXT)) = UPPER(TRIM(og_bp.item::TEXT))
+         AND COALESCE(og_ibr.erp_co_product_association, 0) = 1
+      ),
+      coproduct_diffs AS (
+        SELECT DISTINCT
+          ck.engineering_change_id,
+          ck.change_date,
+          ck.change_type,
+          ck.produced_item,
+          ck.bom_id,
+          ck.resource,
+          ck.user_name,
+          'Co-Product' AS section,
+          CASE
+            WHEN og_bp.item IS NULL THEN 'Added'
+            WHEN main_bp.item IS NULL THEN 'Deleted'
+            WHEN COALESCE(og_bp.erp_bom_qty_produced_per::TEXT, '')
+                 IS DISTINCT FROM COALESCE(main_bp.erp_bom_qty_produced_per::TEXT, '')
+              THEN 'Modified'
+          END AS action,
+          ck.item,
+          'Co-Product Quantity Produced' AS field,
+          og_bp.erp_bom_qty_produced_per::TEXT AS original_value,
+          main_bp.erp_bom_qty_produced_per::TEXT AS updated_value
+        FROM coproduct_keys ck
+        LEFT JOIN ${tbl(TABLES.bomProduced)} main_bp
+          ON UPPER(TRIM(main_bp.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
+         AND UPPER(TRIM(main_bp.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
+        LEFT JOIN ${tbl(TABLES.bomProducedOg)} og_bp
+          ON UPPER(TRIM(og_bp.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
+         AND UPPER(TRIM(og_bp.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
+        WHERE
+          og_bp.item IS NULL
+          OR main_bp.item IS NULL
+          OR COALESCE(og_bp.erp_bom_qty_produced_per::TEXT, '')
              IS DISTINCT FROM COALESCE(main_bp.erp_bom_qty_produced_per::TEXT, '')
-          THEN 'Modified'
-      END AS action,
-      ck.item,
-      'Co-Product Quantity Produced' AS field,
-      og_bp.erp_bom_qty_produced_per::TEXT AS original_value,
-      main_bp.erp_bom_qty_produced_per::TEXT AS updated_value
-    FROM coproduct_keys ck
-    LEFT JOIN ${tbl(TABLES.bomProduced)} main_bp
-      ON UPPER(TRIM(main_bp.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
-     AND UPPER(TRIM(main_bp.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
-    LEFT JOIN ${tbl(TABLES.bomProducedOg)} og_bp
-      ON UPPER(TRIM(og_bp.bom_id::TEXT)) = UPPER(TRIM(ck.bom_id::TEXT))
-     AND UPPER(TRIM(og_bp.item::TEXT)) = UPPER(TRIM(ck.item::TEXT))
-    WHERE
-      og_bp.item IS NULL
-      OR main_bp.item IS NULL
-      OR COALESCE(og_bp.erp_bom_qty_produced_per::TEXT, '')
-         IS DISTINCT FROM COALESCE(main_bp.erp_bom_qty_produced_per::TEXT, '')
-  ),
+      ),
+      all_diffs AS (
+        SELECT * FROM component_diffs WHERE action IS NOT NULL
+        UNION ALL
+        SELECT * FROM coproduct_diffs WHERE action IS NOT NULL
+      ),
+      counted AS (
+        SELECT
+          *,
+          COUNT(*) FILTER (WHERE action = 'Added')
+            OVER (PARTITION BY engineering_change_id, produced_item, bom_id, resource, section) AS added_count,
+          COUNT(*) FILTER (WHERE action = 'Deleted')
+            OVER (PARTITION BY engineering_change_id, produced_item, bom_id, resource, section) AS deleted_count,
+          COUNT(*) FILTER (WHERE action = 'Modified')
+            OVER (PARTITION BY engineering_change_id, produced_item, bom_id, resource, section) AS modified_count,
+          CASE action
+            WHEN 'Added' THEN 1
+            WHEN 'Deleted' THEN 2
+            WHEN 'Modified' THEN 3
+            ELSE 4
+          END AS action_sort_order
+        FROM all_diffs
+      )
+      SELECT DISTINCT
+        engineering_change_id,
+        change_date,
+        change_type,
+        produced_item,
+        bom_id,
+        resource,
+        user_name,
+        section,
+        action,
+        item,
+        added_count,
+        deleted_count,
+        modified_count,
+        field,
+        original_value,
+        updated_value,
+        action_sort_order
+      FROM counted
+      ORDER BY
+        engineering_change_id,
+        produced_item,
+        bom_id,
+        resource,
+        section,
+        action_sort_order,
+        item,
+        field
+    `;
 
-  all_diffs AS (
-    SELECT * FROM component_diffs WHERE action IS NOT NULL
-    UNION ALL
-    SELECT * FROM coproduct_diffs WHERE action IS NOT NULL
-  ),
-
-  counted AS (
-    SELECT
-      *,
-      COUNT(*) FILTER (WHERE action = 'Added')
-        OVER (PARTITION BY engineering_change_id, produced_item, bom_id, resource, section) AS added_count,
-      COUNT(*) FILTER (WHERE action = 'Deleted')
-        OVER (PARTITION BY engineering_change_id, produced_item, bom_id, resource, section) AS deleted_count,
-      COUNT(*) FILTER (WHERE action = 'Modified')
-        OVER (PARTITION BY engineering_change_id, produced_item, bom_id, resource, section) AS modified_count,
-      CASE action
-        WHEN 'Added' THEN 1
-        WHEN 'Deleted' THEN 2
-        WHEN 'Modified' THEN 3
-        ELSE 4
-      END AS action_sort_order
-    FROM all_diffs
-  )
-
-  SELECT DISTINCT
-    engineering_change_id,
-    change_date,
-    change_type,
-    produced_item,
-    bom_id,
-    resource,
-    user_name,
-    section,
-    action,
-    item,
-    added_count,
-    deleted_count,
-    modified_count,
-    field,
-    original_value,
-    updated_value,
-    action_sort_order
-  FROM counted
-  ORDER BY
-    engineering_change_id,
-    produced_item,
-    bom_id,
-    resource,
-    section,
-    action_sort_order,
-    item,
-    field
-`;
-
-  
-  const [baseResult, mainBomResult, componentResult, coProductResult, modifiedComparisonResult] =
-      await Promise.all([
-        pool.query(baseQuery),
-        pool.query(mainBomQuery),
-        pool.query(componentQuery),
-        pool.query(coProductQuery),
-        pool.query(modifiedComparisonQuery),
-      ]);
+    const [
+      baseResult,
+      mainBomResult,
+      componentResult,
+      coProductResult,
+      modifiedComparisonResult,
+    ] = await Promise.all([
+      pool.query(baseQuery, queryParams),
+      pool.query(mainBomQuery, queryParams),
+      pool.query(componentQuery, queryParams),
+      pool.query(coProductQuery, queryParams),
+      pool.query(modifiedComparisonQuery, queryParams),
+    ]);
 
     const baseRows = baseResult.rows || [];
     const mainBomRows = mainBomResult.rows || [];
@@ -5405,12 +5512,15 @@ const modifiedComparisonQuery = `
 
     const groupByEcId = (rows) => {
       const map = new Map();
+
       for (const row of rows || []) {
         const ecId = normalizeText(row.engineering_change_id);
         if (!ecId) continue;
+
         if (!map.has(ecId)) map.set(ecId, []);
         map.get(ecId).push(row);
       }
+
       return map;
     };
 
@@ -5434,28 +5544,53 @@ const modifiedComparisonQuery = `
           locations: [],
           resources: [],
           user_name: normalizeText(row.user_name),
-          change_summary: normalizeText(row.change_summary) || normalizeText(row.summarynotes),
+          change_summary:
+            normalizeText(row.change_summary) || normalizeText(row.summarynotes),
           summarynotes: normalizeText(row.summarynotes),
           component_items: [],
         });
       }
 
       const summary = summaryMap.get(ecId);
-      summary.bom_ids.push(...String(row.bom_id || '').split(',').map((v) => v.trim()).filter(Boolean));
+
+      summary.bom_ids.push(
+        ...String(row.bom_id || "")
+          .split(",")
+          .map((v) => v.trim())
+          .filter(Boolean)
+      );
+
       summary.locations.push(row.location);
       summary.resources.push(row.resource);
-      summary.component_items.push(...String(row.consumed_item || '').split(',').map((v) => v.trim()).filter(Boolean));
 
-      if (!summary.change_date && row.change_date) summary.change_date = formatChangeDate(row.change_date);
-      if (!summary.change_type && row.change_type) summary.change_type = normalizeText(row.change_type);
-      if (!summary.user_name && row.user_name) summary.user_name = normalizeText(row.user_name);
+      summary.component_items.push(
+        ...String(row.consumed_item || "")
+          .split(",")
+          .map((v) => v.trim())
+          .filter(Boolean)
+      );
+
+      if (!summary.change_date && row.change_date) {
+        summary.change_date = formatChangeDate(row.change_date);
+      }
+
+      if (!summary.change_type && row.change_type) {
+        summary.change_type = normalizeText(row.change_type);
+      }
+
+      if (!summary.user_name && row.user_name) {
+        summary.user_name = normalizeText(row.user_name);
+      }
+
       if (!summary.change_summary) {
-        summary.change_summary = normalizeText(row.change_summary) || normalizeText(row.summarynotes);
+        summary.change_summary =
+          normalizeText(row.change_summary) || normalizeText(row.summarynotes);
       }
     }
 
     const responseRows = Array.from(summaryMap.values()).map((summary) => {
       const ecId = summary.engineering_change_id;
+
       const mainDetails = mainBomByEc.get(ecId) || [];
       const componentDetails = componentByEc.get(ecId) || [];
       const coProductDetails = coProductByEc.get(ecId) || [];
@@ -5467,18 +5602,31 @@ const modifiedComparisonQuery = `
         ...componentDetails.map((r) => r.bom_id),
         ...coProductDetails.map((r) => r.bom_id),
       ]);
-      const locations = uniqueValues([...summary.locations, ...mainDetails.map((r) => r.location)]);
-      const resources = uniqueValues([...summary.resources, ...mainDetails.map((r) => r.resource)]);
+
+      const locations = uniqueValues([
+        ...summary.locations,
+        ...mainDetails.map((r) => r.location),
+      ]);
+
+      const resources = uniqueValues([
+        ...summary.resources,
+        ...mainDetails.map((r) => r.resource),
+      ]);
+
       const producedItems = uniqueValues([
         ...mainDetails.map((r) => r.produced_item),
         ...componentDetails.map((r) => r.produced_item),
         ...coProductDetails.map((r) => r.produced_item),
       ]);
+
       const componentItems = uniqueValues([
         ...summary.component_items,
         ...componentDetails.map((r) => r.component_item),
       ]);
-      const coProductItems = uniqueValues(coProductDetails.map((r) => r.co_product_item));
+
+      const coProductItems = uniqueValues(
+        coProductDetails.map((r) => r.co_product_item)
+      );
 
       return {
         engineering_change_id: ecId,
@@ -5561,9 +5709,21 @@ const modifiedComparisonQuery = `
       };
     });
 
-    return res.status(200).json({ success: true, data: responseRows });
+    return res.status(200).json({
+      success: true,
+      data: responseRows,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasPrev: page > 1,
+        hasNext: page < totalPages,
+      },
+    });
   } catch (error) {
     console.error("DB Error (engineering-change-log):", error);
+
     return res.status(500).json({
       success: false,
       error: "Failed to fetch engineering change log",
