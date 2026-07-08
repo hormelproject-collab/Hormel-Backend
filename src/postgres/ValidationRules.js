@@ -62,13 +62,13 @@ export const validationRules = {
 
   1012: {
     desc: "Check for any duplicate combinations of BOMID and Consumed item",
-    error: "There are duplicate values for this BOMID = <value>, item = <> and location = <>",
+    error: "There are duplicate values for this BOMID = <value>, item = <item> and location = <location>",
     rm: "RM: Please DELETE this extra bom_id records \nRS:  Allow users to DELETE the extra (bom_id, item, location) records using DELETE buttons"
   },
 
   1013: {
     desc: "Check for any recursive records (item shown in the BOMID is the same as the item in the consumed item column)",
-    error: "This item=<value>, location=<value>, bomid = <value> is a recursive consumption",
+    error: "This item=<item>, location=<location>, bomid = <bom_id> is a recursive consumption",
     rm: "RM: Please MODIFY/UPDATE the Consumed Item for this  bom_id, item, location combination  or Please DELETE this bom_id, item, location combination from bom_consumed to avoid recursive consumption\nRS:  Show the Relevant Records in a Popup or new window  & Allow users to update/delete records"
   },
 
@@ -104,19 +104,19 @@ export const validationRules = {
 
   1019: {
     desc: "Check duplicate combinations",
-    error: "There are duplicate values for this BOMID = <value>, item = <> and routing_id = <>",
+    error: "There are duplicate values for this BOMID = <value>, item = <item> and routing_id = <routing_id>",
     rm: "RM: Please DELETE duplicate records\nRS: Allow delete"
   },
 
   1020: {
     desc: "Check duplicate priority",
-    error: "There are duplicate values for this BOMID = <value> and erp_item_bom_routing_priority = <>",
+    error: "There are duplicate values for this BOMID = <value> and erp_item_bom_routing_priority = <erp_item_bom_routing_priority>",
     rm: ""
   },
 
   1021: {
     desc: "Check priority integer",
-    error: "The bom_id = <> with erp_item_bom_routing_priority = <value> is not a integer",
+    error: "The bom_id = <bom_id> with erp_item_bom_routing_priority = <value> is not a integer",
     rm: "RM: Please MODIFY the erp_item_bom_routing_priority to Integer\nRS: Allow update"
   },
 

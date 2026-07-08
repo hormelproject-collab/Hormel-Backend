@@ -332,7 +332,7 @@ function normalizeRow(tableKey, row) {
   if (tableKey === "BOM_CONSUMED") {
     return {
       bom_id,
-      item,
+      item: item || deriveBomItem(bom_id),
       location: location || deriveBomLocation(bom_id),
       erp_bom_quantity_consumed_per: qtyConsumedPer,
       co_product_flag: flagIsCo,
@@ -370,7 +370,7 @@ function defaultMessageForSeq(seq, values = {}) {
     case 1012:
       return `Duplicate consumed item ${values.item ?? ""} found for BOM ${values.value ?? ""}.`;
     case 1013:
-      return `Consumed item ${values.value ?? ""} cannot be the same as the BOM produced item for BOM ${values.bom_id ?? values.bomid ?? ""}.`;
+      return `Consumed item ${values.item ?? values.value ?? ""} cannot be the same as the BOM produced item for BOM ${values.bom_id ?? values.bomid ?? ""}.`;
     case 1017:
       return `Routing co-product association is invalid because BOM ${values.bom_id ?? ""} has no co-product row in BOM Produced.`;
     case 1018:
@@ -386,7 +386,23 @@ function defaultMessageForSeq(seq, values = {}) {
   }
 }
 
-export const validateWithGCP = async (payload) => {
+export const validateWithGCP = async (payload, options = {}) => {
+  const skipDuplicateExistenceCheck = Boolean(
+    options.skipDuplicateExistenceCheck ||
+      options.skipBigQueryDuplicateChecks ||
+      options.skipBigQueryDuplicateCheck
+  );
+  const skipCrossTableValidation = Boolean(
+    options.skipCrossTableValidation ||
+      options.skipCrossValidation ||
+      options.skipCrossTableChecks
+  );
+
+  console.log("[GCPvalidation] validateWithGCP flags:", {
+    skipDuplicateExistenceCheck,
+    skipCrossTableValidation,
+  });
+
   const PROJECT = process.env.GCP_PROJECT_ID;
   const DATASET = process.env.BQ_DATASET;
 
@@ -677,7 +693,20 @@ export const validateWithGCP = async (payload) => {
   );
   const coproductBomSet = new Set(coproductBomsFromProducedCsv);
 
-  if (uploaded.BOM_PARAMETERS && uploaded.BOM_PRODUCED && uploaded.ITEM_BOM_ROUTING) {
+  if (
+    uploaded.BOM_PARAMETERS &&
+    uploaded.BOM_PRODUCED &&
+    uploaded.ITEM_BOM_ROUTING &&
+    !skipCrossTableValidation
+  ) {
+    console.log(
+      "[GCPvalidation] cross-table validation enabled for BOM_PARAMETERS",
+      {
+        bomIdsParamsCount: bomIdsParams.length,
+        csvProducedCount: csvProducedSet.size,
+        csvRoutingCount: csvRoutingSet.size,
+      }
+    );
     for (const b of bomIdsParams) {
       const inProducedCsv = csvProducedSet.has(b);
       const inRoutingCsv = csvRoutingSet.has(b);
@@ -693,9 +722,24 @@ export const validateWithGCP = async (payload) => {
         });
       }
     }
+  } else if (uploaded.BOM_PARAMETERS) {
+    console.log(
+      "[GCPvalidation] skipped BOM_PARAMETERS cross-table validation",
+      {
+        skipCrossTableValidation,
+        bomIdsParamsCount: bomIdsParams.length,
+      }
+    );
   }
 
-  if (uploaded.BOM_PARAMETERS) {
+  if (uploaded.BOM_PARAMETERS && !skipDuplicateExistenceCheck) {
+    console.log(
+      "[GCPvalidation] duplicate existence check enabled for BOM_PARAMETERS",
+      {
+        bomIdsParamsCount: bomIdsParams.length,
+        existingCount: gcpBomParametersExisting.size,
+      }
+    );
     for (const b of bomIdsParams) {
       if (gcpBomParametersExisting.has(b)) {
         addError("BOM_PARAMETERS", b, {
@@ -704,9 +748,22 @@ export const validateWithGCP = async (payload) => {
         });
       }
     }
+  } else if (uploaded.BOM_PARAMETERS) {
+    console.log(
+      "[GCPvalidation] skipped BOM_PARAMETERS duplicate existence check",
+      {
+        skipDuplicateExistenceCheck,
+        bomIdsParamsCount: bomIdsParams.length,
+      }
+    );
   }
 
-  if (uploaded.BOM_PRODUCED && uploaded.BOM_PARAMETERS && uploaded.ITEM_BOM_ROUTING) {
+  if (
+    uploaded.BOM_PRODUCED &&
+    uploaded.BOM_PARAMETERS &&
+    uploaded.ITEM_BOM_ROUTING &&
+    !skipCrossTableValidation
+  ) {
     for (const b of bomIdsProduced) {
       const inParamsCsv = csvParamsSet.has(b);
       const inRoutingCsv = csvRoutingSet.has(b);
@@ -723,7 +780,7 @@ export const validateWithGCP = async (payload) => {
     }
   }
 
-  if (uploaded.BOM_PRODUCED) {
+  if (uploaded.BOM_PRODUCED && !skipDuplicateExistenceCheck) {
     for (const b of bomIdsProduced) {
       if (gcpBomProducedExisting.has(b)) {
         addError("BOM_PRODUCED", b, {
@@ -751,7 +808,11 @@ export const validateWithGCP = async (payload) => {
     }
   }
 
-  if (uploaded.BOM_CONSUMED && uploaded.BOM_PRODUCED) {
+  if (
+    uploaded.BOM_CONSUMED &&
+    uploaded.BOM_PRODUCED &&
+    !skipCrossTableValidation
+  ) {
     for (const b of bomIdsConsumed) {
       if (!csvProducedSet.has(b)) {
         addError("BOM_CONSUMED", b, {
@@ -815,7 +876,12 @@ export const validateWithGCP = async (payload) => {
     }
   }
 
-  if (uploaded.ITEM_BOM_ROUTING && uploaded.BOM_PARAMETERS && uploaded.BOM_PRODUCED) {
+  if (
+    uploaded.ITEM_BOM_ROUTING &&
+    uploaded.BOM_PARAMETERS &&
+    uploaded.BOM_PRODUCED &&
+    !skipCrossTableValidation
+  ) {
     for (const b of bomIdsRouting) {
       const inParamsCsv = csvParamsSet.has(b);
       const inProducedCsv = csvProducedSet.has(b);

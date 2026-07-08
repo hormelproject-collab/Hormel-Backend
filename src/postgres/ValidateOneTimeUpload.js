@@ -317,7 +317,7 @@ async function insertRows(client, tableName, rows) {
 /* =========================================================
    Main CSV validate + load
 ========================================================= */
-export async function validateAndLoadAllCsv(payload = {}) {
+export async function validateAndLoadAllCsv(payload = {}, options = {}) {
   fs.mkdirSync(REPORT_DIR, { recursive: true });
 
   const uploadedTables = normalizeUploadedTables(payload);
@@ -338,7 +338,7 @@ export async function validateAndLoadAllCsv(payload = {}) {
   }
 
   // 1) Validate with GCP validator
-  const validation = await validateWithGCP(uploadedTables);
+  const validation = await validateWithGCP(uploadedTables, options);
 
   // 2) Failure -> failure report only, no DB load
   if (!validation.isValid) {

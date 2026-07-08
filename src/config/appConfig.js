@@ -1,6 +1,8 @@
 const appConfig = {
   bigQuery: {
-    
+    // Optional local service account key file path for BigQuery access.
+    // Set this to an absolute path or a repo-relative path such as "config/service-account.json".
+    keyFilename: "",
     projectIds: {
       dev: "bommanagement",
       prd: "bommanagement",

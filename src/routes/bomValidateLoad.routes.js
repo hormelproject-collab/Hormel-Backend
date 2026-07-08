@@ -47,18 +47,38 @@ function sendValidateLoadResponse(res, result) {
 }
 
 async function fetchBigQueryTable(tableConfig) {
-  const projectId =
-    appConfig.bigQuery.projectIds[tableConfig.source];
+  const tableName =
+    typeof tableConfig === "string" ? tableConfig : tableConfig.table;
 
+  const projectId = appConfig.bigQuery.projectIds.dev;
   const datasetId = appConfig.bigQuery.datasetId;
+
+  let keyFilename = process.env.GOOGLE_APPLICATION_CREDENTIALS || appConfig.bigQuery.keyFilename || undefined;
+  if (keyFilename && !path.isAbsolute(keyFilename)) {
+    keyFilename = path.resolve(process.cwd(), keyFilename);
+  }
+
+  if (keyFilename && !fs.existsSync(keyFilename)) {
+    console.warn(
+      `[bomValidateLoad] BigQuery key file not found at ${keyFilename}. Falling back to ADC if available.`
+    );
+    keyFilename = undefined;
+  }
+
+  if (!keyFilename && !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    console.warn(
+      `[bomValidateLoad] No BigQuery credentials found. Set GOOGLE_APPLICATION_CREDENTIALS or appConfig.bigQuery.keyFilename.`
+    );
+  }
 
   const bigquery = new BigQuery({
     projectId,
+    ...(keyFilename ? { keyFilename } : {}),
   });
 
   const query = `
     SELECT *
-    FROM \`${projectId}.${datasetId}.${tableConfig.table}\`
+    FROM \`${projectId}.${datasetId}.${tableName}\`
   `;
 
   const [job] = await bigquery.createQueryJob({
@@ -196,7 +216,16 @@ router.post("/validate-and-load", async (req, res) => {
   }
 });
 
+router.get("/sync-gcp-to-postgres", (_req, res) => {
+  return res.json({
+    status: "OK",
+    message:
+      "This endpoint accepts POST requests to sync BigQuery data into PostgreSQL. Use POST /api/bom-upload/sync-gcp-to-postgres.",
+  });
+});
+
 router.post("/sync-gcp-to-postgres", async (req, res) => {
+  console.log("[bomValidateLoad] sync-gcp-to-postgres called");
   try {
     const { result, fetchedCounts } = await performScheduledGcpSync();
 
