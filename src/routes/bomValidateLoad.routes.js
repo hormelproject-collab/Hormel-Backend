@@ -190,7 +190,11 @@ export async function performScheduledGcpSync() {
     item_bom_routing,
   };
 
-  const result = await validateAndLoadAllCsv(payload);
+ 
+const result = await validateAndLoadAllCsv(payload, {
+  skipDuplicateExistenceCheck: true,
+});
+
   return {
     result,
     fetchedCounts: {
@@ -205,7 +209,18 @@ export async function performScheduledGcpSync() {
 router.post("/validate-and-load", async (req, res) => {
   try {
     const payload = req.body || {};
-    const result = await validateAndLoadAllCsv(payload);
+
+    const result = await validateAndLoadAllCsv(payload, {
+      skipDuplicateExistenceCheck:
+        payload.skipDuplicateExistenceCheck ||
+        payload.skipBigQueryDuplicateChecks ||
+        payload.skipBigQueryDuplicateCheck,
+      skipCrossTableValidation:
+        payload.skipCrossTableValidation ||
+        payload.skipCrossValidation ||
+        payload.skipCrossTableChecks,
+    });
+
     return sendValidateLoadResponse(res, result);
   } catch (err) {
     console.error("validate-and-load csv flow error:", err);
