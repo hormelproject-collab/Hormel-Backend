@@ -1192,6 +1192,7 @@ router.get("/existing-bom-search", async (req, res) => {
         "producedItemDescription",
         "item_release_flag",
         "releaseFlag",
+        "resource",
       ]);
 
       const field = String(value || "").trim();
@@ -1231,6 +1232,7 @@ router.get("/existing-bom-search", async (req, res) => {
       }
 
       const placeholders = cleaned.map((item) => addPgParam(item)).join(", ");
+
       pgFilters.push(
         `UPPER(TRIM(CAST(produced_item AS TEXT))) IN (${placeholders})`
       );
@@ -1308,6 +1310,13 @@ router.get("/existing-bom-search", async (req, res) => {
         return;
       }
 
+      if (field === "resource") {
+        pgFilters.push(
+          `TRIM(CAST(resource AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
       if (field === "produced_item_desc") {
         const items = await findItemsByDescription(q);
         addProducedItemInFilter(items);
@@ -1332,101 +1341,122 @@ router.get("/existing-bom-search", async (req, res) => {
 
     const producedResult = await pool.query(
       `
-        WITH ranked_produced AS (
+        WITH produced_all AS (
           SELECT
             TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
             TRIM(CAST(bp.item AS TEXT)) AS produced_item,
             TRIM(CAST(bp.location AS TEXT)) AS location,
-            ROW_NUMBER() OVER (
-              PARTITION BY TRIM(CAST(bp.bom_id AS TEXT))
-              ORDER BY
-                CASE
-                  WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
-                    THEN 0
-                  ELSE 1
-                END,
-                TRIM(CAST(bp.item AS TEXT))
-            ) AS rn
+            CASE
+              WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
+                THEN ''
+              ELSE '1'
+            END AS inferred_co_product_association
           FROM ${pgRef(T.bomProduced)} bp
           WHERE bp.bom_id IS NOT NULL
             AND TRIM(CAST(bp.bom_id AS TEXT)) <> ''
+            AND bp.item IS NOT NULL
+            AND TRIM(CAST(bp.item AS TEXT)) <> ''
+        ),
+        routing_all AS (
+          SELECT
+            TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
+            TRIM(CAST(ibr.routing_id AS TEXT)) AS original_routing_id,
+            COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') AS erp_co_product_association,
+            COALESCE(
+              NULLIF(
+                TRIM(
+                  regexp_replace(
+                    TRIM(CAST(ibr.routing_id AS TEXT)),
+                    '^([^_]*_){2}',
+                    ''
+                  )
+                ),
+                ''
+              ),
+              ''
+            ) AS resource
+          FROM ${pgRef(T.itemBomRouting)} ibr
+          WHERE ibr.routing_id IS NOT NULL
+            AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
+            AND ibr.bom_id IS NOT NULL
+            AND TRIM(CAST(ibr.bom_id AS TEXT)) <> ''
         ),
         base_rows AS (
-          SELECT bom_id, produced_item, location
-          FROM ranked_produced
-          WHERE rn = 1
+          SELECT
+            pa.bom_id,
+            pa.produced_item,
+            pa.location,
+            COALESCE(ra.resource, '') AS resource,
+            CASE
+              WHEN COALESCE(ra.resource, '') <> ''
+                THEN CONCAT('ROUTING_', pa.produced_item, '_', ra.resource)
+              ELSE ''
+            END AS routing_id,
+            COALESCE(
+              NULLIF(ra.erp_co_product_association, ''),
+              pa.inferred_co_product_association,
+              ''
+            ) AS erp_co_product_association
+          FROM produced_all pa
+          LEFT JOIN routing_all ra
+            ON ra.bom_id = pa.bom_id
+           AND UPPER(TRIM(CAST(ra.produced_item AS TEXT))) =
+               UPPER(TRIM(CAST(pa.produced_item AS TEXT)))
         ),
         filtered_rows AS (
           SELECT *
           FROM base_rows
           ${whereClause}
         ),
-        counted_rows AS (
-          SELECT *, COUNT(1) OVER() AS total_count
+        page_boms AS (
+          SELECT
+            bom_id,
+            MIN(produced_item) AS sort_item,
+            COUNT(*) OVER() AS total_count
           FROM filtered_rows
+          GROUP BY bom_id
+          ORDER BY bom_id, MIN(produced_item)
+          LIMIT ${limitParam}
+          OFFSET ${offsetParam}
         )
-        SELECT bom_id, produced_item, location, total_count
-        FROM counted_rows
-        ORDER BY bom_id, produced_item, location
-        LIMIT ${limitParam}
-        OFFSET ${offsetParam}
+        SELECT
+          br.bom_id,
+          br.produced_item,
+          br.location,
+          br.resource,
+          br.routing_id,
+          br.erp_co_product_association,
+          pb.total_count
+        FROM base_rows br
+        INNER JOIN page_boms pb
+          ON pb.bom_id = br.bom_id
+        ORDER BY
+          br.bom_id,
+          br.resource,
+          br.location,
+          CASE WHEN br.erp_co_product_association = '1' THEN 1 ELSE 0 END,
+          br.produced_item,
+          br.routing_id
       `,
       pgParams
     );
 
     const producedRows = producedResult.rows || [];
+
     const total = producedRows.length
       ? Number(producedRows[0].total_count || 0)
       : 0;
+
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-    const pageBomIds = producedRows
-      .map((row) => normalizeText(row.bom_id))
-      .filter(Boolean);
-
-    const pageItems = Array.from(
+    const allPageItems = Array.from(
       new Set(
         producedRows
           .map((row) => normalizeUpper(row.produced_item))
           .filter(Boolean)
       )
     );
-
-    const routingResult = pageBomIds.length
-      ? await pool.query(
-          `
-            SELECT
-              TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
-              TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
-              TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id,
-              COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') AS erp_co_product_association
-            FROM ${pgRef(T.itemBomRouting)} ibr
-            WHERE ibr.routing_id IS NOT NULL
-              AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
-              AND TRIM(CAST(ibr.bom_id AS TEXT)) = ANY($1)
-            ORDER BY
-              TRIM(CAST(ibr.bom_id AS TEXT)),
-              CASE
-                WHEN COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') = '1'
-                  THEN 1
-                ELSE 0
-              END,
-              TRIM(CAST(ibr.item AS TEXT)),
-              TRIM(CAST(ibr.routing_id AS TEXT))
-          `,
-          [pageBomIds]
-        )
-      : { rows: [] };
-
-    const routingItems = Array.from(
-      new Set(
-        (routingResult.rows || [])
-          .map((row) => normalizeUpper(row.produced_item))
-          .filter(Boolean)
-      )
-    );
-
-    const allPageItems = Array.from(new Set([...pageItems, ...routingItems]));
 
     const itemMasterRows = allPageItems.length
       ? await runBigQuery(
@@ -1489,118 +1519,35 @@ router.get("/existing-bom-search", async (req, res) => {
       }
     }
 
-    const getResourceFromRoutingIdValue = (routingId) => {
-      const value = normalizeText(routingId);
-      if (!value) return "";
-
-      const parts = value
-        .split("_")
-        .map((p) => p.trim())
-        .filter(Boolean);
-
-      if (parts.length >= 3 && parts[0].toUpperCase() === "ROUTING") {
-        return parts.slice(2).join("_");
-      }
-
-      return parts.length >= 2 ? parts.slice(1).join("_") : "";
-    };
-
-    const routingsByBomId = new Map();
-
-    for (const row of routingResult.rows || []) {
+    const mergedRows = producedRows.map((row) => {
       const bomId = normalizeText(row.bom_id);
-      if (!bomId) continue;
-
-      if (!routingsByBomId.has(bomId)) {
-        routingsByBomId.set(bomId, []);
-      }
-
-      routingsByBomId.get(bomId).push({
-        produced_item: normalizeText(row.produced_item),
-        routing_id: normalizeText(row.routing_id),
-        resource: getResourceFromRoutingIdValue(row.routing_id),
-        erp_co_product_association: normalizeText(
-          row.erp_co_product_association
-        ),
-      });
-    }
-
-    const mergedRows = [];
-
-    for (const row of producedRows) {
-      const bomId = normalizeText(row.bom_id);
-      const mainProducedItem = normalizeText(row.produced_item);
+      const producedItem = normalizeText(row.produced_item);
+      const itemKey = normalizeUpper(producedItem);
       const location = normalizeText(row.location);
+      const resource = normalizeText(row.resource);
+      const routingId = resource
+        ? `ROUTING_${producedItem}_${resource}`
+        : normalizeText(row.routing_id);
 
-      if (!bomId || !mainProducedItem) continue;
-
-      const routingRows = routingsByBomId.get(bomId) || [];
-
-      if (routingRows.length === 0) {
-        const mainItemKey = normalizeUpper(mainProducedItem);
-
-        mergedRows.push({
-          id: `${bomId}__NOROUTING`,
-          location,
-          produced_item: mainProducedItem,
-          produced_item_desc: itemDescMap.get(mainItemKey) ?? "",
-          bom_id: bomId,
-          resource: "",
-          routing_id: "",
-          item_release_flag: releaseFlagMap.get(mainItemKey) ?? "",
-          erp_co_product_association: "",
-        });
-
-        continue;
-      }
-
-      for (const routing of routingRows) {
-        const rowProducedItem = normalizeText(
-          routing.produced_item || mainProducedItem
-        );
-        const rowProducedItemKey = normalizeUpper(rowProducedItem);
-        const isCoProduct =
-          String(routing.erp_co_product_association || "").trim() === "1";
-
-        mergedRows.push({
-          id: `${bomId}__${
-            routing.routing_id || routing.resource || rowProducedItem || "ROW"
-          }`,
-          location,
-          produced_item: rowProducedItem,
-          produced_item_desc: itemDescMap.get(rowProducedItemKey) ?? "",
-          bom_id: bomId,
-          resource: routing.resource || "",
-          routing_id: routing.routing_id || "",
-          item_release_flag: releaseFlagMap.get(rowProducedItemKey) ?? "",
-          erp_co_product_association: isCoProduct ? "1" : "",
-        });
-      }
-    }
-
-    mergedRows.sort((a, b) => {
-      const bomCompare = String(a.bom_id || "").localeCompare(
-        String(b.bom_id || "")
+      const erpCoProductAssociation = normalizeText(
+        row.erp_co_product_association
       );
-      if (bomCompare !== 0) return bomCompare;
 
-      const aIsCoProduct =
-        String(a.erp_co_product_association || "").trim() === "1";
-      const bIsCoProduct =
-        String(b.erp_co_product_association || "").trim() === "1";
+      const rowType =
+        erpCoProductAssociation === "1" ? "COPRODUCT" : "MAIN";
 
-      if (aIsCoProduct !== bIsCoProduct) {
-        return aIsCoProduct ? 1 : -1;
-      }
-
-      const itemCompare = String(a.produced_item || "").localeCompare(
-        String(b.produced_item || "")
-      );
-      if (itemCompare !== 0) return itemCompare;
-
-      return String(a.routing_id || "").localeCompare(
-        String(b.routing_id || "")
-      );
+      return {
+        id: `${bomId}__${resource || "NORESOURCE"}__${location}__${producedItem}__${rowType}`,
+        location,
+        produced_item: producedItem,
+        produced_item_desc: itemDescMap.get(itemKey) ?? "",
+        bom_id: bomId,
+        resource,
+        routing_id: routingId,
+        item_release_flag: releaseFlagMap.get(itemKey) ?? "",
+        erp_co_product_association:
+          erpCoProductAssociation === "1" ? "1" : "",
+      };
     });
 
     return res.status(200).json({
@@ -2227,6 +2174,38 @@ router.put("/modify-bom", async (req, res) => {
 
     const chicagoAuditTs = getChicagoDateTimeFormatted();
 
+    const toText = (value) => String(value ?? "").trim();
+
+    const getResourceFromRoutingId = (routingId) => {
+      const parts = String(routingId || "")
+        .split("_")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      // Correct format: ROUTING_Item_resource
+      // Resource starts after ROUTING + Item.
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const buildRoutingId = (item, resource) => {
+      const cleanItem = toText(item);
+      const cleanResource = toText(resource);
+
+      if (!cleanItem || !cleanResource) return "";
+
+      return `ROUTING_${cleanItem}_${cleanResource}`;
+    };
+
+    const normalizeRoutingIdForRow = (row, fallbackResource = "") => {
+      const item = toText(row?.item);
+      const resource =
+        toText(row?.resource) ||
+        toText(fallbackResource) ||
+        getResourceFromRoutingId(row?.routing_id);
+
+      return buildRoutingId(item, resource) || toText(row?.routing_id);
+    };
+
     const resolvePrimaryIdColumn = async (tableName) => {
       const columns = await getExistingColumns(client, tableName);
 
@@ -2251,8 +2230,6 @@ router.put("/modify-bom", async (req, res) => {
         null
       );
     };
-
-    const toText = (value) => String(value ?? "").trim();
 
     const buildModifiedSummary = (title, changes) => {
       const validChanges = (changes || []).filter(Boolean);
@@ -2302,13 +2279,18 @@ router.put("/modify-bom", async (req, res) => {
     const buildProducedKey = (row) =>
       [toText(row?.bom_id), toText(row?.location), toText(row?.item)].join("__");
 
-    const buildRoutingKey = (row) =>
-      [
+    const buildRoutingKey = (row, fallbackResource = "") => {
+      const routingId = normalizeRoutingIdForRow(row, fallbackResource);
+      const coProductFlag =
+        Number(row?.erp_co_product_association ?? 0) === 1 ? "1" : "0";
+
+      return [
         toText(row?.bom_id),
-        toText(row?.routing_id),
+        routingId,
         toText(row?.item),
-        String(Number(row?.erp_co_product_association ?? 0) === 1 ? 1 : 0),
+        coProductFlag,
       ].join("__");
+    };
 
     const deleteExactRowById = async (tableName, idColumn, row) => {
       const resolvedId = getResolvedRowId(row, idColumn);
@@ -2487,12 +2469,14 @@ router.put("/modify-bom", async (req, res) => {
 
     const firstLocation = locations[0] || {};
     const firstLocationName = String(firstLocation?.locationName || "").trim();
-    const firstRoutingId = String(
+    const firstIncomingRoutingId = String(
       firstLocation?.resourceInfo?.routingId || ""
     ).trim();
     const firstResource =
       String(firstLocation?.resourceInfo?.resource || "").trim() ||
-      (firstRoutingId ? getResourceFromRoutingId(firstRoutingId) : "");
+      (firstIncomingRoutingId
+        ? getResourceFromRoutingId(firstIncomingRoutingId)
+        : "");
 
     const paramsLiveResult = await client.query(
       `
@@ -2541,7 +2525,7 @@ router.put("/modify-bom", async (req, res) => {
       logItem: producedItem.item || "",
       logLocation: firstLocationName,
       logResource: firstResource,
-      summaryText: '',
+      summaryText: "",
       summaryCategory: parameterChanges.length ? "parameter information" : "",
     });
 
@@ -2564,7 +2548,9 @@ router.put("/modify-bom", async (req, res) => {
 
     for (const location of locations) {
       const locationName = String(location?.locationName || "").trim();
-      const routingId = String(location?.resourceInfo?.routingId || "").trim();
+      const incomingRoutingId = String(
+        location?.resourceInfo?.routingId || ""
+      ).trim();
 
       const priority =
         location?.resourceInfo?.priority === "" ||
@@ -2574,7 +2560,24 @@ router.put("/modify-bom", async (req, res) => {
 
       const resource =
         String(location?.resourceInfo?.resource || "").trim() ||
-        (routingId ? getResourceFromRoutingId(routingId) : "");
+        (incomingRoutingId ? getResourceFromRoutingId(incomingRoutingId) : "");
+
+      if (!locationName) {
+        throw new Error("locationName is required in locations");
+      }
+
+      if (!resource) {
+        throw new Error(
+          "resource is required in resourceInfo or derivable from routingId"
+        );
+      }
+
+      const mainRoutingId =
+        buildRoutingId(producedItem.item, resource) || incomingRoutingId;
+
+      if (!mainRoutingId) {
+        throw new Error("routingId could not be derived");
+      }
 
       const requestedComponentItems = Array.isArray(location?.componentItems)
         ? location.componentItems
@@ -2583,14 +2586,6 @@ router.put("/modify-bom", async (req, res) => {
       const requestedCoProductItems = Array.isArray(location?.coProductItems)
         ? location.coProductItems
         : [];
-
-      if (!locationName) {
-        throw new Error("locationName is required in locations");
-      }
-
-      if (!routingId) {
-        throw new Error("routingId is required in resourceInfo");
-      }
 
       const liveProducedResult = await client.query(
         `
@@ -2806,19 +2801,19 @@ router.put("/modify-bom", async (req, res) => {
         SELECT *
         FROM ${pgRef(T.itemBomRouting)}
         WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-          AND TRIM(CAST(routing_id AS TEXT)) = $2
+          AND TRIM(regexp_replace(TRIM(CAST(routing_id AS TEXT)), '^([^_]*_){2}', '')) = $2
         ORDER BY load_datetime DESC NULLS LAST, ${quoteIdent(
           itemBomRoutingIdColumn
         )} DESC
         `,
-        [bomId, routingId]
+        [bomId, resource]
       );
 
       const liveRoutingRows = liveRoutingResult.rows || [];
 
       if (!liveRoutingRows.length) {
         throw new Error(
-          `No matching item_bom_routing rows found for bom_id=${bomId}, routing_id=${routingId}`
+          `No matching item_bom_routing rows found for bom_id=${bomId}, resource=${resource}`
         );
       }
 
@@ -2841,11 +2836,11 @@ router.put("/modify-bom", async (req, res) => {
 
       if (
         String(primaryRoutingLiveRow?.routing_id ?? "") !==
-        String(routingId ?? "")
+        String(mainRoutingId ?? "")
       ) {
         routingChanges.push(
           `Routing ID (${primaryRoutingLiveRow?.routing_id ?? ""} -> ${
-            routingId ?? ""
+            mainRoutingId ?? ""
           })`
         );
       }
@@ -2870,12 +2865,12 @@ router.put("/modify-bom", async (req, res) => {
         logLocation: locationName,
         logResource: resource,
         summaryText: buildModifiedSummary(
-          "co-product information",
+          "routing information",
           routingChanges
         ),
         summaryCategory:
           routingChanges.length || requestedCoProductItems.length
-            ? "co-product information"
+            ? "routing information"
             : "",
         rowLogItemSelector: (row) => row?.item || "",
       });
@@ -2898,7 +2893,7 @@ router.put("/modify-bom", async (req, res) => {
         `,
         [
           producedItem.item || primaryRoutingLiveRow.item || null,
-          routingId || primaryRoutingLiveRow.routing_id || null,
+          mainRoutingId || primaryRoutingLiveRow.routing_id || null,
           priority,
           0,
           HARD_CODED_LOAD_DATETIME,
@@ -2907,7 +2902,10 @@ router.put("/modify-bom", async (req, res) => {
       );
 
       const liveCoProductRoutingMap = new Map(
-        liveCoProductRoutingRows.map((row) => [buildRoutingKey(row), row])
+        liveCoProductRoutingRows.map((row) => [
+          buildRoutingKey(row, resource),
+          row,
+        ])
       );
 
       const requestedCoProductRoutingMap = new Map();
@@ -2916,7 +2914,8 @@ router.put("/modify-bom", async (req, res) => {
         const coProductItem = String(cp?.coProductItem || "").trim();
         if (!coProductItem) continue;
 
-        const key = [bomId, routingId, coProductItem, "1"].join("__");
+        const coProductRoutingId = buildRoutingId(coProductItem, resource);
+        const key = [bomId, coProductRoutingId, coProductItem, "1"].join("__");
         requestedCoProductRoutingMap.set(key, true);
 
         const existingRoutingRow = liveCoProductRoutingMap.get(key) || null;
@@ -2940,7 +2939,7 @@ router.put("/modify-bom", async (req, res) => {
             `,
             [
               coProductItem,
-              routingId,
+              coProductRoutingId,
               priority,
               1,
               HARD_CODED_LOAD_DATETIME,
@@ -2960,7 +2959,7 @@ router.put("/modify-bom", async (req, res) => {
             ...routingTemplate,
             bom_id: bomId,
             item: coProductItem,
-            routing_id: routingId,
+            routing_id: coProductRoutingId,
             erp_item_bom_routing_priority: priority,
             erp_item_bom_routing_min_lot_size:
               primaryRoutingLiveRow?.erp_item_bom_routing_min_lot_size ?? 1,
@@ -2992,15 +2991,15 @@ router.put("/modify-bom", async (req, res) => {
         consolidatedItems.add(coProductItem);
         consolidatedLocations.add(locationName);
         if (resource) consolidatedResources.add(resource);
-        consolidatedSummaryCategories.add("co-product information");
+        consolidatedSummaryCategories.add("routing information");
       }
 
       for (const row of liveCoProductRoutingRows) {
-        const key = buildRoutingKey(row);
+        const key = buildRoutingKey(row, resource);
         if (requestedCoProductRoutingMap.has(key)) continue;
 
         await deleteExactRowById(T.itemBomRouting, itemBomRoutingIdColumn, row);
-        consolidatedSummaryCategories.add("co-product information");
+        consolidatedSummaryCategories.add("routing information");
       }
 
       const liveConsumedResult = await client.query(
@@ -3017,10 +3016,7 @@ router.put("/modify-bom", async (req, res) => {
       );
 
       const liveConsumedRows = liveConsumedResult.rows || [];
-      const bomConsumedColumns = await getExistingColumns(
-        client,
-        T.bomConsumed
-      );
+      const bomConsumedColumns = await getExistingColumns(T.bomConsumed);
 
       await archiveManyRows({
         sourceTable: T.bomConsumed,
@@ -3434,11 +3430,69 @@ router.post("/item-bom-routing/create", async (req, res) => {
       return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
     };
 
+    const getResourceFromRoutingId = (value) => {
+      const parts = String(value || "")
+        .split("_")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      // Correct format: ROUTING_Item_resource
+      // Resource may contain underscores, so keep everything after ROUTING + Item.
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const buildRoutingId = (item, resourceValue) => {
+      const cleanItem = safeText(item);
+      const cleanResource = safeText(resourceValue);
+
+      if (!cleanItem || !cleanResource) return "";
+
+      return `ROUTING_${cleanItem}_${cleanResource}`;
+    };
+
     const changedByUserId = getOsUserName();
     const changedByUserName = getOsUserName();
 
     const resolvedMainItem = safeText(mainItem?.item) || safeText(producedItem);
-    const priorityNumber = Number(routingPriority);
+    const priorityNumber =
+      routingPriority === "" || routingPriority == null
+        ? null
+        : Number(routingPriority);
+
+    const resolvedResource =
+      safeText(resource) || getResourceFromRoutingId(routingId);
+
+    const resolvedMainRoutingId =
+      buildRoutingId(resolvedMainItem, resolvedResource) || safeText(routingId);
+
+    if (!bomId) {
+      return res.status(400).json({
+        success: false,
+        error: "bomId is required",
+      });
+    }
+
+    if (!resolvedMainItem) {
+      return res.status(400).json({
+        success: false,
+        error: "producedItem/mainItem is required",
+      });
+    }
+
+    if (!resolvedResource) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "resource is required or must be derivable from routingId in ROUTING_Item_resource format",
+      });
+    }
+
+    if (!resolvedMainRoutingId) {
+      return res.status(400).json({
+        success: false,
+        error: "routingId could not be derived",
+      });
+    }
 
     const normalizedCoProducts = addConnectedCoProduct
       ? safeArray(coProducts)
@@ -3446,8 +3500,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
             coProductItem: safeText(row?.coProductItem),
             itemDescription: safeText(row?.itemDescription),
             qtyProduced: safeText(row?.qtyProduced),
-            erp_co_product_association:
-              Number(row?.erp_co_product_association) === 1 ? 1 : 0,
+            erp_co_product_association: 1,
           }))
           .filter(
             (row) =>
@@ -3457,7 +3510,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
           )
       : [];
 
-    // backward compatibility if only single coProductItem came from old UI
+    // Backward compatibility if only single coProductItem came from old UI
     if (
       addConnectedCoProduct &&
       !normalizedCoProducts.length &&
@@ -3470,7 +3523,6 @@ router.post("/item-bom-routing/create", async (req, res) => {
         erp_co_product_association: 1,
       });
     }
-
 
     await client.query("BEGIN");
     transactionStarted = true;
@@ -3489,11 +3541,14 @@ router.post("/item-bom-routing/create", async (req, res) => {
     // ---------------------------------------------------------
     // 1) INSERT MAIN produced item row into item_bom_routing
     // MAIN item must always have co-product association = 0
+    // Routing ID format: ROUTING_MainItem_resource
     // ---------------------------------------------------------
     const mainItemBomRoutingData = {
-      routing_id: routingId,
+      routing_id: resolvedMainRoutingId,
       bom_id: bomId,
       item: resolvedMainItem,
+      location,
+      resource: resolvedResource,
       erp_item_bom_routing_priority: priorityNumber,
       erp_item_bom_routing_min_lot_size: 1,
       erp_item_bom_routing_lot_size_increment: 1,
@@ -3537,12 +3592,17 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
         if (itemBomRoutingColumns.includes("routing_id")) {
           lookupConditions.push(`routing_id = $${idx++}`);
-          lookupValues.push(routingId);
+          lookupValues.push(resolvedMainRoutingId);
         }
 
         if (itemBomRoutingColumns.includes("bom_id")) {
           lookupConditions.push(`bom_id = $${idx++}`);
           lookupValues.push(bomId);
+        }
+
+        if (itemBomRoutingColumns.includes("item")) {
+          lookupConditions.push(`item = $${idx++}`);
+          lookupValues.push(resolvedMainItem);
         }
 
         if (lookupConditions.length > 0) {
@@ -3556,10 +3616,10 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
           if (idSelectColumn) {
             const lookupQuery = `
-              SELECT ${idSelectColumn} AS resolved_id
+              SELECT ${quoteIdent(idSelectColumn)} AS resolved_id
               FROM ${pgRef(T.itemBomRouting)}
               WHERE ${lookupConditions.join(" AND ")}
-              ORDER BY ${idSelectColumn} DESC
+              ORDER BY ${quoteIdent(idSelectColumn)} DESC
               LIMIT 1
             `;
 
@@ -3577,7 +3637,8 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
     // ---------------------------------------------------------
     // 2) INSERT co-product rows into item_bom_routing and bom_produced
-    // Only co-products should have association = 1
+    // Co-products must have association = 1
+    // Routing ID format: ROUTING_CoProductItem_resource
     // ---------------------------------------------------------
     for (const row of normalizedCoProducts) {
       const coProductItemValue = safeText(row.coProductItem);
@@ -3590,15 +3651,21 @@ router.post("/item-bom-routing/create", async (req, res) => {
         continue;
       }
 
+      const coProductRoutingId =
+        buildRoutingId(coProductItemValue, resolvedResource) ||
+        resolvedMainRoutingId;
+
       const coItemBomRoutingData = {
-        routing_id: routingId,
+        routing_id: coProductRoutingId,
         bom_id: bomId,
         item: coProductItemValue,
+        location,
+        resource: resolvedResource,
         erp_item_bom_routing_priority: priorityNumber,
         erp_item_bom_routing_min_lot_size: 1,
         erp_item_bom_routing_lot_size_increment: 1,
         erp_item_bom_routing_wip_sweep_priority: 1,
-        erp_co_product_association: row.erp_co_product_association === 1 ? 1 : 0,
+        erp_co_product_association: 1,
         erp_item_bom_routing_max_lot_size: null,
         engineering_change_id: engineeringChangeId,
         change_type: "Added",
@@ -3704,11 +3771,11 @@ router.post("/item-bom-routing/create", async (req, res) => {
     }
 
     if (changeLogColumns.includes("resource")) {
-      changeLogData.resource = resource;
+      changeLogData.resource = resolvedResource;
     }
 
     if (changeLogColumns.includes("resources")) {
-      changeLogData.resources = resource;
+      changeLogData.resources = resolvedResource;
     }
 
     if (changeLogColumns.includes("summarynotes")) {
@@ -3757,18 +3824,22 @@ router.post("/item-bom-routing/create", async (req, res) => {
         trxnSetId,
         postgresqlRecId,
         recId: changeLogRecId,
-        routingId,
+        routingId: resolvedMainRoutingId,
         bomId,
         producedItem: resolvedMainItem,
         itemDescription: safeText(itemDescription),
         itemReleaseFlag: safeText(itemReleaseFlag),
         location,
-        resource,
+        resource: resolvedResource,
         resourceRelevancy: safeText(resourceRelevancy),
         consumedItem: resolvedConsumedItem,
         changedByUserId,
         changedByUserName,
-        coProducts: normalizedCoProducts,
+        coProducts: normalizedCoProducts.map((row) => ({
+          ...row,
+          routingId: buildRoutingId(row.coProductItem, resolvedResource),
+          resource: resolvedResource,
+        })),
         insertedItemBomRoutingIds,
         insertedBomProducedIds,
       },
@@ -3777,9 +3848,11 @@ router.post("/item-bom-routing/create", async (req, res) => {
     if (transactionStarted) {
       await client.query("ROLLBACK");
     }
+
     console.error("DB Error (item-bom-routing/create):", error);
 
     return res.status(500).json({
+      success: false,
       error: "Failed to create item BOM routing record",
       details: error.message,
     });
@@ -3805,33 +3878,25 @@ router.get("/delete-bom/summary", async (req, res) => {
 
     const summaryResult = await pool.query(
       `
-        WITH ranked_produced AS (
-          SELECT
-            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
-            TRIM(CAST(bp.item AS TEXT)) AS produced_item,
-            TRIM(CAST(bp.location AS TEXT)) AS location,
-            '' AS produced_item_desc,
-            ROW_NUMBER() OVER (
-              PARTITION BY TRIM(CAST(bp.bom_id AS TEXT))
-              ORDER BY
-                CASE
-                  WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
-                    THEN 0
-                  ELSE 1
-                END,
-                TRIM(CAST(bp.item AS TEXT))
-            ) AS rn
-          FROM ${pgRef(T.bomProduced)} bp
-          WHERE TRIM(CAST(bp.bom_id AS TEXT)) = ANY($1::text[])
-        )
         SELECT
-          bom_id,
-          produced_item,
-          produced_item_desc,
-          location
-        FROM ranked_produced
-        WHERE rn = 1
-        ORDER BY bom_id
+          TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
+          TRIM(CAST(bp.item AS TEXT)) AS produced_item,
+          TRIM(CAST(bp.location AS TEXT)) AS location,
+          CASE
+            WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
+              THEN ''
+            ELSE '1'
+          END AS erp_co_product_association
+        FROM ${pgRef(T.bomProduced)} bp
+        WHERE TRIM(CAST(bp.bom_id AS TEXT)) = ANY($1::text[])
+        ORDER BY
+          TRIM(CAST(bp.bom_id AS TEXT)),
+          CASE
+            WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
+              THEN 0
+            ELSE 1
+          END,
+          TRIM(CAST(bp.item AS TEXT))
       `,
       [bomIds]
     );
@@ -3840,23 +3905,51 @@ router.get("/delete-bom/summary", async (req, res) => {
       `
         SELECT
           TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+          TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
           COALESCE(
             NULLIF(
               TRIM(
-                CAST(
-                  regexp_replace(CAST(ibr.routing_id AS TEXT), '^.*_', '')
-                  AS TEXT
+                regexp_replace(
+                  TRIM(CAST(ibr.routing_id AS TEXT)),
+                  '^([^_]*_){2}',
+                  ''
                 )
               ),
               ''
             ),
             ''
           ) AS resource,
-          TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id
+          CONCAT(
+            'ROUTING_',
+            TRIM(CAST(ibr.item AS TEXT)),
+            '_',
+            COALESCE(
+              NULLIF(
+                TRIM(
+                  regexp_replace(
+                    TRIM(CAST(ibr.routing_id AS TEXT)),
+                    '^([^_]*_){2}',
+                    ''
+                  )
+                ),
+                ''
+              ),
+              ''
+            )
+          ) AS routing_id,
+          COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') AS erp_co_product_association
         FROM ${pgRef(T.itemBomRouting)} ibr
         WHERE TRIM(CAST(ibr.bom_id AS TEXT)) = ANY($1::text[])
+          AND ibr.routing_id IS NOT NULL
+          AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
         ORDER BY
           TRIM(CAST(ibr.bom_id AS TEXT)),
+          CASE
+            WHEN COALESCE(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), '') = '1'
+              THEN 1
+            ELSE 0
+          END,
+          TRIM(CAST(ibr.item AS TEXT)),
           TRIM(CAST(ibr.routing_id AS TEXT))
       `,
       [bomIds]
@@ -3899,6 +3992,7 @@ router.get("/delete-bom/summary", async (req, res) => {
     });
   } catch (error) {
     console.error("DB Error (delete-bom/summary):", error);
+
     return res.status(500).json({
       error: "Failed to fetch delete BOM summary",
       details: error.message,
@@ -3944,6 +4038,7 @@ router.post("/delete-bom/execute", async (req, res) => {
 
     if (!bomIds.length) {
       return res.status(400).json({
+        success: false,
         error: "bomIds must be a non-empty array",
       });
     }
@@ -3969,6 +4064,7 @@ router.post("/delete-bom/execute", async (req, res) => {
 
     const changeLogTable = T.changeLog;
     const changeLogExists = await pgTableExists(client, changeLogTable);
+
     if (!changeLogExists) {
       throw new Error("planning_bom_change_log_summary table does not exist");
     }
@@ -3981,6 +4077,7 @@ router.post("/delete-bom/execute", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
+      // Expected BOM format: BOM_Item_Location
       return parts.length >= 3 ? parts[1] : "";
     };
 
@@ -3990,7 +4087,9 @@ router.post("/delete-bom/execute", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      return parts.length >= 3 ? parts[2] : "";
+      // Expected BOM format: BOM_Item_Location
+      // Location may contain underscores, so keep all parts after item.
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
     };
 
     const getResourceFromRoutingId = (routingId) => {
@@ -3999,7 +4098,9 @@ router.post("/delete-bom/execute", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      return parts.length >= 4 ? parts.slice(3).join("_") : "";
+      // Correct routing format: ROUTING_Item_resource
+      // Resource may contain underscores, so keep all parts after ROUTING + Item.
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
     };
 
     const resourceByBomAndLocation = new Map();
@@ -4032,6 +4133,7 @@ router.post("/delete-bom/execute", async (req, res) => {
 
     const getResourceForBomAndLocation = (bomId, location) => {
       const key = `${toText(bomId)}__${toText(location)}`;
+
       if (resourceByBomAndLocation.has(key)) {
         return resourceByBomAndLocation.get(key);
       }
@@ -4057,6 +4159,7 @@ router.post("/delete-bom/execute", async (req, res) => {
       DELETE_BOM_SOURCE_TO_ARCHIVE
     )) {
       const archiveExists = await pgTableExists(client, archiveTable);
+
       if (!archiveExists) {
         throw new Error(`Archive table ${archiveTable} does not exist`);
       }
@@ -4071,6 +4174,7 @@ router.post("/delete-bom/execute", async (req, res) => {
       );
 
       const sourceRows = sourceResult.rows || [];
+
       if (!sourceRows.length) {
         continue;
       }
@@ -4103,34 +4207,42 @@ router.post("/delete-bom/execute", async (req, res) => {
           null;
 
         if (archivedRecId != null) {
+          if (!ogRecIds[archiveTable]) {
+            ogRecIds[archiveTable] = [];
+          }
+
           ogRecIds[archiveTable].push(String(archivedRecId));
+
           if (firstArchivedRecId == null) {
             firstArchivedRecId = archivedRecId;
           }
         }
 
         const producedItem =
-          row.produced_item ?? row.item ?? getProducedItemFromBomId(row.bom_id);
+          row.produced_item ??
+          row.item ??
+          getProducedItemFromBomId(row.bom_id);
 
-        const rowLocation = row.location ?? getLocationFromBomId(row.bom_id);
+        const rowLocation =
+          toText(row.location) || getLocationFromBomId(row.bom_id);
 
         const rowResource =
           toText(row.resource) ||
           getResourceFromRoutingId(row.routing_id) ||
-          getResourceForBomAndLocation(
-            row.bom_id,
-            row.location || getLocationFromBomId(row.bom_id)
-          );
+          getResourceForBomAndLocation(row.bom_id, rowLocation);
 
         if (row.bom_id) {
           consolidatedBomIds.add(String(row.bom_id).trim());
         }
+
         if (rowLocation) {
           consolidatedLocations.add(String(rowLocation).trim());
         }
+
         if (rowResource) {
           consolidatedResources.add(String(rowResource).trim());
         }
+
         if (producedItem) {
           consolidatedProducedItems.add(String(producedItem).trim());
         }
@@ -4141,6 +4253,15 @@ router.post("/delete-bom/execute", async (req, res) => {
 
       const deletedCount = await deleteRowsByBomId(client, sourceTable, bomIds);
       movedCounts[sourceTable] = deletedCount;
+    }
+
+    if (totalDeletedRecords === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error: "No matching BOM records found for deletion",
+      });
     }
 
     const deletedBomIdCount = consolidatedBomIds.size;
@@ -4174,9 +4295,11 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("rec_id")) {
       consolidatedChangeLogRow.rec_id = generateUniqueBigInt();
     }
+
     if (changeLogColumns.includes("record_id")) {
       consolidatedChangeLogRow.record_id = generateUniqueBigInt();
     }
+
     if (changeLogColumns.includes("postgresql_rec_id")) {
       consolidatedChangeLogRow.postgresql_rec_id = firstArchivedRecId;
     }
@@ -4184,6 +4307,7 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("engineering_change_id")) {
       consolidatedChangeLogRow.engineering_change_id = engineeringChangeId;
     }
+
     if (changeLogColumns.includes("engineeringchangeid")) {
       consolidatedChangeLogRow.engineeringchangeid = engineeringChangeId;
     }
@@ -4191,6 +4315,7 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("change_type")) {
       consolidatedChangeLogRow.change_type = "Deleted";
     }
+
     if (changeLogColumns.includes("changetype")) {
       consolidatedChangeLogRow.changetype = "Deleted";
     }
@@ -4199,9 +4324,14 @@ router.post("/delete-bom/execute", async (req, res) => {
       consolidatedChangeLogRow.target_table = "consolidated tables";
     }
 
+    if (changeLogColumns.includes("target_tables")) {
+      consolidatedChangeLogRow.target_tables = consolidatedTargetTableText;
+    }
+
     if (changeLogColumns.includes("bom_id")) {
       consolidatedChangeLogRow.bom_id = consolidatedBomIdText;
     }
+
     if (changeLogColumns.includes("bom_ids")) {
       consolidatedChangeLogRow.bom_ids = consolidatedBomIdText;
     }
@@ -4209,6 +4339,7 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("produced_item")) {
       consolidatedChangeLogRow.produced_item = consolidatedProducedItemText;
     }
+
     if (changeLogColumns.includes("item")) {
       consolidatedChangeLogRow.item = consolidatedProducedItemText;
     }
@@ -4216,6 +4347,7 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("location")) {
       consolidatedChangeLogRow.location = consolidatedLocationText;
     }
+
     if (changeLogColumns.includes("locations")) {
       consolidatedChangeLogRow.locations = consolidatedLocationText;
     }
@@ -4223,6 +4355,7 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("resource")) {
       consolidatedChangeLogRow.resource = consolidatedResourceText;
     }
+
     if (changeLogColumns.includes("resources")) {
       consolidatedChangeLogRow.resources = consolidatedResourceText;
     }
@@ -4230,9 +4363,11 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("summarynotes")) {
       consolidatedChangeLogRow.summarynotes = notes || "";
     }
+
     if (changeLogColumns.includes("notes")) {
       consolidatedChangeLogRow.notes = notes || "";
     }
+
     if (changeLogColumns.includes("change_summary")) {
       consolidatedChangeLogRow.change_summary = consolidatedChangeSummary;
     }
@@ -4240,9 +4375,11 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("user_name")) {
       consolidatedChangeLogRow.user_name = changedBy;
     }
+
     if (changeLogColumns.includes("created_by")) {
       consolidatedChangeLogRow.created_by = changedBy;
     }
+
     if (changeLogColumns.includes("updated_by")) {
       consolidatedChangeLogRow.updated_by = changedBy;
     }
@@ -4250,19 +4387,17 @@ router.post("/delete-bom/execute", async (req, res) => {
     if (changeLogColumns.includes("change_date")) {
       consolidatedChangeLogRow.change_date = chicagoNowText;
     }
+
     if (changeLogColumns.includes("created_at")) {
       consolidatedChangeLogRow.created_at = chicagoNowText;
     }
+
     if (changeLogColumns.includes("created_on")) {
       consolidatedChangeLogRow.created_on = chicagoNowText;
     }
 
     if (changeLogColumns.includes("status")) {
       consolidatedChangeLogRow.status = "COMPLETED";
-    }
-
-    if (changeLogColumns.includes("target_tables")) {
-      consolidatedChangeLogRow.target_tables = consolidatedTargetTableText;
     }
 
     const {
@@ -4292,9 +4427,16 @@ router.post("/delete-bom/execute", async (req, res) => {
       ogRecIds,
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Rollback Error (delete-bom/execute):", rollbackError);
+    }
+
     console.error("DB Error (delete-bom/execute):", error);
+
     return res.status(500).json({
+      success: false,
       error: "Failed to delete and archive selected BOM records",
       details: error.message,
     });
@@ -4514,7 +4656,6 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
   try {
     const records = Array.isArray(req.body?.records) ? req.body.records : [];
     const notes = String(req.body?.notes ?? "").trim();
-
     const changedBy = getSystemUserName(req);
 
     const getChicagoDateTimeFormatted = () => {
@@ -4541,8 +4682,95 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
     };
 
+    const normalizeTextLocal = (value) => String(value ?? "").trim();
+
+    const getLocationFromBomId = (bomId) => {
+      const value = normalizeTextLocal(bomId);
+      if (!value) return "";
+
+      const parts = value
+        .split("_")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const getResourceFromRoutingId = (routingId) => {
+      const value = normalizeTextLocal(routingId);
+      if (!value) return "";
+
+      const parts = value
+        .split("_")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      // Required frontend/display format: ROUTING_item_resource
+      // Resource is everything after the second underscore.
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const getSourceRowsForRecord = async (record) => {
+      const recId = normalizeTextLocal(record?.rec_id);
+      const bomId = normalizeTextLocal(record?.bom_id);
+      const item = normalizeTextLocal(record?.item);
+      const routingId = normalizeTextLocal(record?.routing_id);
+      const resource = normalizeTextLocal(
+        record?.resource || getResourceFromRoutingId(routingId)
+      );
+
+      if (recId) {
+        return client.query(
+          `
+            SELECT *
+            FROM ${pgRef(T.itemBomRouting)}
+            WHERE TRIM(CAST(rec_id AS TEXT)) = $1
+          `,
+          [recId]
+        );
+      }
+
+      const conditions = [];
+      const params = [];
+      let p = 1;
+
+      if (bomId) {
+        conditions.push(`TRIM(CAST(bom_id AS TEXT)) = $${p++}`);
+        params.push(bomId);
+      }
+
+      if (item) {
+        conditions.push(`TRIM(CAST(item AS TEXT)) = $${p++}`);
+        params.push(item);
+      }
+
+      if (resource) {
+        conditions.push(
+          `TRIM(regexp_replace(TRIM(CAST(routing_id AS TEXT)), '^([^_]*_){2}', '')) = $${p++}`
+        );
+        params.push(resource);
+      } else if (routingId) {
+        conditions.push(`TRIM(CAST(routing_id AS TEXT)) = $${p++}`);
+        params.push(routingId);
+      }
+
+      if (!conditions.length) {
+        return { rows: [] };
+      }
+
+      return client.query(
+        `
+          SELECT *
+          FROM ${pgRef(T.itemBomRouting)}
+          WHERE ${conditions.join(" AND ")}
+        `,
+        params
+      );
+    };
+
     if (!records.length) {
       return res.status(400).json({
+        success: false,
         error: "records must be a non-empty array",
       });
     }
@@ -4554,6 +4782,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     const archiveExists = await pgTableExists(client, archiveTable);
     if (!archiveExists) {
       return res.status(500).json({
+        success: false,
         error: "item_bom_routing_og table does not exist",
       });
     }
@@ -4564,6 +4793,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     );
     if (!bomProducedArchiveExists) {
       return res.status(500).json({
+        success: false,
         error: "bom_produced_og table does not exist",
       });
     }
@@ -4571,6 +4801,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     const changeLogExists = await pgTableExists(client, changeLogTable);
     if (!changeLogExists) {
       return res.status(500).json({
+        success: false,
         error: "planning_bom_change_log_summary table does not exist",
       });
     }
@@ -4594,6 +4825,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
     let movedCount = 0;
     let bomProducedDeletedCount = 0;
+    let firstArchivedPostgresqlRecId = null;
 
     const processedLiveKeys = new Set();
     const processedBomProducedMatchKeys = new Set();
@@ -4603,61 +4835,8 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     const consolidatedResources = new Set();
     const consolidatedProducedItems = new Set();
 
-    let firstArchivedPostgresqlRecId = null;
-
-    const getLocationFromBomId = (bomId) => {
-      const value = String(bomId || "").trim();
-      if (!value) return "";
-      const parts = value
-        .split("_")
-        .map((p) => p.trim())
-        .filter(Boolean);
-      return parts.length >= 3 ? parts.slice(2).join("_") : "";
-    };
-
-    const getResourceFromRoutingId = (routingId) => {
-      const value = String(routingId || "").trim();
-      if (!value) return "";
-      const parts = value
-        .split("_")
-        .map((p) => p.trim())
-        .filter(Boolean);
-      return parts.length >= 4 ? parts.slice(3).join("_") : "";
-    };
-
     for (const record of records) {
-      const recId = String(record?.rec_id ?? "").trim();
-      const bomId = String(record?.bom_id ?? "").trim();
-      const routingId = String(record?.routing_id ?? "").trim();
-
-      if (!recId && !bomId && !routingId) {
-        continue;
-      }
-
-      const conditions = [];
-      const params = [];
-      let p = 1;
-
-      if (recId) {
-        conditions.push(`TRIM(CAST(rec_id AS TEXT)) = $${p++}`);
-        params.push(recId);
-      }
-      if (bomId) {
-        conditions.push(`TRIM(CAST(bom_id AS TEXT)) = $${p++}`);
-        params.push(bomId);
-      }
-      if (routingId) {
-        conditions.push(`TRIM(CAST(routing_id AS TEXT)) = $${p++}`);
-        params.push(routingId);
-      }
-
-      const sourceQuery = `
-        SELECT *
-        FROM ${pgRef(T.itemBomRouting)}
-        WHERE ${conditions.join(" AND ")}
-      `;
-
-      const sourceResult = await client.query(sourceQuery, params);
+      const sourceResult = await getSourceRowsForRecord(record);
       const sourceRows = sourceResult.rows || [];
 
       for (const sourceRow of sourceRows) {
@@ -4672,6 +4851,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           if (processedLiveKeys.has(liveUniqueKey)) {
             continue;
           }
+
           processedLiveKeys.add(liveUniqueKey);
 
           const archiveRow = { ...row };
@@ -4760,28 +4940,33 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
           if (archivedPostgresqlRecId != null) {
             archivedRecIds.push(String(archivedPostgresqlRecId));
+
             if (firstArchivedPostgresqlRecId == null) {
               firstArchivedPostgresqlRecId = archivedPostgresqlRecId;
             }
           }
 
-          const producedItem = row.produced_item ?? row.item ?? "";
-          const derivedLocation =
-            row.location ?? getLocationFromBomId(row.bom_id);
-          const derivedResource =
-            row.resource ?? getResourceFromRoutingId(row.routing_id);
+          const producedItem = normalizeTextLocal(
+            row.produced_item ?? row.item ?? ""
+          );
+          const derivedLocation = normalizeTextLocal(
+            row.location || getLocationFromBomId(row.bom_id)
+          );
+          const derivedResource = normalizeTextLocal(
+            row.resource || getResourceFromRoutingId(row.routing_id)
+          );
 
           if (row.bom_id) {
-            consolidatedBomIds.add(String(row.bom_id).trim());
+            consolidatedBomIds.add(normalizeTextLocal(row.bom_id));
           }
           if (derivedLocation) {
-            consolidatedLocations.add(String(derivedLocation).trim());
+            consolidatedLocations.add(derivedLocation);
           }
           if (derivedResource) {
-            consolidatedResources.add(String(derivedResource).trim());
+            consolidatedResources.add(derivedResource);
           }
           if (producedItem) {
-            consolidatedProducedItems.add(String(producedItem).trim());
+            consolidatedProducedItems.add(producedItem);
           }
 
           if (isTruthyCoProductAssociation(row)) {
@@ -4827,6 +5012,15 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           movedCount += 1;
         }
       }
+    }
+
+    if (movedCount === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        error: "No matching item_bom_routing records found for deletion",
+      });
     }
 
     const consolidatedBomIdText = Array.from(consolidatedBomIds)
@@ -4896,7 +5090,8 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     }
 
     if (changeLogColumns.includes("produced_item")) {
-      consolidatedChangeLogRow.produced_item = consolidatedProducedItemText;
+      consolidatedChangeLogRow.produced_item =
+        consolidatedProducedItemText;
     }
     if (changeLogColumns.includes("item")) {
       consolidatedChangeLogRow.item = consolidatedProducedItemText;
@@ -4972,9 +5167,16 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       archivedBomProducedRecIds,
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Rollback Error (delete-item-bom-routing/execute):", rollbackError);
+    }
+
     console.error("DB Error (delete-item-bom-routing/execute):", error);
+
     return res.status(500).json({
+      success: false,
       error: "Failed to delete item BOM routing records",
       details: error.message,
     });
@@ -7513,32 +7715,106 @@ router.post("/download-bom-excel", async (req, res) => {
 router.post("/item-details/by-items", async (req, res) => {
   try {
     const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+
     const items = Array.from(
       new Set(rawItems.map((x) => String(x || "").trim()).filter(Boolean))
     );
 
     if (!items.length) {
-      return res.status(200).json({ success: true, data: [] });
+      return res.status(200).json({
+        success: true,
+        data: [],
+      });
+    }
+
+    const upperItems = items.map((x) => x.toUpperCase());
+
+    // Get actual existing columns from PostgreSQL item details table
+    const columnResult = await pool.query(
+      `
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = $2
+      `,
+      [PG_SCHEMA, T.itemDetails]
+    );
+
+    const existingColumns = new Set(
+      (columnResult.rows || []).map((row) =>
+        String(row.column_name || "").trim().toLowerCase()
+      )
+    );
+
+    if (!existingColumns.has("item")) {
+      return res.status(500).json({
+        success: false,
+        error: "item column does not exist in item details table",
+      });
+    }
+
+    const hasItemDesc = existingColumns.has("item_desc");
+    const hasItemDescription = existingColumns.has("item_description");
+
+    let itemDescSql = "''";
+    let itemDescriptionSql = "''";
+
+    if (hasItemDesc && hasItemDescription) {
+      itemDescSql = `
+        COALESCE(
+          NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
+          NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
+          ''
+        )
+      `;
+
+      itemDescriptionSql = `
+        COALESCE(
+          NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
+          NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
+          ''
+        )
+      `;
+    } else if (hasItemDescription) {
+      itemDescSql = `
+        COALESCE(
+          NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
+          ''
+        )
+      `;
+
+      itemDescriptionSql = `
+        COALESCE(
+          NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
+          ''
+        )
+      `;
+    } else if (hasItemDesc) {
+      itemDescSql = `
+        COALESCE(
+          NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
+          ''
+        )
+      `;
+
+      itemDescriptionSql = `
+        COALESCE(
+          NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
+          ''
+        )
+      `;
     }
 
     const result = await pool.query(
       `
         SELECT
           TRIM(CAST(item AS TEXT)) AS item,
-          COALESCE(
-            NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
-            NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
-            ''
-          ) AS item_desc,
-          COALESCE(
-            NULLIF(TRIM(CAST(item_description AS TEXT)), ''),
-            NULLIF(TRIM(CAST(item_desc AS TEXT)), ''),
-            ''
-          ) AS item_description
+          ${itemDescSql} AS item_desc,
+          ${itemDescriptionSql} AS item_description
         FROM ${pgRef(T.itemDetails)}
         WHERE UPPER(TRIM(CAST(item AS TEXT))) = ANY($1)
       `,
-      [items.map((x) => x.toUpperCase())]
+      [upperItems]
     );
 
     return res.status(200).json({
@@ -7547,6 +7823,7 @@ router.post("/item-details/by-items", async (req, res) => {
     });
   } catch (error) {
     console.error("DB Error (item-details/by-items):", error);
+
     return res.status(500).json({
       success: false,
       error: "Failed to fetch item details",
