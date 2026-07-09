@@ -190,10 +190,9 @@ export async function performScheduledGcpSync() {
     item_bom_routing,
   };
 
- 
-const result = await validateAndLoadAllCsv(payload, {
-  skipDuplicateExistenceCheck: true,
-});
+  const result = await validateAndLoadAllCsv(payload, {
+    skipValidation: true,
+  });
 
   return {
     result,
@@ -263,15 +262,9 @@ router.post("/sync-gcp-to-postgres", async (req, res) => {
       source: "sync-gcp-to-postgres",
       fetchedCounts,
       inserted: result.inserted || {},
-      reportFileName: result.report?.reportFileName || null,
-      reportDownloadUrl: result.report?.reportFileName
-        ? `/api/bom-upload/report/${result.report.reportFileName}`
-        : null,
-      message:
-        "BigQuery tables fetched, validated, and loaded into PostgreSQL successfully.",
+      message: "BigQuery tables fetched and loaded into PostgreSQL successfully.",
     });
   } catch (err) {
-    console.error("sync-gcp-to-postgres error:", err);
     return res.status(500).json({
       status: "ERROR",
       message: err.message || "Unexpected sync error",

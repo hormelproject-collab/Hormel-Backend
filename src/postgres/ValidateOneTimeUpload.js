@@ -337,6 +337,37 @@ export async function validateAndLoadAllCsv(payload = {}, options = {}) {
     };
   }
 
+  const skipValidation = Boolean(options.skipValidation);
+
+  if (skipValidation) {
+    const normalized = normalizeForPostgresInsert(uploadedTables);
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const inserted = {
+        bom_parameters: await insertRows(client, "bom_parameters", normalized.bom_parameters),
+        bom_produced: await insertRows(client, "bom_produced", normalized.bom_produced),
+        bom_consumed: await insertRows(client, "bom_consumed", normalized.bom_consumed),
+        item_bom_routing: await insertRows(client, "item_bom_routing", normalized.item_bom_routing),
+      };
+
+      await client.query("COMMIT");
+
+      return {
+        ok: true,
+        inserted,
+        report: null,
+      };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   // 1) Validate with GCP validator
   const validation = await validateWithGCP(uploadedTables, options);
 
