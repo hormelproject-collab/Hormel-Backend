@@ -108,29 +108,10 @@ app.listen(PORT, () => {
   cron.schedule(
     SCHEDULE_TIME,
     async () => {
-      console.log(
-        `[scheduler] Running scheduled GCP->Postgres sync at Chicago time: ${new Date().toISOString()}`
-      );
-
       try {
-        const { result, fetchedCounts } = await performScheduledGcpSync();
-
-        if (!result.ok) {
-          console.error(
-            `[scheduler] Validation failed: ${result.errorCount} errors`,
-            result.errorsPreview?.slice(0, 10)
-          );
-          return;
-        }
-
-        console.log(
-          `[scheduler] Sync success. inserted=`,
-          result.inserted,
-          `fetchedCounts=`,
-          fetchedCounts
-        );
+        await performScheduledGcpSync();
       } catch (error) {
-        console.error("[scheduler] Scheduled sync error:", error);
+        console.error(error);
       }
     },
     {
@@ -138,7 +119,4 @@ app.listen(PORT, () => {
     }
   );
 
-  console.log(
-    `✅ Scheduled daily Chicago-time sync: ${SCHEDULE_TIME} (America/Chicago)`
-  );
 });
