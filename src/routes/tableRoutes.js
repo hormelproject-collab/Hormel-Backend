@@ -5,6 +5,7 @@ import appConfig from "../config/appConfig.js";
 import crypto from "crypto";
 import XLSX from "xlsx";
 import os from "os";
+import { fetchItemMasterReleaseDetailsByItems } from "../services/bigqueryService.js";
 
 const router = express.Router();
 
@@ -1644,8 +1645,93 @@ router.get("/existing-bom-details", async (req, res) => {
       });
     }
 
+    const normalizeText = (value) =>
+      value == null ? "" : String(value).trim();
+
+    const normalizeItemKey = (value) =>
+      normalizeText(value).toUpperCase();
+
+    const normalizeItemDetailsToMap = (detailsResult) => {
+      if (detailsResult instanceof Map) {
+        const map = new Map();
+
+        for (const [key, value] of detailsResult.entries()) {
+          const itemKey = normalizeItemKey(key || value?.item);
+          if (!itemKey) continue;
+
+          map.set(itemKey, {
+            item: normalizeText(value?.item ?? key),
+            item_desc: normalizeText(
+              value?.item_desc ??
+                value?.item_description ??
+                value?.description
+            ),
+            item_release_flag: normalizeText(
+              value?.item_release_flag ??
+                value?.item_releaseflag ??
+                value?.release
+            ),
+          });
+        }
+
+        return map;
+      }
+
+      if (Array.isArray(detailsResult)) {
+        const map = new Map();
+
+        detailsResult.forEach((row) => {
+          const itemKey = normalizeItemKey(row?.item);
+          if (!itemKey) return;
+
+          map.set(itemKey, {
+            item: normalizeText(row?.item),
+            item_desc: normalizeText(
+              row?.item_desc ??
+                row?.item_description ??
+                row?.description
+            ),
+            item_release_flag: normalizeText(
+              row?.item_release_flag ??
+                row?.item_releaseflag ??
+                row?.release
+            ),
+          });
+        });
+
+        return map;
+      }
+
+      if (detailsResult && typeof detailsResult === "object") {
+        const map = new Map();
+
+        Object.entries(detailsResult).forEach(([key, value]) => {
+          const itemKey = normalizeItemKey(key || value?.item);
+          if (!itemKey) return;
+
+          map.set(itemKey, {
+            item: normalizeText(value?.item ?? key),
+            item_desc: normalizeText(
+              value?.item_desc ??
+                value?.item_description ??
+                value?.description
+            ),
+            item_release_flag: normalizeText(
+              value?.item_release_flag ??
+                value?.item_releaseflag ??
+                value?.release
+            ),
+          });
+        });
+
+        return map;
+      }
+
+      return new Map();
+    };
+
     const parseBomIdParts = (value) => {
-      const text = String(value ?? "").trim();
+      const text = normalizeText(value);
 
       if (!text) {
         return {
@@ -1673,7 +1759,7 @@ router.get("/existing-bom-details", async (req, res) => {
     };
 
     const parseResourceFromRoutingId = (routingId) => {
-      const text = String(routingId ?? "").trim();
+      const text = normalizeText(routingId);
       if (!text) return "";
 
       const parts = text.split("_");
@@ -1682,7 +1768,15 @@ router.get("/existing-bom-details", async (req, res) => {
       return parts.slice(2).join("_").trim();
     };
 
-    const { bomVersion, producedItem, location } = parseBomIdParts(bomId);
+    const parsed = parseBomIdParts(bomId);
+
+    /**
+     * Prefer query values if frontend sends them.
+     * Fallback to parsed BOM ID.
+     */
+    const producedItem = normalizeText(req.query.producedItem) || parsed.producedItem;
+    const location = normalizeText(req.query.location) || parsed.location;
+    const bomVersion = parsed.bomVersion;
 
     const resourcesQuery = `
       SELECT DISTINCT
@@ -1696,14 +1790,16 @@ router.get("/existing-bom-details", async (req, res) => {
     const resourcesResult = await client.query(resourcesQuery, [bomId]);
 
     const resourceMap = new Map();
+
     (resourcesResult.rows || []).forEach((row, index) => {
-      const routingId = String(row.routing_id ?? "").trim();
+      const routingId = normalizeText(row.routing_id);
       if (!routingId) return;
 
       const resource = parseResourceFromRoutingId(routingId);
       if (!resource) return;
 
       const key = resource.toUpperCase();
+
       if (!resourceMap.has(key)) {
         resourceMap.set(key, {
           id: `resource-${index + 1}`,
@@ -1725,67 +1821,134 @@ router.get("/existing-bom-details", async (req, res) => {
 
     const componentsResult = await client.query(componentsQuery, [bomId]);
 
-    const components = (componentsResult.rows || []).map((row, index) => ({
-      id: row.rec_id ?? `component-${index + 1}`,
-      component_item: row.component_item ?? "",
-      item_description: "",
-      standard_usage: row.standard_usage ?? "",
-    }));
-
     const coProductsQuery = `
-  SELECT DISTINCT ON (UPPER(TRIM(ibr.item)))
-    COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
-    TRIM(ibr.item) AS co_product_item,
-    bp.erp_bom_qty_produced_per AS qty_produced_per
-  FROM ${pgRef(T.itemBomRouting)} ibr
-  LEFT JOIN ${pgRef(T.bomProduced)} bp
-    ON TRIM(COALESCE(bp.bom_id, '')) = TRIM(COALESCE(ibr.bom_id, ''))
-   AND TRIM(COALESCE(bp.item, '')) = TRIM(COALESCE(ibr.item, ''))
-  WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
-    AND COALESCE(ibr.erp_co_product_association, 0) = 1
-    AND TRIM(COALESCE(ibr.item, '')) <> TRIM($2)
-  ORDER BY UPPER(TRIM(ibr.item)), COALESCE(bp.rec_id, ibr.rec_id) NULLS LAST
-`;
+      SELECT DISTINCT ON (UPPER(TRIM(ibr.item)))
+        COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
+        TRIM(ibr.item) AS co_product_item,
+        bp.erp_bom_qty_produced_per AS qty_produced_per
+      FROM ${pgRef(T.itemBomRouting)} ibr
+      LEFT JOIN ${pgRef(T.bomProduced)} bp
+        ON TRIM(COALESCE(bp.bom_id, '')) = TRIM(COALESCE(ibr.bom_id, ''))
+       AND TRIM(COALESCE(bp.item, '')) = TRIM(COALESCE(ibr.item, ''))
+      WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
+        AND COALESCE(ibr.erp_co_product_association, 0) = 1
+        AND TRIM(COALESCE(ibr.item, '')) <> TRIM($2)
+      ORDER BY UPPER(TRIM(ibr.item)), COALESCE(bp.rec_id, ibr.rec_id) NULLS LAST
+    `;
 
     const coProductsResult = await client.query(coProductsQuery, [
       bomId,
       producedItem,
     ]);
 
-    const coProductMap = new Map();
-    (coProductsResult.rows || []).forEach((row, index) => {
-      const item = String(row.co_product_item ?? "").trim();
-      if (!item) return;
+    const componentRows = componentsResult.rows || [];
+    const coProductRows = coProductsResult.rows || [];
 
-      const key = item.toUpperCase();
-      if (!coProductMap.has(key)) {
-        coProductMap.set(key, {
-          id: row.rec_id ?? `coproduct-${index + 1}`,
-          co_product_item: item,
-          item_description: "",
-          qty_produced_per: row.qty_produced_per ?? "",
-        });
-      }
+    /**
+     * Collect all items for GCP enrichment:
+     * - produced item
+     * - component item(s)
+     * - co-product item(s)
+     */
+    const allItems = [
+      producedItem,
+      ...componentRows.map((row) => row.component_item),
+      ...coProductRows.map((row) => row.co_product_item),
+    ]
+      .map((value) => normalizeText(value))
+      .filter(Boolean);
+
+    const uniqueItems = [...new Set(allItems)];
+
+    const itemDetailsRaw =
+      await fetchItemMasterReleaseDetailsByItems(uniqueItems);
+
+    const itemDetailsMap = normalizeItemDetailsToMap(itemDetailsRaw);
+
+    const getItemDetails = (item) => {
+      const key = normalizeItemKey(item);
+
+      return (
+        itemDetailsMap.get(key) || {
+          item: normalizeText(item),
+          item_desc: "",
+          item_release_flag: "",
+        }
+      );
+    };
+
+    const producedDetails = getItemDetails(producedItem);
+
+    const components = componentRows.map((row, index) => {
+      const componentItem = normalizeText(row.component_item);
+      const details = getItemDetails(componentItem);
+
+      return {
+        id: row.rec_id ?? `component-${index + 1}`,
+
+        component_item: componentItem,
+
+        // Explicit separate fields for frontend
+        item: componentItem,
+        item_desc: details.item_desc || "",
+        item_description: details.item_desc || "",
+
+        standard_usage: row.standard_usage ?? "",
+      };
+    });
+
+    const coProductMap = new Map();
+
+    coProductRows.forEach((row, index) => {
+      const coProductItem = normalizeText(row.co_product_item);
+      if (!coProductItem) return;
+
+      const key = coProductItem.toUpperCase();
+      if (coProductMap.has(key)) return;
+
+      const details = getItemDetails(coProductItem);
+
+      coProductMap.set(key, {
+        id: row.rec_id ?? `coproduct-${index + 1}`,
+
+        co_product_item: coProductItem,
+
+        // Explicit separate fields for frontend
+        item: coProductItem,
+        item_desc: details.item_desc || "",
+        item_description: details.item_desc || "",
+
+        qty_produced_per: row.qty_produced_per ?? "",
+      });
     });
 
     const coProducts = Array.from(coProductMap.values());
 
     return res.json({
       status: "SUCCESS",
+
       selectedBom: {
         bom_id: bomId,
         bom_version: bomVersion,
         location,
         produced_item: producedItem,
-        produced_item_desc: "",
-        item_release_flag: "",
+
+        // From GCP item_master.item_desc
+        produced_item_desc: producedDetails.item_desc || "",
+
+        // From GCP item_mrp_rls_flg.release
+        item_release_flag: producedDetails.item_release_flag || "",
       },
+
       resources: Array.from(resourceMap.values()),
+
       components,
+
       coProducts,
     });
   } catch (error) {
     console.error("DB Error (existing-bom-details):", error);
+
     return res.status(500).json({
       status: "ERROR",
       message: "Failed to fetch existing BOM details",
@@ -1802,6 +1965,8 @@ router.get("/existing-bom-details", async (req, res) => {
  * Optional fallback route if frontend reloads page and only route param id is present.
  * This is useful because your frontend currently supports a fallback by id as well.
  */
+
+
 router.get("/existing-bom-details-by-id/:id", async (req, res) => {
   const client = await pool.connect();
 
@@ -1816,16 +1981,17 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
     }
 
     /**
-     * Since frontend passes row.id which may be bom_id or generated id depending on source,
-     * this fallback tries item_bom_routing by bom_id first.
+     * Initial load:
+     * PostgreSQL gives BOM structure.
+     * GCP BigQuery gives:
+     * - item_desc from item_master
+     * - item_release_flag from item_mrp_rls_flg.release
      */
     const headerQuery = `
       SELECT
         bom_id,
         location,
-        item AS produced_item,
-        item_description AS produced_item_desc,
-        item_release_flag
+        item AS produced_item
       FROM ${pgRef(T.itemBomRouting)}
       WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
       ORDER BY bom_id
@@ -1862,7 +2028,6 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
       SELECT
         rec_id,
         item AS component_item,
-        item_description,
         erp_bom_quantity_consumed_per AS standard_usage
       FROM ${pgRef(T.bomConsumed)}
       WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
@@ -1875,7 +2040,6 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
       SELECT
         COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
         ibr.item AS co_product_item,
-        COALESCE(bp.item_description, ibr.item_description, '') AS item_description,
         bp.erp_bom_qty_produced_per AS qty_produced_per
       FROM ${pgRef(T.itemBomRouting)} ibr
       LEFT JOIN ${pgRef(T.bomProduced)} bp
@@ -1885,44 +2049,124 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
       WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
         AND TRIM(COALESCE(ibr.location, '')) = TRIM($2)
         AND TRIM(COALESCE(ibr.item, '')) <> TRIM($3)
-        AND COALESCE(ibr.co_product_association, 0) = 1
+        AND COALESCE(ibr.erp_co_product_association, 0) = 1
       ORDER BY COALESCE(bp.rec_id, ibr.rec_id) NULLS LAST, ibr.item
     `;
 
-    const [resourcesResult, componentsResult, coProductsResult] = await Promise.all([
-      client.query(resourcesQuery, [bomId, location, producedItem]),
-      client.query(componentsQuery, [bomId, location, producedItem]),
-      client.query(coProductsQuery, [bomId, location, producedItem]),
-    ]);
+    const [resourcesResult, componentsResult, coProductsResult] =
+      await Promise.all([
+        client.query(resourcesQuery, [bomId, location, producedItem]),
+        client.query(componentsQuery, [bomId, location, producedItem]),
+        client.query(coProductsQuery, [bomId, location, producedItem]),
+      ]);
+
+    const componentRows = componentsResult.rows || [];
+    const coProductRows = coProductsResult.rows || [];
+
+    /**
+     * Collect all items that need GCP enrichment:
+     * - produced item
+     * - component items
+     * - co-product items
+     */
+    const allItems = [
+      producedItem,
+      ...componentRows.map((row) => row.component_item),
+      ...coProductRows.map((row) => row.co_product_item),
+    ]
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean);
+
+    /**
+     * Helper should fetch:
+     * - item_desc from GCP item_master
+     * - item_release_flag from GCP item_mrp_rls_flg.release
+     *
+     * Expected return:
+     * Map keyed by UPPER(item)
+     * {
+     *   item,
+     *   item_desc,
+     *   item_release_flag
+     * }
+     */
+    const itemDetailsMap = await fetchItemMasterReleaseDetailsByItems(allItems);
+
+    const getItemDetails = (item) => {
+      const key = String(item ?? "").trim().toUpperCase();
+
+      return (
+        itemDetailsMap.get(key) || {
+          item: String(item ?? "").trim(),
+          item_desc: "",
+          item_release_flag: "",
+        }
+      );
+    };
+
+    const producedDetails = getItemDetails(producedItem);
 
     return res.json({
       status: "SUCCESS",
+
       selectedBom: {
         bom_id: bomId,
         location,
         produced_item: producedItem,
-        produced_item_desc: header.produced_item_desc ?? "",
-        item_release_flag: header.item_release_flag ?? "",
+
+        // From GCP item_master.item_desc
+        produced_item_desc: producedDetails.item_desc || "",
+
+        // From GCP item_mrp_rls_flg.release
+        item_release_flag: producedDetails.item_release_flag || "",
       },
+
       resources: (resourcesResult.rows || []).map((row, index) => ({
         id: `resource-${index + 1}`,
         resource: row.resource ?? "",
       })),
-      components: (componentsResult.rows || []).map((row, index) => ({
-        id: row.rec_id ?? `component-${index + 1}`,
-        component_item: row.component_item ?? "",
-        item_description: row.item_description ?? "",
-        standard_usage: row.standard_usage ?? "",
-      })),
-      coProducts: (coProductsResult.rows || []).map((row, index) => ({
-        id: row.rec_id ?? `coproduct-${index + 1}`,
-        co_product_item: row.co_product_item ?? "",
-        item_description: row.item_description ?? "",
-        qty_produced_per: row.qty_produced_per ?? "",
-      })),
+
+      components: componentRows.map((row, index) => {
+        const componentItem = row.component_item ?? "";
+        const details = getItemDetails(componentItem);
+
+        return {
+          id: row.rec_id ?? `component-${index + 1}`,
+
+          // Keep existing frontend field
+          component_item: componentItem,
+
+          // Explicit separate fields
+          item: componentItem,
+          item_desc: details.item_desc || "",
+          item_description: details.item_desc || "",
+
+          standard_usage: row.standard_usage ?? "",
+        };
+      }),
+
+      coProducts: coProductRows.map((row, index) => {
+        const coProductItem = row.co_product_item ?? "";
+        const details = getItemDetails(coProductItem);
+
+        return {
+          id: row.rec_id ?? `coproduct-${index + 1}`,
+
+          // Keep existing frontend field
+          co_product_item: coProductItem,
+
+          // Explicit separate fields
+          item: coProductItem,
+          item_desc: details.item_desc || "",
+          item_description: details.item_desc || "",
+
+          qty_produced_per: row.qty_produced_per ?? "",
+        };
+      }),
     });
   } catch (error) {
     console.error("DB Error (existing-bom-details-by-id):", error);
+
     return res.status(500).json({
       status: "ERROR",
       message: "Failed to fetch existing BOM details by id",

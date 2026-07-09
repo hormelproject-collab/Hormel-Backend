@@ -584,7 +584,153 @@ export const fetchFromTable = async (tableName, filters = {}, limit = null) => {
 
   return runPgQuery(query, params);
 };
+export const fetchItemMasterReleaseDetailsByItems = async (items = []) => {
+  const uniqueItems = [
+    ...new Set(
+      (items || [])
+        .map((x) => String(x ?? "").trim())
+        .filter(Boolean)
+    ),
+  ];
 
+  if (!uniqueItems.length) return new Map();
+
+  const itemMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
+  const releaseFlagColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
+
+  const itemColumn = findColumn(itemMasterColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
+  const itemDescColumn = findColumn(itemMasterColumns, [
+    "item_desc",
+    "item_description",
+    "description",
+    "item_desc_1",
+  ]);
+
+  const releaseItemColumn = findColumn(releaseFlagColumns, [
+    "item",
+    "item_id",
+    "item_number",
+    "itemNumber",
+  ]);
+
+  const releaseColumn = findColumn(releaseFlagColumns, [
+    "release",
+    "release_flag",
+    "releaseflag",
+    "item_releaseflag",
+    "item_release_flag",
+    "item_mrp_rls_flg",
+    "planning_release_flag",
+    "status",
+  ]);
+
+  if (!itemColumn) {
+    throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
+  }
+
+  const itemDescExpr = itemDescColumn
+    ? `COALESCE(CAST(im.${qCol(itemDescColumn)} AS STRING), '')`
+    : `''`;
+
+  const releaseFlagCte =
+    releaseItemColumn && releaseColumn
+      ? `
+      release_flag_base AS (
+        SELECT
+          UPPER(TRIM(CAST(${qCol(releaseItemColumn)} AS STRING))) AS item_key,
+          ANY_VALUE(COALESCE(CAST(${qCol(releaseColumn)} AS STRING), '')) AS item_release_flag
+        FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemReleaseFlag)}
+        WHERE ${qCol(releaseItemColumn)} IS NOT NULL
+          AND TRIM(CAST(${qCol(releaseItemColumn)} AS STRING)) != ''
+          AND UPPER(TRIM(CAST(${qCol(releaseItemColumn)} AS STRING))) IN UNNEST(@itemKeys)
+        GROUP BY item_key
+      ),`
+      : `
+      release_flag_base AS (
+        SELECT
+          CAST(NULL AS STRING) AS item_key,
+          CAST(NULL AS STRING) AS item_release_flag
+        FROM UNNEST([]) AS empty_rows
+      ),`;
+
+  const rows = await runQuery(
+    `
+      WITH item_master_raw AS (
+        SELECT
+          UPPER(TRIM(CAST(im.${qCol(itemColumn)} AS STRING))) AS item_key,
+          TRIM(CAST(im.${qCol(itemColumn)} AS STRING)) AS item,
+          ${itemDescExpr} AS item_desc
+        FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemMaster)} im
+        WHERE im.${qCol(itemColumn)} IS NOT NULL
+          AND TRIM(CAST(im.${qCol(itemColumn)} AS STRING)) != ''
+          AND UPPER(TRIM(CAST(im.${qCol(itemColumn)} AS STRING))) IN UNNEST(@itemKeys)
+      ),
+
+      item_master_base AS (
+        SELECT
+          item_key,
+          item,
+          item_desc
+        FROM (
+          SELECT
+            *,
+            ROW_NUMBER() OVER (
+              PARTITION BY item_key
+              ORDER BY
+                CASE WHEN TRIM(item_desc) != '' THEN 0 ELSE 1 END,
+                item
+            ) AS rn
+          FROM item_master_raw
+        )
+        WHERE rn = 1
+      ),
+
+      ${releaseFlagCte}
+
+      joined_rows AS (
+        SELECT
+          im.item_key,
+          im.item,
+          im.item_desc,
+          COALESCE(rf.item_release_flag, '') AS item_release_flag
+        FROM item_master_base im
+        LEFT JOIN release_flag_base rf
+          ON rf.item_key = im.item_key
+      )
+
+      SELECT
+        item_key,
+        item,
+        item_desc,
+        item_release_flag
+      FROM joined_rows
+    `,
+    {
+      itemKeys: uniqueItems.map((x) => x.toUpperCase()),
+    }
+  );
+
+  const map = new Map();
+
+  (rows || []).forEach((row) => {
+    const key = String(row.item_key ?? row.item ?? "").trim().toUpperCase();
+    if (!key) return;
+
+    map.set(key, {
+      item: normalizeText(row.item),
+      item_desc: normalizeText(row.item_desc),
+      item_release_flag: normalizeText(row.item_release_flag),
+    });
+  });
+
+  return map;
+};
 export const fetchItemMasterWithReleaseFlag = async ({
   page = 1,
   pageSize = 50,
@@ -599,8 +745,12 @@ export const fetchItemMasterWithReleaseFlag = async ({
   const safeOffset = (safePage - 1) * safePageSize;
   const searchText = normalizeText(search);
 
-  const itemMasterColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
-  const releaseFlagColumns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
+  const itemMasterColumns = await getBigQueryTableColumns(
+    BQ_TABLE_KEYS.itemMaster
+  );
+  const releaseFlagColumns = await getBigQueryTableColumns(
+    BQ_TABLE_KEYS.itemReleaseFlag
+  );
 
   const itemColumn = findColumn(itemMasterColumns, [
     "item",
@@ -640,7 +790,9 @@ export const fetchItemMasterWithReleaseFlag = async ({
   ]);
 
   if (!itemColumn) {
-    throw new Error(`${appConfig.bigQuery.tables.itemMaster}: item column not found`);
+    throw new Error(
+      `${appConfig.bigQuery.tables.itemMaster}: item column not found`
+    );
   }
 
   const itemDescExpr = itemDescColumn
