@@ -1174,10 +1174,13 @@ router.post("/locations-by-items", async (req, res) => {
 router.get("/existing-bom-search", async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(
-      100,
-      Math.max(1, Number.parseInt(req.query.pageSize, 10) || 50)
-    );
+
+    // No hard cap here.
+    // Frontend should send pageSize = 50.
+    // LIMIT/OFFSET below is only for backend pagination.
+    const requestedPageSize = Number.parseInt(req.query.pageSize, 10) || 50;
+    const pageSize = Math.max(1, requestedPageSize);
+
     const offset = (page - 1) * pageSize;
 
     const normalizeField = (value) => {
@@ -1244,16 +1247,12 @@ router.get("/existing-bom-search", async (req, res) => {
 
       const rows = await runBigQuery(
         `
-          SELECT DISTINCT UPPER(TRIM(CAST(item AS STRING))) AS item
+          SELECT DISTINCT
+            UPPER(TRIM(CAST(item AS STRING))) AS item
           FROM ${bqTableRefByKey("itemMaster")}
           WHERE item IS NOT NULL
             AND TRIM(CAST(item AS STRING)) != ''
-            AND (
-              LOWER(COALESCE(CAST(item_description AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(description AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(item_desc AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(item_desc_1 AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-            )
+            AND LOWER(COALESCE(CAST(item_desc AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
         `,
         { q }
       );
@@ -1267,17 +1266,12 @@ router.get("/existing-bom-search", async (req, res) => {
 
       const rows = await runBigQuery(
         `
-          SELECT DISTINCT UPPER(TRIM(CAST(item AS STRING))) AS item
+          SELECT DISTINCT
+            UPPER(TRIM(CAST(item AS STRING))) AS item
           FROM ${bqTableRefByKey("itemReleaseFlag")}
           WHERE item IS NOT NULL
             AND TRIM(CAST(item AS STRING)) != ''
-            AND (
-              LOWER(COALESCE(CAST(item_releaseflag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(release_flag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(releaseflag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(mrp_release_flag AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-              OR LOWER(COALESCE(CAST(item_mrp_rls_flg AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
-            )
+            AND LOWER(COALESCE(CAST(release AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
         `,
         { q }
       );
@@ -1341,23 +1335,7 @@ router.get("/existing-bom-search", async (req, res) => {
 
     const producedResult = await pool.query(
       `
-        WITH produced_all AS (
-          SELECT
-            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
-            TRIM(CAST(bp.item AS TEXT)) AS produced_item,
-            TRIM(CAST(bp.location AS TEXT)) AS location,
-            CASE
-              WHEN COALESCE(TRIM(CAST(bp.erp_bom_qty_produced_per AS TEXT)), '') IN ('1', '1.0', '1.00')
-                THEN ''
-              ELSE '1'
-            END AS inferred_co_product_association
-          FROM ${pgRef(T.bomProduced)} bp
-          WHERE bp.bom_id IS NOT NULL
-            AND TRIM(CAST(bp.bom_id AS TEXT)) <> ''
-            AND bp.item IS NOT NULL
-            AND TRIM(CAST(bp.item AS TEXT)) <> ''
-        ),
-        routing_all AS (
+        WITH routing_main AS (
           SELECT
             TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
             TRIM(CAST(ibr.item AS TEXT)) AS produced_item,
@@ -1377,67 +1355,67 @@ router.get("/existing-bom-search", async (req, res) => {
               ''
             ) AS resource
           FROM ${pgRef(T.itemBomRouting)} ibr
-          WHERE ibr.routing_id IS NOT NULL
-            AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
-            AND ibr.bom_id IS NOT NULL
+          WHERE ibr.bom_id IS NOT NULL
             AND TRIM(CAST(ibr.bom_id AS TEXT)) <> ''
+            AND ibr.item IS NOT NULL
+            AND TRIM(CAST(ibr.item AS TEXT)) <> ''
+            AND ibr.routing_id IS NOT NULL
+            AND TRIM(CAST(ibr.routing_id AS TEXT)) <> ''
+            AND COALESCE(
+                  NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), ''),
+                  '0'
+                ) <> '1'
         ),
         base_rows AS (
-          SELECT
-            pa.bom_id,
-            pa.produced_item,
-            pa.location,
-            COALESCE(ra.resource, '') AS resource,
+          SELECT DISTINCT
+            rm.bom_id,
+            rm.produced_item,
+            COALESCE(TRIM(CAST(bp.location AS TEXT)), '') AS location,
+            rm.resource,
             CASE
-              WHEN COALESCE(ra.resource, '') <> ''
-                THEN CONCAT('ROUTING_', pa.produced_item, '_', ra.resource)
-              ELSE ''
+              WHEN COALESCE(rm.resource, '') <> ''
+                THEN CONCAT('ROUTING_', rm.produced_item, '_', rm.resource)
+              ELSE rm.original_routing_id
             END AS routing_id,
-            COALESCE(
-              NULLIF(ra.erp_co_product_association, ''),
-              pa.inferred_co_product_association,
-              ''
-            ) AS erp_co_product_association
-          FROM produced_all pa
-          LEFT JOIN routing_all ra
-            ON ra.bom_id = pa.bom_id
-           AND UPPER(TRIM(CAST(ra.produced_item AS TEXT))) =
-               UPPER(TRIM(CAST(pa.produced_item AS TEXT)))
+            rm.erp_co_product_association
+          FROM routing_main rm
+          LEFT JOIN ${pgRef(T.bomProduced)} bp
+            ON TRIM(CAST(bp.bom_id AS TEXT)) = rm.bom_id
+           AND UPPER(TRIM(CAST(bp.item AS TEXT))) =
+               UPPER(TRIM(CAST(rm.produced_item AS TEXT)))
+          WHERE rm.bom_id IS NOT NULL
+            AND TRIM(CAST(rm.bom_id AS TEXT)) <> ''
+            AND rm.produced_item IS NOT NULL
+            AND TRIM(CAST(rm.produced_item AS TEXT)) <> ''
         ),
         filtered_rows AS (
           SELECT *
           FROM base_rows
           ${whereClause}
         ),
-        page_boms AS (
+        counted_rows AS (
           SELECT
-            bom_id,
-            MIN(produced_item) AS sort_item,
+            *,
             COUNT(*) OVER() AS total_count
           FROM filtered_rows
-          GROUP BY bom_id
-          ORDER BY bom_id, MIN(produced_item)
-          LIMIT ${limitParam}
-          OFFSET ${offsetParam}
         )
         SELECT
-          br.bom_id,
-          br.produced_item,
-          br.location,
-          br.resource,
-          br.routing_id,
-          br.erp_co_product_association,
-          pb.total_count
-        FROM base_rows br
-        INNER JOIN page_boms pb
-          ON pb.bom_id = br.bom_id
+          bom_id,
+          produced_item,
+          location,
+          resource,
+          routing_id,
+          erp_co_product_association,
+          total_count
+        FROM counted_rows
         ORDER BY
-          br.bom_id,
-          br.resource,
-          br.location,
-          CASE WHEN br.erp_co_product_association = '1' THEN 1 ELSE 0 END,
-          br.produced_item,
-          br.routing_id
+          bom_id,
+          produced_item,
+          location,
+          resource,
+          routing_id
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
       `,
       pgParams
     );
@@ -1461,7 +1439,9 @@ router.get("/existing-bom-search", async (req, res) => {
     const itemMasterRows = allPageItems.length
       ? await runBigQuery(
           `
-            SELECT *
+            SELECT
+              item,
+              item_desc
             FROM ${bqTableRefByKey("itemMaster")}
             WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
           `,
@@ -1472,7 +1452,9 @@ router.get("/existing-bom-search", async (req, res) => {
     const releaseFlagRows = allPageItems.length
       ? await runBigQuery(
           `
-            SELECT *
+            SELECT
+              item,
+              release
             FROM ${bqTableRefByKey("itemReleaseFlag")}
             WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
           `,
@@ -1486,16 +1468,8 @@ router.get("/existing-bom-search", async (req, res) => {
       const itemKey = normalizeUpper(row.item);
       if (!itemKey) continue;
 
-      const description = normalizeText(
-        row.item_description ??
-          row.description ??
-          row.item_desc ??
-          row.item_desc_1 ??
-          ""
-      );
-
       if (!itemDescMap.has(itemKey)) {
-        itemDescMap.set(itemKey, description);
+        itemDescMap.set(itemKey, normalizeText(row.item_desc ?? ""));
       }
     }
 
@@ -1505,39 +1479,24 @@ router.get("/existing-bom-search", async (req, res) => {
       const itemKey = normalizeUpper(row.item);
       if (!itemKey) continue;
 
-      const releaseFlag = normalizeText(
-        row.item_releaseflag ??
-          row.release_flag ??
-          row.releaseflag ??
-          row.mrp_release_flag ??
-          row.item_mrp_rls_flg ??
-          ""
-      );
-
       if (!releaseFlagMap.has(itemKey)) {
-        releaseFlagMap.set(itemKey, releaseFlag);
+        releaseFlagMap.set(itemKey, normalizeText(row.release ?? ""));
       }
     }
 
-    const mergedRows = producedRows.map((row) => {
+    const mergedRows = producedRows.map((row, index) => {
       const bomId = normalizeText(row.bom_id);
       const producedItem = normalizeText(row.produced_item);
       const itemKey = normalizeUpper(producedItem);
       const location = normalizeText(row.location);
       const resource = normalizeText(row.resource);
+
       const routingId = resource
         ? `ROUTING_${producedItem}_${resource}`
         : normalizeText(row.routing_id);
 
-      const erpCoProductAssociation = normalizeText(
-        row.erp_co_product_association
-      );
-
-      const rowType =
-        erpCoProductAssociation === "1" ? "COPRODUCT" : "MAIN";
-
       return {
-        id: `${bomId}__${resource || "NORESOURCE"}__${location}__${producedItem}__${rowType}`,
+        id: `${bomId}__${resource || "NORESOURCE"}__${location || "NOLOCATION"}__${producedItem}__MAIN__${offset + index}`,
         location,
         produced_item: producedItem,
         produced_item_desc: itemDescMap.get(itemKey) ?? "",
@@ -1545,8 +1504,7 @@ router.get("/existing-bom-search", async (req, res) => {
         resource,
         routing_id: routingId,
         item_release_flag: releaseFlagMap.get(itemKey) ?? "",
-        erp_co_product_association:
-          erpCoProductAssociation === "1" ? "1" : "",
+        erp_co_product_association: "",
       };
     });
 
@@ -1576,7 +1534,6 @@ router.get("/existing-bom-search", async (req, res) => {
     });
   }
 });
-
 
 
 router.get("/existing-bom-details", async (req, res) => {
@@ -2462,6 +2419,36 @@ router.put("/modify-bom", async (req, res) => {
       throw new Error("Could not resolve primary id column for bom_parameters");
     }
 
+    const itemBomRoutingColumns = await getExistingColumns(client, T.itemBomRouting);
+    const itemBomRoutingResourceColumn = itemBomRoutingColumns.includes("resource")
+      ? "resource"
+      : itemBomRoutingColumns.includes("Resource")
+        ? "Resource"
+        : null;
+
+    const buildRoutingUpdateQuery = ({ includeResource }) => {
+      const setParts = [
+        "item = $1",
+        "routing_id = $2",
+        "erp_item_bom_routing_priority = $3",
+        "erp_co_product_association = $4",
+        "load_datetime = $5",
+      ];
+
+      if (includeResource && itemBomRoutingResourceColumn) {
+        setParts.push(`${quoteIdent(itemBomRoutingResourceColumn)} = $6`);
+      }
+
+      const idParamIndex = includeResource && itemBomRoutingResourceColumn ? 7 : 6;
+
+      return `
+        UPDATE ${pgRef(T.itemBomRouting)}
+        SET
+          ${setParts.join(",\n          ")}
+        WHERE ${quoteIdent(itemBomRoutingIdColumn)} = $${idParamIndex}
+      `;
+    };
+
     const consolidatedLocations = new Set();
     const consolidatedResources = new Set();
     const consolidatedSummaryCategories = new Set();
@@ -2710,10 +2697,14 @@ router.put("/modify-bom", async (req, res) => {
 
         if (!coProductItem) continue;
 
+        const coProductResource =
+          toText(cp?.resource) || getResourceFromRoutingId(cp?.routingId) || resource;
+
         const key = [bomId, locationName, coProductItem].join("__");
         requestedCoProductMap.set(key, {
           coProductItem,
           standardUsage,
+          resource: coProductResource,
         });
 
         const existingRow = liveCoProductMap.get(key) || null;
@@ -2784,7 +2775,7 @@ router.put("/modify-bom", async (req, res) => {
 
         consolidatedItems.add(coProductItem);
         consolidatedLocations.add(locationName);
-        if (resource) consolidatedResources.add(resource);
+        if (coProductResource) consolidatedResources.add(coProductResource);
         consolidatedSummaryCategories.add("co-product information");
       }
 
@@ -2796,24 +2787,28 @@ router.put("/modify-bom", async (req, res) => {
         consolidatedSummaryCategories.add("co-product information");
       }
 
+      /*
+        IMPORTANT CHANGE:
+        Fetch all routing rows for this BOM ID instead of filtering only by the main resource.
+        This lets newly added co-products use their own selected resource and routing_id.
+      */
       const liveRoutingResult = await client.query(
         `
         SELECT *
         FROM ${pgRef(T.itemBomRouting)}
         WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-          AND TRIM(regexp_replace(TRIM(CAST(routing_id AS TEXT)), '^([^_]*_){2}', '')) = $2
         ORDER BY load_datetime DESC NULLS LAST, ${quoteIdent(
           itemBomRoutingIdColumn
         )} DESC
         `,
-        [bomId, resource]
+        [bomId]
       );
 
       const liveRoutingRows = liveRoutingResult.rows || [];
 
       if (!liveRoutingRows.length) {
         throw new Error(
-          `No matching item_bom_routing rows found for bom_id=${bomId}, resource=${resource}`
+          `No matching item_bom_routing rows found for bom_id=${bomId}`
         );
       }
 
@@ -2821,7 +2816,13 @@ router.put("/modify-bom", async (req, res) => {
         liveRoutingRows.find(
           (row) =>
             toText(row.item) === toText(producedItem.item) &&
-            Number(row.erp_co_product_association ?? 0) !== 1
+            Number(row.erp_co_product_association ?? 0) !== 1 &&
+            getResourceFromRoutingId(row.routing_id) === resource
+        ) ||
+        liveRoutingRows.find(
+          (row) =>
+            Number(row.erp_co_product_association ?? 0) !== 1 &&
+            getResourceFromRoutingId(row.routing_id) === resource
         ) ||
         liveRoutingRows.find(
           (row) => Number(row.erp_co_product_association ?? 0) !== 1
@@ -2881,29 +2882,30 @@ router.put("/modify-bom", async (req, res) => {
       );
 
       await client.query(
-        `
-        UPDATE ${pgRef(T.itemBomRouting)}
-        SET
-          item = $1,
-          routing_id = $2,
-          erp_item_bom_routing_priority = $3,
-          erp_co_product_association = $4,
-          load_datetime = $5
-        WHERE ${quoteIdent(itemBomRoutingIdColumn)} = $6
-        `,
-        [
-          producedItem.item || primaryRoutingLiveRow.item || null,
-          mainRoutingId || primaryRoutingLiveRow.routing_id || null,
-          priority,
-          0,
-          HARD_CODED_LOAD_DATETIME,
-          primaryRoutingActualRecId,
-        ]
+        buildRoutingUpdateQuery({ includeResource: true }),
+        itemBomRoutingResourceColumn
+          ? [
+              producedItem.item || primaryRoutingLiveRow.item || null,
+              mainRoutingId || primaryRoutingLiveRow.routing_id || null,
+              priority,
+              0,
+              HARD_CODED_LOAD_DATETIME,
+              resource,
+              primaryRoutingActualRecId,
+            ]
+          : [
+              producedItem.item || primaryRoutingLiveRow.item || null,
+              mainRoutingId || primaryRoutingLiveRow.routing_id || null,
+              priority,
+              0,
+              HARD_CODED_LOAD_DATETIME,
+              primaryRoutingActualRecId,
+            ]
       );
 
       const liveCoProductRoutingMap = new Map(
         liveCoProductRoutingRows.map((row) => [
-          buildRoutingKey(row, resource),
+          buildRoutingKey(row, getResourceFromRoutingId(row.routing_id)),
           row,
         ])
       );
@@ -2914,7 +2916,19 @@ router.put("/modify-bom", async (req, res) => {
         const coProductItem = String(cp?.coProductItem || "").trim();
         if (!coProductItem) continue;
 
-        const coProductRoutingId = buildRoutingId(coProductItem, resource);
+        const coProductResource =
+          String(cp?.resource || "").trim() ||
+          getResourceFromRoutingId(cp?.routingId) ||
+          resource;
+
+        if (!coProductResource) {
+          throw new Error(`Resource is required for co-product ${coProductItem}`);
+        }
+
+        const coProductRoutingId =
+          buildRoutingId(coProductItem, coProductResource) ||
+          String(cp?.routingId || "").trim();
+
         const key = [bomId, coProductRoutingId, coProductItem, "1"].join("__");
         requestedCoProductRoutingMap.set(key, true);
 
@@ -2927,24 +2941,25 @@ router.put("/modify-bom", async (req, res) => {
           );
 
           await client.query(
-            `
-            UPDATE ${pgRef(T.itemBomRouting)}
-            SET
-              item = $1,
-              routing_id = $2,
-              erp_item_bom_routing_priority = $3,
-              erp_co_product_association = $4,
-              load_datetime = $5
-            WHERE ${quoteIdent(itemBomRoutingIdColumn)} = $6
-            `,
-            [
-              coProductItem,
-              coProductRoutingId,
-              priority,
-              1,
-              HARD_CODED_LOAD_DATETIME,
-              existingRoutingRecId,
-            ]
+            buildRoutingUpdateQuery({ includeResource: true }),
+            itemBomRoutingResourceColumn
+              ? [
+                  coProductItem,
+                  coProductRoutingId,
+                  priority,
+                  1,
+                  HARD_CODED_LOAD_DATETIME,
+                  coProductResource,
+                  existingRoutingRecId,
+                ]
+              : [
+                  coProductItem,
+                  coProductRoutingId,
+                  priority,
+                  1,
+                  HARD_CODED_LOAD_DATETIME,
+                  existingRoutingRecId,
+                ]
           );
         } else {
           const routingColumns = await getExistingColumns(
@@ -2960,6 +2975,9 @@ router.put("/modify-bom", async (req, res) => {
             bom_id: bomId,
             item: coProductItem,
             routing_id: coProductRoutingId,
+            ...(itemBomRoutingResourceColumn
+              ? { [itemBomRoutingResourceColumn]: coProductResource }
+              : {}),
             erp_item_bom_routing_priority: priority,
             erp_item_bom_routing_min_lot_size:
               primaryRoutingLiveRow?.erp_item_bom_routing_min_lot_size ?? 1,
@@ -2990,12 +3008,12 @@ router.put("/modify-bom", async (req, res) => {
 
         consolidatedItems.add(coProductItem);
         consolidatedLocations.add(locationName);
-        if (resource) consolidatedResources.add(resource);
+        if (coProductResource) consolidatedResources.add(coProductResource);
         consolidatedSummaryCategories.add("routing information");
       }
 
       for (const row of liveCoProductRoutingRows) {
-        const key = buildRoutingKey(row, resource);
+        const key = buildRoutingKey(row, getResourceFromRoutingId(row.routing_id));
         if (requestedCoProductRoutingMap.has(key)) continue;
 
         await deleteExactRowById(T.itemBomRouting, itemBomRoutingIdColumn, row);
@@ -3374,6 +3392,151 @@ router.get("/bom-routing-step1/bom-ids", async (req, res) => {
   }
 });
 
+router.post("/item-bom-routing/validate-priority", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const safeText = (value) => String(value ?? "").trim();
+
+    const {
+      bomId = "",
+      resource = "",
+      routingId = "",
+      routingPriority = "",
+    } = req.body || {};
+
+    const getResourceFromRoutingId = (value) => {
+      const text = String(value || "").trim();
+
+      if (!text) return "";
+
+      const parts = text
+        .split("_")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      // Correct format: ROUTING_Item_resource
+      // Resource can contain underscores, so everything after 2nd part is resource.
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const resolvedBomId = safeText(bomId);
+    const resolvedResource = safeText(resource) || getResourceFromRoutingId(routingId);
+    const resolvedPriority = safeText(routingPriority);
+
+    if (!resolvedBomId) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        duplicate: false,
+        error: "BOM ID is required",
+      });
+    }
+
+    if (!resolvedResource) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        duplicate: false,
+        error: "Resource is required",
+      });
+    }
+
+    if (!resolvedPriority || Number.isNaN(Number(resolvedPriority))) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        duplicate: false,
+        error: "Item BOM Routing Priority is required",
+      });
+    }
+
+    const itemBomRoutingColumns = await getExistingColumns(client, T.itemBomRouting);
+
+    if (!itemBomRoutingColumns.includes("bom_id")) {
+      throw new Error(`${T.itemBomRouting}.bom_id column does not exist`);
+    }
+
+    if (!itemBomRoutingColumns.includes("erp_item_bom_routing_priority")) {
+      throw new Error(
+        `${T.itemBomRouting}.erp_item_bom_routing_priority column does not exist`
+      );
+    }
+
+    const hasResourceColumn = itemBomRoutingColumns.includes("resource");
+    const hasRoutingIdColumn = itemBomRoutingColumns.includes("routing_id");
+
+    if (!hasResourceColumn && !hasRoutingIdColumn) {
+      throw new Error(
+        `${T.itemBomRouting} must have resource or routing_id column for validation`
+      );
+    }
+
+    const resourceExpression = hasResourceColumn && hasRoutingIdColumn
+      ? `
+          COALESCE(
+            NULLIF(TRIM(CAST(resource AS TEXT)), ''),
+            NULLIF(
+              TRIM(regexp_replace(CAST(routing_id AS TEXT), '^ROUTING_[^_]*_', '')),
+              ''
+            )
+          )
+        `
+      : hasResourceColumn
+        ? `TRIM(CAST(resource AS TEXT))`
+        : `TRIM(regexp_replace(CAST(routing_id AS TEXT), '^ROUTING_[^_]*_', ''))`;
+
+    const duplicateQuery = `
+      SELECT
+        bom_id,
+        ${hasResourceColumn ? "resource" : "NULL AS resource"},
+        ${hasRoutingIdColumn ? "routing_id" : "NULL AS routing_id"},
+        item,
+        erp_item_bom_routing_priority,
+        erp_co_product_association
+      FROM ${pgRef(T.itemBomRouting)}
+      WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+        AND UPPER(${resourceExpression}) = UPPER($2)
+        AND TRIM(CAST(erp_item_bom_routing_priority AS TEXT)) = $3
+      LIMIT 1
+    `;
+
+    const duplicateResult = await client.query(duplicateQuery, [
+      resolvedBomId,
+      resolvedResource,
+      resolvedPriority,
+    ]);
+
+    if (duplicateResult.rows.length > 0) {
+      return res.status(200).json({
+        success: true,
+        valid: false,
+        duplicate: true,
+        error: `Priority ${resolvedPriority} already exists for BOM ID ${resolvedBomId} and Resource ${resolvedResource}. Please enter a different priority.`,
+        data: duplicateResult.rows[0],
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      valid: true,
+      duplicate: false,
+      message: `Priority ${resolvedPriority} is available for BOM ID ${resolvedBomId} and Resource ${resolvedResource}.`,
+    });
+  } catch (error) {
+    console.error("DB Error (item-bom-routing/validate-priority):", error);
+
+    return res.status(500).json({
+      success: false,
+      valid: false,
+      duplicate: false,
+      error: "Failed to validate item BOM routing priority",
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
 /* =========================================================
    4) CREATE ITEM BOM ROUTING + CHANGE LOG
 ========================================================= */
@@ -3406,7 +3569,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
     const safeText = (value) => String(value ?? "").trim();
     const safeArray = (value) => (Array.isArray(value) ? value : []);
 
-    const MAIN_ITEM_ASSOCIATION = 0;
+    const MAIN_ITEM_ASSOCIATION = null;
     const CO_PRODUCT_ASSOCIATION = 1;
 
     const getChicagoDateTimeFormatted = () => {
@@ -3583,23 +3746,6 @@ router.post("/item-bom-routing/create", async (req, res) => {
     const insertedMainItemBomRouting = await client.query(
       mainItemInsert.query,
       mainItemInsert.values
-    );
-
-    // Safety update to guarantee main item flag is 0
-    await client.query(
-      `
-        UPDATE ${pgRef(T.itemBomRouting)}
-        SET erp_co_product_association = $1
-        WHERE TRIM(CAST(bom_id AS TEXT)) = $2
-          AND TRIM(CAST(item AS TEXT)) = $3
-          AND TRIM(CAST(routing_id AS TEXT)) = $4
-      `,
-      [
-        MAIN_ITEM_ASSOCIATION,
-        bomId,
-        resolvedMainItem,
-        resolvedMainRoutingId,
-      ]
     );
 
     const mainInsertedRow = insertedMainItemBomRouting.rows?.[0] || {};
