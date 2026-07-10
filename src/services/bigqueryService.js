@@ -193,26 +193,14 @@ const normalizeExistingBomSearchField = (field) => {
   return EXISTING_BOM_SEARCH_FIELDS.has(value) ? value : "";
 };
 
-const getItemsByDescriptionForExistingBom = async (queryText) => {
-  const q = normalizeUpper(queryText);
-  if (!q) return [];
-
-  const columns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemMaster);
-  const itemColumn = findColumn(columns, ["item", "item_id", "item_number", "itemNumber"]);
-  const descColumn = findColumn(columns, [
-    "item_description",
-    "item_desc",
-    "description",
-    "item_desc_1",
-  ]);
-
-  if (!itemColumn || !descColumn) return [];
+const getItemsByDescriptionForExistingBom = async (searchText) => {
+  const q = `%${normalizeUpper(searchText)}%`;
 
   const rows = await runQuery(
     `
-      SELECT DISTINCT UPPER(TRIM(CAST(${qCol(itemColumn)} AS STRING))) AS item
+      SELECT DISTINCT UPPER(TRIM(CAST(item AS STRING))) AS item
       FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemMaster)}
-      WHERE UPPER(TRIM(CAST(${qCol(descColumn)} AS STRING))) = @q
+      WHERE UPPER(TRIM(CAST(COALESCE(item_desc, item_description, description, '') AS STRING))) LIKE @q
     `,
     { q }
   );
@@ -220,30 +208,24 @@ const getItemsByDescriptionForExistingBom = async (queryText) => {
   return rows.map((row) => normalizeUpper(row.item)).filter(Boolean);
 };
 
-const getItemsByReleaseFlagForExistingBom = async (queryText) => {
-  const q = normalizeUpper(queryText);
-  if (!q) return [];
-
-  const columns = await getBigQueryTableColumns(BQ_TABLE_KEYS.itemReleaseFlag);
-  const itemColumn = findColumn(columns, ["item", "item_id", "item_number", "itemNumber"]);
-  const releaseColumn = findColumn(columns, [
-    "release",
-    "release_flag",
-    "releaseflag",
-    "item_releaseflag",
-    "item_release_flag",
-    "item_mrp_rls_flg",
-    "planning_release_flag",
-    "status",
-  ]);
-
-  if (!itemColumn || !releaseColumn) return [];
+const getItemsByReleaseFlagForExistingBom = async (searchText) => {
+  const q = `%${normalizeUpper(searchText)}%`;
 
   const rows = await runQuery(
     `
-      SELECT DISTINCT UPPER(TRIM(CAST(${qCol(itemColumn)} AS STRING))) AS item
+      SELECT DISTINCT UPPER(TRIM(CAST(item AS STRING))) AS item
       FROM ${bqTableRefByKey(BQ_TABLE_KEYS.itemReleaseFlag)}
-      WHERE UPPER(TRIM(CAST(${qCol(releaseColumn)} AS STRING))) = @q
+      WHERE UPPER(TRIM(CAST(COALESCE(
+        release,
+        release_flag,
+        releaseflag,
+        item_releaseflag,
+        item_release_flag,
+        item_mrp_rls_flg,
+        planning_release_flag,
+        status,
+        ''
+      ) AS STRING))) LIKE @q
     `,
     { q }
   );
@@ -293,50 +275,70 @@ export const fetchExistingBomSearchRows = async ({
   const pgParams = [];
   const pgFilters = [];
 
-  const appendSearchFilter = async (field, value) => {
-    const q = normalizeText(value);
-    if (!field || !q) return false;
+const appendSearchFilter = async (field, value) => {
+  const q = normalizeText(value);
+  if (!field || !q) return false;
 
-    const upperQ = normalizeUpper(q);
+  const upperLikeQ = `%${normalizeUpper(q)}%`;
 
-    if (field === "location") {
-      pgFilters.push(`UPPER(TRIM(CAST(base.location AS TEXT))) = ${addPgParam(pgParams, upperQ)}`);
-      return false;
-    }
-
-    if (field === "produced_item") {
-      pgFilters.push(`UPPER(TRIM(CAST(base.produced_item AS TEXT))) = ${addPgParam(pgParams, upperQ)}`);
-      return false;
-    }
-
-    if (field === "bom_id") {
-      pgFilters.push(`UPPER(TRIM(CAST(base.bom_id AS TEXT))) = ${addPgParam(pgParams, upperQ)}`);
-      return false;
-    }
-
-    if (field === "produced_item_desc") {
-      const items = await getItemsByDescriptionForExistingBom(q);
-      if (!items.length) return true;
-      pgFilters.push(`UPPER(TRIM(CAST(base.produced_item AS TEXT))) = ANY(${addPgParam(pgParams, items)})`);
-      return false;
-    }
-
-    if (field === "item_release_flag") {
-      const items = await getItemsByReleaseFlagForExistingBom(q);
-      if (!items.length) return true;
-      pgFilters.push(`UPPER(TRIM(CAST(base.produced_item AS TEXT))) = ANY(${addPgParam(pgParams, items)})`);
-      return false;
-    }
-
-    if (field === "resource") {
-      const routingIds = await getRoutingIdsByResourceForExistingBom(q);
-      if (!routingIds.length) return true;
-      pgFilters.push(`UPPER(TRIM(CAST(base.routing_id AS TEXT))) = ANY(${addPgParam(pgParams, routingIds)})`);
-      return false;
-    }
-
+  if (field === "location") {
+    pgFilters.push(
+      `UPPER(TRIM(CAST(base.location AS TEXT))) LIKE ${addPgParam(pgParams, upperLikeQ)}`
+    );
     return false;
-  };
+  }
+
+  if (field === "produced_item") {
+    pgFilters.push(
+      `UPPER(TRIM(CAST(base.produced_item AS TEXT))) LIKE ${addPgParam(pgParams, upperLikeQ)}`
+    );
+    return false;
+  }
+
+  if (field === "bom_id") {
+    pgFilters.push(
+      `UPPER(TRIM(CAST(base.bom_id AS TEXT))) LIKE ${addPgParam(pgParams, upperLikeQ)}`
+    );
+    return false;
+  }
+
+  if (field === "resource") {
+    pgFilters.push(`
+      UPPER(
+        COALESCE(
+          NULLIF(
+            SUBSTRING(TRIM(CAST(base.routing_id AS TEXT)) FROM '^ROUTING_[^_]+_(.+)$'),
+            ''
+          ),
+          ''
+        )
+      ) LIKE ${addPgParam(pgParams, upperLikeQ)}
+    `);
+    return false;
+  }
+
+  if (field === "produced_item_desc") {
+    const items = await getItemsByDescriptionForExistingBom(q);
+    if (!items.length) return true;
+
+    pgFilters.push(
+      `UPPER(TRIM(CAST(base.produced_item AS TEXT))) = ANY(${addPgParam(pgParams, items)})`
+    );
+    return false;
+  }
+
+  if (field === "item_release_flag") {
+    const items = await getItemsByReleaseFlagForExistingBom(q);
+    if (!items.length) return true;
+
+    pgFilters.push(
+      `UPPER(TRIM(CAST(base.produced_item AS TEXT))) = ANY(${addPgParam(pgParams, items)})`
+    );
+    return false;
+  }
+
+  return false;
+};
 
   const forceNoRows1 = await appendSearchFilter(normalizedSearchBy1, normalizedQuery1);
   const forceNoRows2 = await appendSearchFilter(normalizedSearchBy2, normalizedQuery2);
