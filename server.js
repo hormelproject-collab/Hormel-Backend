@@ -104,7 +104,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
 
-  const SCHEDULE_TIME = "15 8 * * *";
+  const SCHEDULE_TIME = "00 12 * * *";
   cron.schedule(
     SCHEDULE_TIME,
     async () => {

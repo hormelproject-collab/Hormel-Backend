@@ -432,7 +432,8 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes, pa
     bom_version: getBomVersionFromBomId(row.bom_id),
     prefix: HARD_CODED_PREFIX,
     bom_plan_type: HARD_CODED_BOM_PLAN_TYPE,
-    erp_bom_qty_produced_per: row.erp_bom_qty_produced_per ?? row.qty_produced_per ?? null,
+    erp_bom_qty_produced_per:
+      row.erp_bom_qty_produced_per ?? row.qty_produced_per ?? null,
     engineering_change_id: ecNumber,
     change_type: "Added",
     load_datetime: HARD_CODED_LOAD_DATETIME,
@@ -444,7 +445,10 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes, pa
     item: row.item,
     location: row.location,
     erp_bom_quantity_consumed_per:
-      row.bom_quantity_consumed_per ?? row.erp_bom_quantity_consumed_per ?? row.quantity_consumed_per ?? null,
+      row.bom_quantity_consumed_per ??
+      row.erp_bom_quantity_consumed_per ??
+      row.quantity_consumed_per ??
+      null,
     erp_bom_component_start_date: HARD_CODED_START_DATE,
     erp_bom_component_end_date: HARD_CODED_END_DATE,
     engineering_change_id: ecNumber,
@@ -452,18 +456,57 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes, pa
     load_datetime: HARD_CODED_LOAD_DATETIME,
   }));
 
-  const baseItemBomRoutingRows = ensureArray(normalizedTables?.item_bom_routing).map((row) => {
-    const derivedResource = getRoutingResource(row);
-    const routingId = buildRoutingId(row.item, derivedResource, row.routing_id);
+  const itemBomRoutingRows = [];
 
-    return {
+  const rawRoutingRows = ensureArray(normalizedTables?.item_bom_routing);
+
+  // Prefer true main rows.
+  // But if client env sends all rows as erp_co_product_association = 1,
+  // fallback to all rows so item_bom_routing does not become empty.
+  const nonCoProductRoutingRows = rawRoutingRows.filter(
+    (row) => Number(row?.erp_co_product_association) !== 1
+  );
+
+  const routingSourceRows =
+    nonCoProductRoutingRows.length > 0 ? nonCoProductRoutingRows : rawRoutingRows;
+
+  const seenBaseRows = new Set();
+
+  routingSourceRows.forEach((row) => {
+    const bomId = norm(row.bom_id);
+    const derivedResource = getRoutingResource(row);
+    const location = norm(row.location);
+
+    if (!bomId || !derivedResource) return;
+
+    const matchingPayloadRecord = ensureArray(payloadRecords).find(
+      (record) => norm(record?.bomId) === bomId
+    );
+
+    const producedItem =
+      norm(matchingPayloadRecord?.producedItem?.item) ||
+      norm(matchingPayloadRecord?.producedItem) ||
+      norm(row.item);
+
+    if (!producedItem) return;
+
+    // Prevent duplicate base rows if client sends repeated normalized routing rows.
+    const baseKey = `${bomId}__${location}__${derivedResource}__${producedItem}`;
+    if (seenBaseRows.has(baseKey)) return;
+    seenBaseRows.add(baseKey);
+
+    // Create routing ID once from produced item + resource.
+    const routingId = buildRoutingId(producedItem, derivedResource, row.routing_id);
+
+    const mainRoutingRow = {
       rec_id: generateUniqueBigInt(),
-      bom_id: row.bom_id,
-      item: row.item,
+      bom_id: bomId,
+      item: producedItem,
       routing_id: routingId,
       location: row.location,
       resource: derivedResource,
-      erp_item_bom_routing_priority: row.item_bom_routing_priority ?? row.priority ?? row.routingPriority ?? null,
+      erp_item_bom_routing_priority:
+        row.item_bom_routing_priority ?? row.priority ?? row.routingPriority ?? null,
       erp_item_bom_routing_min_lot_size:
         row.item_bom_routing_min_lot_size ?? row.erp_item_bom_routing_min_lot_size ?? 1,
       erp_item_bom_routing_lot_size_increment:
@@ -477,47 +520,34 @@ function buildTargetTableRows(normalizedTables, ecNumber, userDetails, notes, pa
       change_type: "Added",
       load_datetime: HARD_CODED_LOAD_DATETIME,
     };
-  });
 
-  const coProductRoutingRows = [];
-  const baseRoutingRowsByBomId = new Map();
+    itemBomRoutingRows.push(mainRoutingRow);
 
-  for (const row of baseItemBomRoutingRows) {
-    const bomId = norm(row.bom_id);
-    if (!bomId) continue;
-    if (!baseRoutingRowsByBomId.has(bomId)) baseRoutingRowsByBomId.set(bomId, []);
-    baseRoutingRowsByBomId.get(bomId).push(row);
-  }
-
-  ensureArray(payloadRecords).forEach((record) => {
-    const bomId = norm(record?.bomId);
-    if (!bomId) return;
-
-    const baseRowsForBom = baseRoutingRowsByBomId.get(bomId) || [];
-    if (baseRowsForBom.length === 0) return;
-
-    ensureArray(record?.locations).forEach((locationRow) => {
+    ensureArray(matchingPayloadRecord?.locations).forEach((locationRow) => {
       ensureArray(locationRow?.coProducts).forEach((coProduct) => {
-        const coProductItem = norm(coProduct?.coProductItem ?? coProduct?.item ?? coProduct?.value);
+        const coProductItem = norm(
+          coProduct?.coProductItem ??
+            coProduct?.item ??
+            coProduct?.value
+        );
+
         if (!coProductItem) return;
 
-        baseRowsForBom.forEach((baseRow) => {
-          const resource = getRoutingResource(baseRow);
-          coProductRoutingRows.push({
-            ...baseRow,
-            rec_id: generateUniqueBigInt(),
-            bom_id: bomId,
-            item: coProductItem,
-            routing_id: buildRoutingId(coProductItem, resource, baseRow.routing_id),
-            resource,
-            erp_co_product_association: 1,
-          });
+        itemBomRoutingRows.push({
+          ...mainRoutingRow,
+          rec_id: generateUniqueBigInt(),
+
+          // Co-product item.
+          item: coProductItem,
+
+          // Same routing ID as main produced item row.
+          routing_id: mainRoutingRow.routing_id,
+
+          erp_co_product_association: 1,
         });
       });
     });
   });
-
-  const itemBomRoutingRows = [...baseItemBomRoutingRows, ...coProductRoutingRows];
 
   return {
     bom_parameters: bomParametersRows,

@@ -6,6 +6,9 @@ import crypto from "crypto";
 import XLSX from "xlsx";
 import os from "os";
 import { fetchItemMasterReleaseDetailsByItems } from "../services/bigqueryService.js";
+import { validateItemBomRoutingCreatePayload } from "../bigquery/manualentryitembomValidation.js";
+import { fetchItemMasterWithReleaseFlag } from "../services/bigQueryService.js";
+
 
 const router = express.Router();
 
@@ -1536,6 +1539,330 @@ router.get("/existing-bom-search", async (req, res) => {
 });
 
 
+router.get("/modify-existing-bom-details", async (req, res) => {
+  try {
+    const normalizeText = (value) => String(value ?? "").trim();
+
+    const getResourceFromRoutingId = (routingId) => {
+      const parts = String(routingId || "")
+        .split("_")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const getItemDescMapFromItemMaster = async (items = []) => {
+      const uniqueItems = [
+        ...new Set(
+          (items || [])
+            .map((item) => normalizeText(item))
+            .filter(Boolean)
+        ),
+      ];
+
+      if (!uniqueItems.length) return new Map();
+
+      const results = await Promise.all(
+        uniqueItems.map(async (item) => {
+          try {
+            const result = await fetchItemMasterWithReleaseFlag({
+              page: 1,
+              pageSize: 50,
+              search: item,
+              filterBy: "item",
+            });
+
+            const rows = Array.isArray(result?.data) ? result.data : [];
+
+            const exactRow =
+              rows.find(
+                (row) =>
+                  normalizeText(row.item).toUpperCase() ===
+                  item.toUpperCase()
+              ) || rows[0];
+
+            return {
+              item,
+              desc: normalizeText(exactRow?.item_desc),
+            };
+          } catch (error) {
+            console.error(
+              "Warning: failed to fetch item description from item master:",
+              item,
+              error
+            );
+
+            return {
+              item,
+              desc: "",
+            };
+          }
+        })
+      );
+
+      const descMap = new Map();
+
+      results.forEach((row) => {
+        const item = normalizeText(row.item);
+        const desc = normalizeText(row.desc);
+
+        if (!item) return;
+
+        descMap.set(item, desc);
+        descMap.set(item.toUpperCase(), desc);
+        descMap.set(item.toLowerCase(), desc);
+      });
+
+      return descMap;
+    };
+
+    const getDesc = (descMap, item) => {
+      const key = normalizeText(item);
+
+      if (!key) return "";
+
+      return (
+        descMap.get(key) ||
+        descMap.get(key.toUpperCase()) ||
+        descMap.get(key.toLowerCase()) ||
+        ""
+      );
+    };
+
+    const bomId = normalizeText(req.query.bomId);
+    const producedItem = normalizeText(req.query.producedItem);
+    const location = normalizeText(req.query.location);
+
+    if (!bomId) {
+      return res.status(400).json({
+        success: false,
+        error: "bomId is required",
+      });
+    }
+
+    /*
+      Components:
+      Fetch components from bom_consumed by BOM ID and location.
+      Description is enriched from fetchItemMasterWithReleaseFlag.
+    */
+    const componentParams = [bomId];
+    let componentIdx = 2;
+
+    let componentLocationFilter = "";
+    if (location) {
+      componentLocationFilter = `
+        AND TRIM(CAST(bc.location AS TEXT)) = $${componentIdx++}
+      `;
+      componentParams.push(location);
+    }
+
+    const componentResult = await pool.query(
+      `
+        SELECT
+          TRIM(CAST(bc.bom_id AS TEXT)) AS bom_id,
+          TRIM(CAST(bc.item AS TEXT)) AS component_item,
+          TRIM(CAST(bc.location AS TEXT)) AS location,
+          bc.erp_bom_quantity_consumed_per AS standard_usage
+        FROM ${pgRef(T.bomConsumed)} bc
+        WHERE TRIM(CAST(bc.bom_id AS TEXT)) = $1
+          ${componentLocationFilter}
+        ORDER BY
+          TRIM(CAST(bc.item AS TEXT))
+      `,
+      componentParams
+    );
+
+    /*
+      Co-products:
+      - bom_produced gives item + qty.
+      - item_bom_routing gives:
+          erp_co_product_association = 1
+          routing_id
+          erp_item_bom_routing_priority
+      - item_bom_routing has no location, so no ibr.location.
+      - resource is derived from routing_id.
+      - description is enriched from fetchItemMasterWithReleaseFlag.
+    */
+    const coProductParams = [bomId];
+    let coProductIdx = 2;
+
+    let coProductLocationFilter = "";
+    if (location) {
+      coProductLocationFilter = `
+        AND TRIM(CAST(bp.location AS TEXT)) = $${coProductIdx++}
+      `;
+      coProductParams.push(location);
+    }
+
+    const coProductResult = await pool.query(
+      `
+        WITH produced_rows AS (
+          SELECT
+            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(bp.item AS TEXT)) AS item,
+            TRIM(CAST(bp.location AS TEXT)) AS location,
+            bp.erp_bom_qty_produced_per AS qty
+          FROM ${pgRef(T.bomProduced)} bp
+          WHERE TRIM(CAST(bp.bom_id AS TEXT)) = $1
+            ${coProductLocationFilter}
+        ),
+        coproduct_routing AS (
+          SELECT
+            TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(ibr.item AS TEXT)) AS item,
+            TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id,
+            COALESCE(
+              TRIM(CAST(ibr.erp_co_product_association AS TEXT)),
+              ''
+            ) AS erp_co_product_association,
+            ibr.erp_item_bom_routing_priority AS erp_item_bom_routing_priority,
+            COALESCE(
+              NULLIF(
+                TRIM(
+                  regexp_replace(
+                    TRIM(CAST(ibr.routing_id AS TEXT)),
+                    '^([^_]*_){2}',
+                    ''
+                  )
+                ),
+                ''
+              ),
+              ''
+            ) AS resource
+          FROM ${pgRef(T.itemBomRouting)} ibr
+          WHERE TRIM(CAST(ibr.bom_id AS TEXT)) = $1
+            AND COALESCE(
+                  NULLIF(
+                    TRIM(CAST(ibr.erp_co_product_association AS TEXT)),
+                    ''
+                  ),
+                  '0'
+                ) = '1'
+        )
+        SELECT
+          pr.bom_id,
+          pr.item,
+          pr.location,
+          pr.qty,
+          cr.resource,
+          cr.routing_id,
+          cr.erp_co_product_association,
+          cr.erp_item_bom_routing_priority
+        FROM produced_rows pr
+        INNER JOIN coproduct_routing cr
+          ON cr.bom_id = pr.bom_id
+         AND UPPER(TRIM(CAST(cr.item AS TEXT))) =
+             UPPER(TRIM(CAST(pr.item AS TEXT)))
+        ORDER BY
+          pr.item,
+          cr.routing_id
+      `,
+      coProductParams
+    );
+
+    const componentRows = componentResult.rows || [];
+    const coProductRows = coProductResult.rows || [];
+
+    const itemsForDescription = [
+      ...componentRows.map((row) => row.component_item),
+      ...coProductRows.map((row) => row.item),
+    ]
+      .map(normalizeText)
+      .filter(Boolean);
+
+    const itemDescMap = await getItemDescMapFromItemMaster(
+      itemsForDescription
+    );
+
+    const components = componentRows.map((row) => {
+      const componentItem = normalizeText(row.component_item);
+      const componentDesc = getDesc(itemDescMap, componentItem);
+
+      return {
+        component_item: componentItem,
+        original_component_item: componentItem,
+        component_desc: componentDesc,
+        original_component_desc: componentDesc,
+        standard_usage:
+          row.standard_usage === null || row.standard_usage === undefined
+            ? ""
+            : String(row.standard_usage),
+        original_standard_usage:
+          row.standard_usage === null || row.standard_usage === undefined
+            ? ""
+            : String(row.standard_usage),
+        bom_id: normalizeText(row.bom_id),
+        location: normalizeText(row.location),
+      };
+    });
+
+    const coProducts = coProductRows.map((row) => {
+      const coProductItem = normalizeText(row.item);
+      const coProductDesc = getDesc(itemDescMap, coProductItem);
+      const rowRoutingId = normalizeText(row.routing_id);
+      const rowResource =
+        normalizeText(row.resource) || getResourceFromRoutingId(rowRoutingId);
+
+      const itemBomRoutingPriority =
+        row.erp_item_bom_routing_priority === null ||
+        row.erp_item_bom_routing_priority === undefined
+          ? ""
+          : String(row.erp_item_bom_routing_priority);
+
+      return {
+        item: coProductItem,
+        original_item: coProductItem,
+        desc: coProductDesc,
+        original_desc: coProductDesc,
+        qty:
+          row.qty === null || row.qty === undefined
+            ? ""
+            : String(row.qty),
+        original_qty:
+          row.qty === null || row.qty === undefined
+            ? ""
+            : String(row.qty),
+        resource: rowResource,
+        original_resource: rowResource,
+        routing_id: rowRoutingId,
+        original_routing_id: rowRoutingId,
+        erp_co_product_association: "1",
+
+        // Priority fetched from PostgreSQL item_bom_routing
+        itemBomRoutingPriority,
+        original_itemBomRoutingPriority: itemBomRoutingPriority,
+        item_bom_routing_priority: itemBomRoutingPriority,
+        erp_item_bom_routing_priority: itemBomRoutingPriority,
+
+        bom_id: normalizeText(row.bom_id),
+        location: normalizeText(row.location),
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        record: {
+          bom_id: bomId,
+          produced_item: producedItem,
+          location,
+        },
+        componentItems: components,
+        coProducts,
+      },
+    });
+  } catch (error) {
+    console.error("DB Error (modify-existing-bom-details):", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch modify existing BOM details",
+      details: error.message,
+    });
+  }
+});
+
 router.get("/existing-bom-details", async (req, res) => {
   const client = await pool.connect();
 
@@ -2139,8 +2466,6 @@ router.put("/modify-bom", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      // Correct format: ROUTING_Item_resource
-      // Resource starts after ROUTING + Item.
       return parts.length >= 3 ? parts.slice(2).join("_") : "";
     };
 
@@ -2177,6 +2502,7 @@ router.put("/modify-bom", async (req, res) => {
 
     const getResolvedRowId = (row, idColumn) => {
       if (!row) return null;
+
       return (
         row[idColumn] ??
         row.postgresql_rec_id ??
@@ -2236,21 +2562,9 @@ router.put("/modify-bom", async (req, res) => {
     const buildProducedKey = (row) =>
       [toText(row?.bom_id), toText(row?.location), toText(row?.item)].join("__");
 
-    const buildRoutingKey = (row, fallbackResource = "") => {
-      const routingId = normalizeRoutingIdForRow(row, fallbackResource);
-      const coProductFlag =
-        Number(row?.erp_co_product_association ?? 0) === 1 ? "1" : "0";
-
-      return [
-        toText(row?.bom_id),
-        routingId,
-        toText(row?.item),
-        coProductFlag,
-      ].join("__");
-    };
-
     const deleteExactRowById = async (tableName, idColumn, row) => {
       const resolvedId = getResolvedRowId(row, idColumn);
+
       if (resolvedId == null || String(resolvedId).trim() === "") {
         throw new Error(`Could not resolve row id for delete in ${tableName}`);
       }
@@ -2263,6 +2577,89 @@ router.put("/modify-bom", async (req, res) => {
         [resolvedId]
       );
     };
+
+    const engineeringChangeId = generateUniqueId("EC-");
+    const derivedBomVersion = getBomVersionFromBomId(bomId);
+
+    const changeLogTable = T.changeLog;
+    const changeLogColumns = await getExistingColumns(client, changeLogTable);
+
+    const bomProducedIdColumn = await resolvePrimaryIdColumn(T.bomProduced);
+    const itemBomRoutingIdColumn = await resolvePrimaryIdColumn(
+      T.itemBomRouting
+    );
+    const bomConsumedIdColumn = await resolvePrimaryIdColumn(T.bomConsumed);
+    const bomParametersIdColumn = await resolvePrimaryIdColumn(T.bomParameters);
+
+    if (!bomProducedIdColumn) {
+      throw new Error("Could not resolve primary id column for bom_produced");
+    }
+
+    if (!itemBomRoutingIdColumn) {
+      throw new Error("Could not resolve primary id column for item_bom_routing");
+    }
+
+    if (!bomConsumedIdColumn) {
+      throw new Error("Could not resolve primary id column for bom_consumed");
+    }
+
+    if (!bomParametersIdColumn) {
+      throw new Error("Could not resolve primary id column for bom_parameters");
+    }
+
+    const itemBomRoutingColumns = await getExistingColumns(
+      client,
+      T.itemBomRouting
+    );
+
+    const itemBomRoutingResourceColumn = itemBomRoutingColumns.includes(
+      "resource"
+    )
+      ? "resource"
+      : itemBomRoutingColumns.includes("Resource")
+        ? "Resource"
+        : null;
+
+    const buildRoutingUpdateQuery = ({ includeResource }) => {
+      const setParts = [
+        "item = $1",
+        "routing_id = $2",
+        "erp_item_bom_routing_priority = $3",
+        "erp_co_product_association = $4",
+        "load_datetime = $5",
+      ];
+
+      if (includeResource && itemBomRoutingResourceColumn) {
+        setParts.push(`${quoteIdent(itemBomRoutingResourceColumn)} = $6`);
+      }
+
+      const idParamIndex =
+        includeResource && itemBomRoutingResourceColumn ? 7 : 6;
+
+      return `
+        UPDATE ${pgRef(T.itemBomRouting)}
+        SET
+          ${setParts.join(",\n          ")}
+        WHERE ${quoteIdent(itemBomRoutingIdColumn)} = $${idParamIndex}
+      `;
+    };
+
+    const consolidatedLocations = new Set();
+    const consolidatedResources = new Set();
+    const consolidatedSummaryCategories = new Set();
+    const consolidatedItems = new Set();
+
+    const firstLocation = locations[0] || {};
+    const firstLocationName = String(firstLocation?.locationName || "").trim();
+    const firstIncomingRoutingId = String(
+      firstLocation?.resourceInfo?.routingId || ""
+    ).trim();
+
+    const firstResource =
+      String(firstLocation?.resourceInfo?.resource || "").trim() ||
+      (firstIncomingRoutingId
+        ? getResourceFromRoutingId(firstIncomingRoutingId)
+        : "");
 
     const archiveOnly = async ({
       sourceTable,
@@ -2277,6 +2674,7 @@ router.put("/modify-bom", async (req, res) => {
       summaryCategory,
     }) => {
       const archiveExists = await pgTableExists(client, archiveTable);
+
       if (!archiveExists) {
         throw new Error(`Archive table ${archiveTable} does not exist`);
       }
@@ -2372,6 +2770,7 @@ router.put("/modify-bom", async (req, res) => {
     }) => {
       for (const row of rows || []) {
         const actualRecId = getResolvedRowId(row, idColumn);
+
         if (actualRecId == null || String(actualRecId).trim() === "") {
           throw new Error(
             `Could not resolve live row id for ${sourceTable} using column ${idColumn}`
@@ -2392,78 +2791,6 @@ router.put("/modify-bom", async (req, res) => {
         });
       }
     };
-
-    const engineeringChangeId = generateUniqueId("EC-");
-    const derivedBomVersion = getBomVersionFromBomId(bomId);
-
-    const changeLogTable = T.changeLog;
-    const changeLogColumns = await getExistingColumns(client, changeLogTable);
-
-    const bomProducedIdColumn = await resolvePrimaryIdColumn(T.bomProduced);
-    const itemBomRoutingIdColumn = await resolvePrimaryIdColumn(
-      T.itemBomRouting
-    );
-    const bomConsumedIdColumn = await resolvePrimaryIdColumn(T.bomConsumed);
-    const bomParametersIdColumn = await resolvePrimaryIdColumn(T.bomParameters);
-
-    if (!bomProducedIdColumn) {
-      throw new Error("Could not resolve primary id column for bom_produced");
-    }
-    if (!itemBomRoutingIdColumn) {
-      throw new Error("Could not resolve primary id column for item_bom_routing");
-    }
-    if (!bomConsumedIdColumn) {
-      throw new Error("Could not resolve primary id column for bom_consumed");
-    }
-    if (!bomParametersIdColumn) {
-      throw new Error("Could not resolve primary id column for bom_parameters");
-    }
-
-    const itemBomRoutingColumns = await getExistingColumns(client, T.itemBomRouting);
-    const itemBomRoutingResourceColumn = itemBomRoutingColumns.includes("resource")
-      ? "resource"
-      : itemBomRoutingColumns.includes("Resource")
-        ? "Resource"
-        : null;
-
-    const buildRoutingUpdateQuery = ({ includeResource }) => {
-      const setParts = [
-        "item = $1",
-        "routing_id = $2",
-        "erp_item_bom_routing_priority = $3",
-        "erp_co_product_association = $4",
-        "load_datetime = $5",
-      ];
-
-      if (includeResource && itemBomRoutingResourceColumn) {
-        setParts.push(`${quoteIdent(itemBomRoutingResourceColumn)} = $6`);
-      }
-
-      const idParamIndex = includeResource && itemBomRoutingResourceColumn ? 7 : 6;
-
-      return `
-        UPDATE ${pgRef(T.itemBomRouting)}
-        SET
-          ${setParts.join(",\n          ")}
-        WHERE ${quoteIdent(itemBomRoutingIdColumn)} = $${idParamIndex}
-      `;
-    };
-
-    const consolidatedLocations = new Set();
-    const consolidatedResources = new Set();
-    const consolidatedSummaryCategories = new Set();
-    const consolidatedItems = new Set();
-
-    const firstLocation = locations[0] || {};
-    const firstLocationName = String(firstLocation?.locationName || "").trim();
-    const firstIncomingRoutingId = String(
-      firstLocation?.resourceInfo?.routingId || ""
-    ).trim();
-    const firstResource =
-      String(firstLocation?.resourceInfo?.resource || "").trim() ||
-      (firstIncomingRoutingId
-        ? getResourceFromRoutingId(firstIncomingRoutingId)
-        : "");
 
     const paramsLiveResult = await client.query(
       `
@@ -2492,6 +2819,7 @@ router.put("/modify-bom", async (req, res) => {
     }
 
     const parameterChanges = [];
+
     if (
       String(paramsLiveRow.erp_bom_start_date ?? "") !==
       String(engineeringChange.creationDate ?? "")
@@ -2535,6 +2863,7 @@ router.put("/modify-bom", async (req, res) => {
 
     for (const location of locations) {
       const locationName = String(location?.locationName || "").trim();
+
       const incomingRoutingId = String(
         location?.resourceInfo?.routingId || ""
       ).trim();
@@ -2609,6 +2938,7 @@ router.put("/modify-bom", async (req, res) => {
       );
 
       const producedChanges = [];
+
       if (
         String(primaryProducedLiveRow?.item ?? "") !==
         String(producedItem.item ?? "")
@@ -2690,6 +3020,7 @@ router.put("/modify-bom", async (req, res) => {
 
       for (const cp of requestedCoProductItems) {
         const coProductItem = String(cp?.coProductItem || "").trim();
+
         const standardUsage =
           cp?.standardUsage === "" || cp?.standardUsage == null
             ? null
@@ -2698,9 +3029,12 @@ router.put("/modify-bom", async (req, res) => {
         if (!coProductItem) continue;
 
         const coProductResource =
-          toText(cp?.resource) || getResourceFromRoutingId(cp?.routingId) || resource;
+          toText(cp?.resource) ||
+          getResourceFromRoutingId(cp?.routingId) ||
+          resource;
 
         const key = [bomId, locationName, coProductItem].join("__");
+
         requestedCoProductMap.set(key, {
           coProductItem,
           standardUsage,
@@ -2746,9 +3080,13 @@ router.put("/modify-bom", async (req, res) => {
             client,
             T.bomProduced
           );
+
           const templateRow = { ...primaryProducedLiveRow };
 
           delete templateRow.postgresql_rec_id;
+          delete templateRow.id;
+          delete templateRow.record_id;
+          delete templateRow.recordid;
 
           const newProducedRow = {
             ...templateRow,
@@ -2775,23 +3113,23 @@ router.put("/modify-bom", async (req, res) => {
 
         consolidatedItems.add(coProductItem);
         consolidatedLocations.add(locationName);
-        if (coProductResource) consolidatedResources.add(coProductResource);
+
+        if (coProductResource) {
+          consolidatedResources.add(coProductResource);
+        }
+
         consolidatedSummaryCategories.add("co-product information");
       }
 
       for (const row of liveCoProductRows) {
         const key = buildProducedKey(row);
+
         if (requestedCoProductMap.has(key)) continue;
 
         await deleteExactRowById(T.bomProduced, bomProducedIdColumn, row);
         consolidatedSummaryCategories.add("co-product information");
       }
 
-      /*
-        IMPORTANT CHANGE:
-        Fetch all routing rows for this BOM ID instead of filtering only by the main resource.
-        This lets newly added co-products use their own selected resource and routing_id.
-      */
       const liveRoutingResult = await client.query(
         `
         SELECT *
@@ -2812,25 +3150,31 @@ router.put("/modify-bom", async (req, res) => {
         );
       }
 
+      const isCoProductRouting = (row) =>
+        toText(row?.erp_co_product_association) === "1" ||
+        Number(row?.erp_co_product_association ?? 0) === 1;
+
       const primaryRoutingLiveRow =
         liveRoutingRows.find(
           (row) =>
             toText(row.item) === toText(producedItem.item) &&
-            Number(row.erp_co_product_association ?? 0) !== 1 &&
+            !isCoProductRouting(row) &&
             getResourceFromRoutingId(row.routing_id) === resource
         ) ||
         liveRoutingRows.find(
           (row) =>
-            Number(row.erp_co_product_association ?? 0) !== 1 &&
+            !isCoProductRouting(row) &&
             getResourceFromRoutingId(row.routing_id) === resource
         ) ||
-        liveRoutingRows.find(
-          (row) => Number(row.erp_co_product_association ?? 0) !== 1
-        ) ||
+        liveRoutingRows.find((row) => !isCoProductRouting(row)) ||
         liveRoutingRows[0];
 
-      const liveCoProductRoutingRows = liveRoutingRows.filter(
-        (row) => Number(row.erp_co_product_association ?? 0) === 1
+      const liveMainRoutingRows = liveRoutingRows.filter(
+        (row) => !isCoProductRouting(row)
+      );
+
+      const liveCoProductRoutingRows = liveRoutingRows.filter((row) =>
+        isCoProductRouting(row)
       );
 
       const routingChanges = [];
@@ -2888,7 +3232,7 @@ router.put("/modify-bom", async (req, res) => {
               producedItem.item || primaryRoutingLiveRow.item || null,
               mainRoutingId || primaryRoutingLiveRow.routing_id || null,
               priority,
-              0,
+              null,
               HARD_CODED_LOAD_DATETIME,
               resource,
               primaryRoutingActualRecId,
@@ -2897,23 +3241,99 @@ router.put("/modify-bom", async (req, res) => {
               producedItem.item || primaryRoutingLiveRow.item || null,
               mainRoutingId || primaryRoutingLiveRow.routing_id || null,
               priority,
-              0,
+              null,
               HARD_CODED_LOAD_DATETIME,
               primaryRoutingActualRecId,
             ]
       );
 
+      const liveMainRoutingMap = new Map(
+        liveMainRoutingRows.map((row) => [
+          [
+            toText(row.bom_id),
+            toText(row.routing_id),
+            toText(row.item),
+            "MAIN",
+          ].join("__"),
+          row,
+        ])
+      );
+
       const liveCoProductRoutingMap = new Map(
         liveCoProductRoutingRows.map((row) => [
-          buildRoutingKey(row, getResourceFromRoutingId(row.routing_id)),
+          [
+            toText(row.bom_id),
+            toText(row.routing_id),
+            toText(row.item),
+            "COPRODUCT",
+          ].join("__"),
           row,
         ])
       );
 
       const requestedCoProductRoutingMap = new Map();
 
+      const routingColumns = await getExistingColumns(client, T.itemBomRouting);
+
+      const insertItemBomRoutingRow = async ({
+        item,
+        routingId,
+        resourceValue,
+        priorityValue,
+        coProductAssociation,
+        templateRow,
+      }) => {
+        const newRoutingRow = {
+          ...templateRow,
+          bom_id: bomId,
+          item,
+          routing_id: routingId,
+          ...(itemBomRoutingResourceColumn
+            ? { resourceValue }
+            : {}),
+          erp_item_bom_routing_priority: priorityValue,
+          erp_item_bom_routing_min_lot_size:
+            templateRow?.erp_item_bom_routing_min_lot_size ?? 1,
+          erp_item_bom_routing_lot_size_increment:
+            templateRow?.erp_item_bom_routing_lot_size_increment ?? 1,
+          erp_item_bom_routing_wip_sweep_priority:
+            templateRow?.erp_item_bom_routing_wip_sweep_priority ??
+            templateRow?.erp_item_bom_wip_sweep_priority ??
+            1,
+          erp_item_bom_wip_sweep_priority:
+            templateRow?.erp_item_bom_wip_sweep_priority ?? 1,
+          erp_co_product_association: coProductAssociation,
+          erp_item_bom_routing_max_lot_size:
+            templateRow?.erp_item_bom_routing_max_lot_size ?? null,
+          load_datetime: HARD_CODED_LOAD_DATETIME,
+          rec_id: generateUniqueBigInt(),
+        };
+
+        delete newRoutingRow.postgresql_rec_id;
+        delete newRoutingRow.id;
+        delete newRoutingRow.record_id;
+        delete newRoutingRow.recordid;
+
+        if (
+          itemBomRoutingIdColumn &&
+          itemBomRoutingIdColumn !== "rec_id" &&
+          Object.prototype.hasOwnProperty.call(newRoutingRow, itemBomRoutingIdColumn)
+        ) {
+          delete newRoutingRow[itemBomRoutingIdColumn];
+        }
+
+        const routingInsert = buildInsertQuery(
+          T.itemBomRouting,
+          newRoutingRow,
+          routingColumns
+        );
+
+        await client.query(routingInsert.query, routingInsert.values);
+      };
+
       for (const cp of requestedCoProductItems) {
         const coProductItem = String(cp?.coProductItem || "").trim();
+
         if (!coProductItem) continue;
 
         const coProductResource =
@@ -2925,18 +3345,100 @@ router.put("/modify-bom", async (req, res) => {
           throw new Error(`Resource is required for co-product ${coProductItem}`);
         }
 
-        const coProductRoutingId =
-          buildRoutingId(coProductItem, coProductResource) ||
-          String(cp?.routingId || "").trim();
+        const coProductRoutingId = buildRoutingId(
+          producedItem.item,
+          coProductResource
+        );
 
-        const key = [bomId, coProductRoutingId, coProductItem, "1"].join("__");
-        requestedCoProductRoutingMap.set(key, true);
+        if (!coProductRoutingId) {
+          throw new Error(
+            `Could not derive routing ID for co-product ${coProductItem}`
+          );
+        }
 
-        const existingRoutingRow = liveCoProductRoutingMap.get(key) || null;
+        const rawCoProductPriority =
+          cp?.itemBomRoutingPriority ??
+          cp?.item_bom_routing_priority ??
+          cp?.erp_item_bom_routing_priority ??
+          cp?.routingPriority ??
+          "";
 
-        if (existingRoutingRow) {
-          const existingRoutingRecId = getResolvedRowId(
-            existingRoutingRow,
+        const coProductPriority =
+          rawCoProductPriority === "" ||
+          rawCoProductPriority === null ||
+          rawCoProductPriority === undefined
+            ? null
+            : Number(rawCoProductPriority);
+
+        if (coProductPriority === null || Number.isNaN(coProductPriority)) {
+          throw new Error(
+            `Item BOM Routing Priority is required for co-product ${coProductItem}`
+          );
+        }
+
+        const mainRoutingKey = [
+          bomId,
+          coProductRoutingId,
+          producedItem.item,
+          "MAIN",
+        ].join("__");
+
+        const coProductRoutingKey = [
+          bomId,
+          coProductRoutingId,
+          coProductItem,
+          "COPRODUCT",
+        ].join("__");
+
+        requestedCoProductRoutingMap.set(coProductRoutingKey, true);
+
+        const existingMainRoutingRow =
+          liveMainRoutingMap.get(mainRoutingKey) || null;
+
+        const existingCoProductRoutingRow =
+          liveCoProductRoutingMap.get(coProductRoutingKey) || null;
+
+        if (existingMainRoutingRow) {
+          const existingMainRoutingRecId = getResolvedRowId(
+            existingMainRoutingRow,
+            itemBomRoutingIdColumn
+          );
+
+          await client.query(
+            buildRoutingUpdateQuery({ includeResource: true }),
+            itemBomRoutingResourceColumn
+              ? [
+                  producedItem.item || existingMainRoutingRow.item || null,
+                  coProductRoutingId,
+                  coProductPriority,
+                  null,
+                  HARD_CODED_LOAD_DATETIME,
+                  coProductResource,
+                  existingMainRoutingRecId,
+                ]
+              : [
+                  producedItem.item || existingMainRoutingRow.item || null,
+                  coProductRoutingId,
+                  coProductPriority,
+                  null,
+                  HARD_CODED_LOAD_DATETIME,
+                  existingMainRoutingRecId,
+                ]
+          );
+        } else {
+          await insertItemBomRoutingRow({
+            item: producedItem.item,
+            routingId: coProductRoutingId,
+            resourceValue: coProductResource,
+            priorityValue: coProductPriority,
+            coProductAssociation: null,
+            templateRow: primaryRoutingLiveRow,
+          });
+        }
+
+        if (existingCoProductRoutingRow) {
+          const existingCoProductRoutingRecId = getResolvedRowId(
+            existingCoProductRoutingRow,
             itemBomRoutingIdColumn
           );
 
@@ -2946,74 +3448,51 @@ router.put("/modify-bom", async (req, res) => {
               ? [
                   coProductItem,
                   coProductRoutingId,
-                  priority,
+                  coProductPriority,
                   1,
                   HARD_CODED_LOAD_DATETIME,
                   coProductResource,
-                  existingRoutingRecId,
+                  existingCoProductRoutingRecId,
                 ]
               : [
                   coProductItem,
                   coProductRoutingId,
-                  priority,
+                  coProductPriority,
                   1,
                   HARD_CODED_LOAD_DATETIME,
-                  existingRoutingRecId,
+                  existingCoProductRoutingRecId,
                 ]
           );
         } else {
-          const routingColumns = await getExistingColumns(
-            client,
-            T.itemBomRouting
-          );
-          const routingTemplate = { ...primaryRoutingLiveRow };
-
-          delete routingTemplate.postgresql_rec_id;
-
-          const newRoutingRow = {
-            ...routingTemplate,
-            bom_id: bomId,
+          await insertItemBomRoutingRow({
             item: coProductItem,
-            routing_id: coProductRoutingId,
-            ...(itemBomRoutingResourceColumn
-              ? { [itemBomRoutingResourceColumn]: coProductResource }
-              : {}),
-            erp_item_bom_routing_priority: priority,
-            erp_item_bom_routing_min_lot_size:
-              primaryRoutingLiveRow?.erp_item_bom_routing_min_lot_size ?? 1,
-            erp_item_bom_routing_lot_size_increment:
-              primaryRoutingLiveRow?.erp_item_bom_routing_lot_size_increment ??
-              1,
-            erp_item_bom_routing_wip_sweep_priority:
-              primaryRoutingLiveRow?.erp_item_bom_routing_wip_sweep_priority ??
-              primaryRoutingLiveRow?.erp_item_bom_wip_sweep_priority ??
-              1,
-            erp_item_bom_wip_sweep_priority:
-              primaryRoutingLiveRow?.erp_item_bom_wip_sweep_priority ?? 1,
-            erp_co_product_association: 1,
-            erp_item_bom_routing_max_lot_size:
-              primaryRoutingLiveRow?.erp_item_bom_routing_max_lot_size ?? null,
-            load_datetime: HARD_CODED_LOAD_DATETIME,
-            rec_id: generateUniqueBigInt(),
-          };
-
-          const routingInsert = buildInsertQuery(
-            T.itemBomRouting,
-            newRoutingRow,
-            routingColumns
-          );
-
-          await client.query(routingInsert.query, routingInsert.values);
+            routingId: coProductRoutingId,
+            resourceValue: coProductResource,
+            priorityValue: coProductPriority,
+            coProductAssociation: 1,
+            templateRow: primaryRoutingLiveRow,
+          });
         }
 
+        consolidatedItems.add(producedItem.item);
         consolidatedItems.add(coProductItem);
         consolidatedLocations.add(locationName);
-        if (coProductResource) consolidatedResources.add(coProductResource);
+
+        if (coProductResource) {
+          consolidatedResources.add(coProductResource);
+        }
+
         consolidatedSummaryCategories.add("routing information");
       }
 
       for (const row of liveCoProductRoutingRows) {
-        const key = buildRoutingKey(row, getResourceFromRoutingId(row.routing_id));
+        const key = [
+          toText(row.bom_id),
+          toText(row.routing_id),
+          toText(row.item),
+          "COPRODUCT",
+        ].join("__");
+
         if (requestedCoProductRoutingMap.has(key)) continue;
 
         await deleteExactRowById(T.itemBomRouting, itemBomRoutingIdColumn, row);
@@ -3062,6 +3541,7 @@ router.put("/modify-bom", async (req, res) => {
 
       for (const component of requestedComponentItems) {
         const componentItem = String(component?.componentItem || "").trim();
+
         const standardUsage =
           component?.standardUsage === "" || component?.standardUsage == null
             ? null
@@ -3070,6 +3550,7 @@ router.put("/modify-bom", async (req, res) => {
         if (!componentItem) continue;
 
         const key = [bomId, locationName, componentItem].join("__");
+
         requestedConsumedMap.set(key, {
           componentItem,
           standardUsage,
@@ -3131,12 +3612,17 @@ router.put("/modify-bom", async (req, res) => {
 
         consolidatedItems.add(componentItem);
         consolidatedLocations.add(locationName);
-        if (resource) consolidatedResources.add(resource);
+
+        if (resource) {
+          consolidatedResources.add(resource);
+        }
+
         consolidatedSummaryCategories.add("component information");
       }
 
       for (const row of liveConsumedRows) {
         const key = buildConsumedKey(row);
+
         if (requestedConsumedMap.has(key)) continue;
 
         await deleteExactRowById(T.bomConsumed, bomConsumedIdColumn, row);
@@ -3398,30 +3884,9 @@ router.post("/item-bom-routing/validate-priority", async (req, res) => {
   try {
     const safeText = (value) => String(value ?? "").trim();
 
-    const {
-      bomId = "",
-      resource = "",
-      routingId = "",
-      routingPriority = "",
-    } = req.body || {};
-
-    const getResourceFromRoutingId = (value) => {
-      const text = String(value || "").trim();
-
-      if (!text) return "";
-
-      const parts = text
-        .split("_")
-        .map((p) => p.trim())
-        .filter(Boolean);
-
-      // Correct format: ROUTING_Item_resource
-      // Resource can contain underscores, so everything after 2nd part is resource.
-      return parts.length >= 3 ? parts.slice(2).join("_") : "";
-    };
+    const { bomId = "", routingPriority = "" } = req.body || {};
 
     const resolvedBomId = safeText(bomId);
-    const resolvedResource = safeText(resource) || getResourceFromRoutingId(routingId);
     const resolvedPriority = safeText(routingPriority);
 
     if (!resolvedBomId) {
@@ -3430,15 +3895,6 @@ router.post("/item-bom-routing/validate-priority", async (req, res) => {
         valid: false,
         duplicate: false,
         error: "BOM ID is required",
-      });
-    }
-
-    if (!resolvedResource) {
-      return res.status(400).json({
-        success: false,
-        valid: false,
-        duplicate: false,
-        error: "Resource is required",
       });
     }
 
@@ -3451,7 +3907,10 @@ router.post("/item-bom-routing/validate-priority", async (req, res) => {
       });
     }
 
-    const itemBomRoutingColumns = await getExistingColumns(client, T.itemBomRouting);
+    const itemBomRoutingColumns = await getExistingColumns(
+      client,
+      T.itemBomRouting
+    );
 
     if (!itemBomRoutingColumns.includes("bom_id")) {
       throw new Error(`${T.itemBomRouting}.bom_id column does not exist`);
@@ -3465,45 +3924,31 @@ router.post("/item-bom-routing/validate-priority", async (req, res) => {
 
     const hasResourceColumn = itemBomRoutingColumns.includes("resource");
     const hasRoutingIdColumn = itemBomRoutingColumns.includes("routing_id");
-
-    if (!hasResourceColumn && !hasRoutingIdColumn) {
-      throw new Error(
-        `${T.itemBomRouting} must have resource or routing_id column for validation`
-      );
-    }
-
-    const resourceExpression = hasResourceColumn && hasRoutingIdColumn
-      ? `
-          COALESCE(
-            NULLIF(TRIM(CAST(resource AS TEXT)), ''),
-            NULLIF(
-              TRIM(regexp_replace(CAST(routing_id AS TEXT), '^ROUTING_[^_]*_', '')),
-              ''
-            )
-          )
-        `
-      : hasResourceColumn
-        ? `TRIM(CAST(resource AS TEXT))`
-        : `TRIM(regexp_replace(CAST(routing_id AS TEXT), '^ROUTING_[^_]*_', ''))`;
+    const hasItemColumn = itemBomRoutingColumns.includes("item");
+    const hasCoProductAssociationColumn =
+      itemBomRoutingColumns.includes("erp_co_product_association");
 
     const duplicateQuery = `
       SELECT
         bom_id,
         ${hasResourceColumn ? "resource" : "NULL AS resource"},
         ${hasRoutingIdColumn ? "routing_id" : "NULL AS routing_id"},
-        item,
+        ${hasItemColumn ? "item" : "NULL AS item"},
         erp_item_bom_routing_priority,
-        erp_co_product_association
+        ${
+          hasCoProductAssociationColumn
+            ? "erp_co_product_association"
+            : "NULL AS erp_co_product_association"
+        }
       FROM ${pgRef(T.itemBomRouting)}
-      WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-        AND UPPER(${resourceExpression}) = UPPER($2)
-        AND TRIM(CAST(erp_item_bom_routing_priority AS TEXT)) = $3
+      WHERE UPPER(TRIM(CAST(bom_id AS TEXT))) = UPPER(TRIM($1))
+        AND NULLIF(TRIM(CAST(erp_item_bom_routing_priority AS TEXT)), '') ~ '^[0-9]+(\\.[0-9]+)?$'
+        AND CAST(NULLIF(TRIM(CAST(erp_item_bom_routing_priority AS TEXT)), '') AS NUMERIC) = CAST($2 AS NUMERIC)
       LIMIT 1
     `;
 
     const duplicateResult = await client.query(duplicateQuery, [
       resolvedBomId,
-      resolvedResource,
       resolvedPriority,
     ]);
 
@@ -3512,7 +3957,7 @@ router.post("/item-bom-routing/validate-priority", async (req, res) => {
         success: true,
         valid: false,
         duplicate: true,
-        error: `Priority ${resolvedPriority} already exists for BOM ID ${resolvedBomId} and Resource ${resolvedResource}. Please enter a different priority.`,
+        error: `Priority ${resolvedPriority} already exists for BOM ID ${resolvedBomId}. Please enter a different priority.`,
         data: duplicateResult.rows[0],
       });
     }
@@ -3521,7 +3966,7 @@ router.post("/item-bom-routing/validate-priority", async (req, res) => {
       success: true,
       valid: true,
       duplicate: false,
-      message: `Priority ${resolvedPriority} is available for BOM ID ${resolvedBomId} and Resource ${resolvedResource}.`,
+      message: `Priority ${resolvedPriority} is available for BOM ID ${resolvedBomId}.`,
     });
   } catch (error) {
     console.error("DB Error (item-bom-routing/validate-priority):", error);
@@ -3564,6 +4009,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
       componentItem = "",
       notes = "",
       changeType = "Added",
+      user = {},
     } = req.body || {};
 
     const safeText = (value) => String(value ?? "").trim();
@@ -3571,6 +4017,99 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
     const MAIN_ITEM_ASSOCIATION = null;
     const CO_PRODUCT_ASSOCIATION = 1;
+
+    const normalizeValidationErrorArray = (validation) => {
+      if (!validation) return [];
+
+      if (Array.isArray(validation.validationErrors)) {
+        return validation.validationErrors;
+      }
+
+      if (Array.isArray(validation.errors)) {
+        return validation.errors;
+      }
+
+      if (Array.isArray(validation.errorList)) {
+        return validation.errorList.flatMap((row, rowIndex) => {
+          const messages = Array.isArray(row?.messages) ? row.messages : [];
+
+          if (messages.length === 0) {
+            return [
+              {
+                code:
+                  row?.seq ??
+                  row?.sequence ??
+                  row?.code ??
+                  `VALIDATION-${rowIndex + 1}`,
+                desc:
+                  row?.desc ??
+                  row?.description ??
+                  row?.validation ??
+                  "Validation failed",
+                error:
+                  row?.error ??
+                  row?.message ??
+                  row?.detail ??
+                  JSON.stringify(row),
+                rm:
+                  row?.rm ??
+                  row?.remediation ??
+                  row?.remediationMessage ??
+                  "",
+              },
+            ];
+          }
+
+          return messages.map((msg, msgIndex) => ({
+            code:
+              msg?.seq ??
+              msg?.sequence ??
+              msg?.code ??
+              row?.seq ??
+              row?.sequence ??
+              row?.code ??
+              `VALIDATION-${rowIndex + 1}-${msgIndex + 1}`,
+            desc:
+              msg?.desc ??
+              msg?.description ??
+              msg?.validation ??
+              row?.desc ??
+              row?.description ??
+              row?.validation ??
+              "Validation failed",
+            error:
+              msg?.error ??
+              msg?.message ??
+              msg?.detail ??
+              row?.error ??
+              row?.message ??
+              row?.detail ??
+              "",
+            rm:
+              msg?.rm ??
+              msg?.remediation ??
+              msg?.remediationMessage ??
+              row?.rm ??
+              row?.remediation ??
+              row?.remediationMessage ??
+              "",
+          }));
+        });
+      }
+
+      if (validation.error) {
+        return [
+          {
+            code: validation.code ?? "VALIDATION_ERROR",
+            desc: validation.desc ?? "Validation failed",
+            error: validation.error,
+            rm: validation.rm ?? validation.remediation ?? "",
+          },
+        ];
+      }
+
+      return [];
+    };
 
     const getChicagoDateTimeFormatted = () => {
       const formatter = new Intl.DateTimeFormat("sv-SE", {
@@ -3602,8 +4141,6 @@ router.post("/item-bom-routing/create", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      // Correct format: ROUTING_Item_resource
-      // Resource may contain underscores, so keep everything after ROUTING + Item.
       return parts.length >= 3 ? parts.slice(2).join("_") : "";
     };
 
@@ -3621,20 +4158,23 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
     const resolvedMainItem = safeText(mainItem?.item) || safeText(producedItem);
 
+    const frontendMainRoutingId =
+      safeText(mainItem?.routingId) || safeText(routingId);
+
     const priorityNumber =
       routingPriority === "" || routingPriority == null
         ? null
         : Number(routingPriority);
 
     const resolvedResource =
-      safeText(resource) || getResourceFromRoutingId(routingId);
-
-    const resolvedMainRoutingId =
-      buildRoutingId(resolvedMainItem, resolvedResource) || safeText(routingId);
+      safeText(resource) ||
+      safeText(mainItem?.resource) ||
+      getResourceFromRoutingId(frontendMainRoutingId);
 
     if (!bomId) {
       return res.status(400).json({
         success: false,
+        status: "failure",
         error: "bomId is required",
       });
     }
@@ -3642,6 +4182,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
     if (!resolvedMainItem) {
       return res.status(400).json({
         success: false,
+        status: "failure",
         error: "producedItem/mainItem is required",
       });
     }
@@ -3649,45 +4190,131 @@ router.post("/item-bom-routing/create", async (req, res) => {
     if (!resolvedResource) {
       return res.status(400).json({
         success: false,
+        status: "failure",
         error:
           "resource is required or must be derivable from routingId in ROUTING_Item_resource format",
       });
     }
 
+    if (priorityNumber === null || Number.isNaN(priorityNumber)) {
+      return res.status(400).json({
+        success: false,
+        status: "failure",
+        error: "routingPriority must be a valid number",
+      });
+    }
+
+    const resolvedMainRoutingId = buildRoutingId(
+      resolvedMainItem,
+      resolvedResource
+    );
+
     if (!resolvedMainRoutingId) {
       return res.status(400).json({
         success: false,
+        status: "failure",
         error: "routingId could not be derived",
       });
     }
 
     const normalizedCoProducts = addConnectedCoProduct
       ? safeArray(coProducts)
-          .map((row) => ({
-            coProductItem: safeText(row?.coProductItem),
-            itemDescription: safeText(row?.itemDescription),
-            qtyProduced: safeText(row?.qtyProduced),
-            erp_co_product_association: CO_PRODUCT_ASSOCIATION,
-          }))
-          .filter(
-            (row) =>
+          .map((row) => {
+            const cpItem = safeText(row?.coProductItem);
+
+            return {
+              coProductItem: cpItem,
+              itemDescription: safeText(row?.itemDescription),
+              qtyProduced: safeText(row?.qtyProduced),
+              resource: resolvedResource,
+              routingId: resolvedMainRoutingId,
+              erp_co_product_association: CO_PRODUCT_ASSOCIATION,
+            };
+          })
+          .filter((row) => {
+            const qty = Number(row.qtyProduced);
+            return (
               row.coProductItem &&
               row.qtyProduced !== "" &&
-              !Number.isNaN(Number(row.qtyProduced))
-          )
+              !Number.isNaN(qty)
+            );
+          })
       : [];
 
-    // Backward compatibility if only single coProductItem came from old UI
     if (
       addConnectedCoProduct &&
       !normalizedCoProducts.length &&
       safeText(coProductItem)
     ) {
+      const fallbackCoProductItem = safeText(coProductItem);
+
       normalizedCoProducts.push({
-        coProductItem: safeText(coProductItem),
+        coProductItem: fallbackCoProductItem,
         itemDescription: "",
         qtyProduced: "",
+        resource: resolvedResource,
+        routingId: resolvedMainRoutingId,
         erp_co_product_association: CO_PRODUCT_ASSOCIATION,
+      });
+    }
+
+    /*
+      VALIDATE BEFORE POSTGRESQL INSERT.
+      This validates the same payload rows that will be inserted:
+      - MAIN IBR row
+      - COPRODUCT IBR rows
+    */
+    const validationPayload = {
+      bomId,
+      producedItem: resolvedMainItem,
+      itemDescription: safeText(itemDescription),
+      itemReleaseFlag: safeText(itemReleaseFlag),
+      location,
+      resource: resolvedResource,
+      resourceRelevancy: safeText(resourceRelevancy),
+      routingPriority: priorityNumber,
+      routingId: resolvedMainRoutingId,
+      addConnectedCoProduct,
+      mainItem: {
+        item: resolvedMainItem,
+        routingId: resolvedMainRoutingId,
+        resource: resolvedResource,
+        erp_co_product_association: null,
+      },
+      coProductItem: normalizedCoProducts[0]?.coProductItem || "",
+      coProducts: normalizedCoProducts.map((row) => ({
+        coProductItem: row.coProductItem,
+        itemDescription: row.itemDescription || "",
+        qtyProduced: row.qtyProduced,
+        resource: resolvedResource,
+        routingId: resolvedMainRoutingId,
+        erp_co_product_association: CO_PRODUCT_ASSOCIATION,
+      })),
+      notes,
+      changeType,
+      user,
+    };
+
+    const validation = await validateItemBomRoutingCreatePayload(
+      validationPayload,
+      pool
+    );
+
+    const validationErrors = normalizeValidationErrorArray(validation);
+
+    const validationPassed =
+      validation?.isValid === true ||
+      validation?.valid === true ||
+      String(validation?.status || "").toLowerCase() === "success";
+
+    if (!validationPassed || validationErrors.length > 0) {
+      return res.status(400).json({
+        status: "failure",
+        success: false,
+        message: "Validation failed.",
+        validationErrors,
+        errorList: validation?.errorList || validationErrors,
+        errorCodes: validation?.errorCodes || [],
       });
     }
 
@@ -3698,7 +4325,10 @@ router.post("/item-bom-routing/create", async (req, res) => {
     const trxnSetId = generateUniqueId("TRXN-");
     const chicagoNowText = getChicagoDateTimeFormatted();
 
-    const itemBomRoutingColumns = await getExistingColumns(client, T.itemBomRouting);
+    const itemBomRoutingColumns = await getExistingColumns(
+      client,
+      T.itemBomRouting
+    );
     const bomProducedColumns = await getExistingColumns(client, T.bomProduced);
     const changeLogColumns = await getExistingColumns(client, T.changeLog);
 
@@ -3711,11 +4341,6 @@ router.post("/item-bom-routing/create", async (req, res) => {
     const insertedItemBomRoutingIds = [];
     const insertedBomProducedIds = [];
 
-    // ---------------------------------------------------------
-    // 1) INSERT MAIN produced item row into item_bom_routing
-    // MAIN item must always have co-product association = 0
-    // Routing ID format: ROUTING_MainItem_resource
-    // ---------------------------------------------------------
     const mainItemBomRoutingData = {
       routing_id: resolvedMainRoutingId,
       bom_id: bomId,
@@ -3726,10 +4351,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
       erp_item_bom_routing_min_lot_size: 1,
       erp_item_bom_routing_lot_size_increment: 1,
       erp_item_bom_routing_wip_sweep_priority: 1,
-
-      // IMPORTANT: main item must be 0
       erp_co_product_association: MAIN_ITEM_ASSOCIATION,
-
       erp_item_bom_routing_max_lot_size: null,
       engineering_change_id: engineeringChangeId,
       change_type: "Added",
@@ -3782,7 +4404,9 @@ router.post("/item-bom-routing/create", async (req, res) => {
         }
 
         if (lookupConditions.length > 0) {
-          const idSelectColumn = itemBomRoutingColumns.includes("postgresql_rec_id")
+          const idSelectColumn = itemBomRoutingColumns.includes(
+            "postgresql_rec_id"
+          )
             ? "postgresql_rec_id"
             : itemBomRoutingColumns.includes("rec_id")
               ? "rec_id"
@@ -3811,41 +4435,29 @@ router.post("/item-bom-routing/create", async (req, res) => {
       }
     }
 
-    // ---------------------------------------------------------
-    // 2) INSERT co-product rows into item_bom_routing and bom_produced
-    // Co-products must have association = 1
-    // Routing ID format: ROUTING_CoProductItem_resource
-    // ---------------------------------------------------------
     for (const row of normalizedCoProducts) {
       const coProductItemValue = safeText(row.coProductItem);
+      const coProductResource = resolvedResource;
+      const coProductRoutingId = resolvedMainRoutingId;
 
       const qtyProducedValue =
         row.qtyProduced === "" || row.qtyProduced == null
           ? null
           : Number(row.qtyProduced);
 
-      if (!coProductItemValue) {
-        continue;
-      }
-
-      const coProductRoutingId =
-        buildRoutingId(coProductItemValue, resolvedResource) ||
-        resolvedMainRoutingId;
+      if (!coProductItemValue) continue;
 
       const coItemBomRoutingData = {
         routing_id: coProductRoutingId,
         bom_id: bomId,
         item: coProductItemValue,
         location,
-        resource: resolvedResource,
+        resource: coProductResource,
         erp_item_bom_routing_priority: priorityNumber,
         erp_item_bom_routing_min_lot_size: 1,
         erp_item_bom_routing_lot_size_increment: 1,
         erp_item_bom_routing_wip_sweep_priority: 1,
-
-        // IMPORTANT: co-product must always be 1
         erp_co_product_association: CO_PRODUCT_ASSOCIATION,
-
         erp_item_bom_routing_max_lot_size: null,
         engineering_change_id: engineeringChangeId,
         change_type: "Added",
@@ -3862,23 +4474,6 @@ router.post("/item-bom-routing/create", async (req, res) => {
       const insertedCoItemBomRouting = await client.query(
         coItemInsert.query,
         coItemInsert.values
-      );
-
-      // Safety update to guarantee co-product flag is 1
-      await client.query(
-        `
-          UPDATE ${pgRef(T.itemBomRouting)}
-          SET erp_co_product_association = $1
-          WHERE TRIM(CAST(bom_id AS TEXT)) = $2
-            AND TRIM(CAST(item AS TEXT)) = $3
-            AND TRIM(CAST(routing_id AS TEXT)) = $4
-        `,
-        [
-          CO_PRODUCT_ASSOCIATION,
-          bomId,
-          coProductItemValue,
-          coProductRoutingId,
-        ]
       );
 
       const insertedCoItemRow = insertedCoItemBomRouting.rows?.[0] || {};
@@ -3938,11 +4533,9 @@ router.post("/item-bom-routing/create", async (req, res) => {
       postgresqlRecId = changeLogRecId;
     }
 
-    // ---------------------------------------------------------
-    // 3) planning_bom_change_log_summary INSERT DATA
-    // ---------------------------------------------------------
     const normalizedChangeType = String(changeType || "Added").trim();
-    const resolvedConsumedItem = safeText(consumedItem) || safeText(componentItem);
+    const resolvedConsumedItem =
+      safeText(consumedItem) || safeText(componentItem);
 
     const allProducedItemsForChangeLog = [
       resolvedMainItem,
@@ -3953,26 +4546,24 @@ router.post("/item-bom-routing/create", async (req, res) => {
       .join(", ");
 
     const allRoutingIdsForChangeLog = [
-      resolvedMainRoutingId,
-      ...normalizedCoProducts.map((row) =>
-        buildRoutingId(row.coProductItem, resolvedResource)
+      ...new Set(
+        [
+          resolvedMainRoutingId,
+          ...normalizedCoProducts.map((row) => row.routingId),
+        ]
+          .map((id) => safeText(id))
+          .filter(Boolean)
       ),
-    ]
-      .map((id) => safeText(id))
-      .filter(Boolean)
-      .join(", ");
+    ].join(", ");
 
     const changeLogData = {
       rec_id: changeLogRecId,
       engineering_change_id: engineeringChangeId,
       postgresql_rec_id: postgresqlRecId,
-      change_type: normalizedChangeType,
+      change_type: String(changeType || "Added").trim(),
       target_table: T.itemBomRouting,
       bom_id: bomId,
-
-      // IMPORTANT: keep main + co-products for detail-add classification
       produced_item: allProducedItemsForChangeLog,
-
       location,
       change_date: chicagoNowText,
       user_name: changedByUserName,
@@ -4042,7 +4633,10 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      message: "Item BOM routing record created successfully",
+      status: "success",
+      message:
+        "Validation was successful and item BOM routing record created successfully",
+      engineeringChangeId,
       data: {
         engineeringChangeId,
         trxnSetId,
@@ -4062,7 +4656,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
         changedByUserName,
         coProducts: normalizedCoProducts.map((row) => ({
           ...row,
-          routingId: buildRoutingId(row.coProductItem, resolvedResource),
+          routingId: resolvedMainRoutingId,
           resource: resolvedResource,
           erp_co_product_association: CO_PRODUCT_ASSOCIATION,
         })),
@@ -4079,6 +4673,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
 
     return res.status(500).json({
       success: false,
+      status: "failure",
       error: "Failed to create item BOM routing record",
       details: error.message,
     });
@@ -4086,6 +4681,7 @@ router.post("/item-bom-routing/create", async (req, res) => {
     client.release();
   }
 });
+
 
 /* =========================================================
    DELETE BOM - Step 2 Summary

@@ -192,6 +192,26 @@ async function fetchExistingBomIds(pool, tableName, bomIds = []) {
   return new Set(result.rows.map((r) => norm(r.bom_id)).filter(Boolean));
 }
 
+async function fetchExistingBomItemPairs(pool, tableName, bomIds = []) {
+  const ids = ensureArray(bomIds).map((x) => norm(x)).filter(Boolean);
+  if (!ids.length) return new Set();
+
+  const sql = `
+    SELECT DISTINCT
+      TRIM(CAST(bom_id AS TEXT)) AS bom_id,
+      TRIM(CAST(item AS TEXT)) AS item
+    FROM ${tableName}
+    WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1)
+  `;
+
+  const result = await pool.query(sql, [ids]);
+  return new Set(
+    result.rows
+      .map((r) => `${norm(r.bom_id).toUpperCase()}__${norm(r.item).toUpperCase()}`)
+      .filter((key) => !key.endsWith('__'))
+  );
+}
+
 /*  Main manual validator */
 export async function validateManualEntryPayload(payload, pool) {
   const tables = convertSummaryPayloadToTables(payload);
@@ -213,9 +233,16 @@ export async function validateManualEntryPayload(payload, pool) {
   const routingSet = new Set(bomIdsRouting);
 
   // Existing duplicate checks in Postgre
-  const [existingParams, existingProduced] = await Promise.all([
+  const [
+    existingParams,
+    existingProduced,
+    existingProducedPairs,
+    existingConsumedPairs,
+  ] = await Promise.all([
     fetchExistingBomIds(pool, "bom_parameters", bomIdsParams),
     fetchExistingBomIds(pool, "bom_produced", bomIdsProduced),
+    fetchExistingBomItemPairs(pool, "bom_produced", bomIdsProduced),
+    fetchExistingBomItemPairs(pool, "bom_consumed", bomIdsConsumed),
   ]);
 
   /*  1001: BOM_PARAMETERS bom_id must exist in produced + routing */
@@ -364,6 +391,41 @@ export async function validateManualEntryPayload(payload, pool) {
       );
       const coRows = rows.filter((r) => r.is_coproduct);
 
+      // Duplicate BOM ID + Co-Product item combination in payload or existing BOM_PRODUCED
+      {
+        const seenCoProductPairs = new Set();
+        for (const pr of coRows) {
+          const pairKey = `${norm(bomId).toUpperCase()}__${norm(pr.item).toUpperCase()}`;
+          if (!norm(pr.item)) continue;
+
+          if (seenCoProductPairs.has(pairKey) || existingProducedPairs.has(pairKey)) {
+            failures.push(
+              buildErrorRow({
+                table: "BOM_PRODUCED",
+                record: pr.recordNo,
+                bomId,
+                item: pr.item,
+                location: pr.location,
+                seq: 1006,
+                values: {
+                  value: bomId,
+                  item: pr.item,
+                  location: pr.location,
+                  bom_id: bomId,
+                },
+                fallbackValidation:
+                  "Duplicate combination of BOMID and co-product item",
+                fallbackErrorDetails: `Duplicate co-product item "${pr.item}" found for BOM "${bomId}".`,
+                fallbackRemediationMessage:
+                  "Remove duplicate co-product item rows for the same BOM.",
+              })
+            );
+          }
+
+          seenCoProductPairs.add(pairKey);
+        }
+      }
+
       if (mainRows.length !== 1) {
         rows.forEach((pr) => {
           failures.push(
@@ -508,7 +570,8 @@ export async function validateManualEntryPayload(payload, pool) {
     const seen = new Set();
     for (const c of consumed) {
       const key = `${norm(c.bom_id)}__${norm(c.item)}`;
-      if (seen.has(key)) {
+      const dbKey = `${norm(c.bom_id).toUpperCase()}__${norm(c.item).toUpperCase()}`;
+      if (seen.has(key) || existingConsumedPairs.has(dbKey)) {
         failures.push(
           buildErrorRow({
             table: "BOM_CONSUMED",
