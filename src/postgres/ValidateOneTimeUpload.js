@@ -10,7 +10,12 @@ import { generateSuccessReport } from "../reportGenerator/successReportGenerator
 ========================================================= */
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "reports");
-
+const HARD_CODED_START_DATE = "2019-01-01";
+const HARD_CODED_END_DATE = "2099-01-25";
+const HARD_CODED_BOM_STATUS = "ACTIVE";
+const HARD_CODED_PREFIX = "BOM";
+const HARD_CODED_BOM_PLAN_TYPE = "MP and OP";
+const HARD_CODED_LOAD_DATETIME = null;
 const norm = (v) => (v == null ? "" : String(v).trim());
 
 const toNum = (v) => {
@@ -58,6 +63,13 @@ function deriveBomLocation(bomId) {
   if (!id) return "";
   const parts = id.split("_");
   return parts.length >= 1 ? parts[parts.length - 1] : "";
+}
+function deriveBomVersionFromBomId(bomId) {
+  const id = norm(bomId);
+  if (!id) return "";
+
+  const parts = id.split("_");
+  return parts.length >= 1 ? parts[0] : "";
 }
 
 function getChicagoTime() {
@@ -125,7 +137,10 @@ function normalizeForPostgresInsert(payload) {
         return {
           rec_id: generateUniqueBigInt(),
           bom_id,
-          produced_item,
+
+          erp_bom_start_date: HARD_CODED_START_DATE,
+          erp_bom_end_date: HARD_CODED_END_DATE,
+          load_datetime: HARD_CODED_LOAD_DATETIME,
         };
       })
       .filter((x) => x.bom_id),
@@ -170,8 +185,14 @@ function normalizeForPostgresInsert(payload) {
           bom_id,
           item,
           location,
+
+          bom_status: HARD_CODED_BOM_STATUS,
+          bom_version: deriveBomVersionFromBomId(bom_id),
+          prefix: HARD_CODED_PREFIX,
+          bom_plan_type: HARD_CODED_BOM_PLAN_TYPE,
+
           erp_bom_qty_produced_per: qtyProduced,
-          is_coproduct,
+          load_datetime: HARD_CODED_LOAD_DATETIME,
         };
       })
       .filter((x) => x.bom_id),
@@ -207,8 +228,11 @@ function normalizeForPostgresInsert(payload) {
           bom_id,
           item,
           location,
+
           erp_bom_quantity_consumed_per: qtyConsumed,
-          co_product_flag,
+          erp_bom_component_start_date: HARD_CODED_START_DATE,
+          erp_bom_component_end_date: HARD_CODED_END_DATE,
+          load_datetime: HARD_CODED_LOAD_DATETIME,
         };
       })
       .filter((x) => x.bom_id),
@@ -236,18 +260,23 @@ function normalizeForPostgresInsert(payload) {
         );
         const erp_co_product_association =
           toNum(
-            pick(row, ["CoProductAssociation", "ERP_CoProductAssociation"])
-          ) ?? 0;
+            pick(row, ["erp_co_product_association", "CoProductAssociation", "ERP_CoProductAssociation"])
+          ) ?? null;
 
         return {
           rec_id: generateUniqueBigInt(),
           bom_id,
           item,
-          location,
           routing_id,
-          priority,
+
           erp_item_bom_routing_priority: priority,
+          erp_item_bom_routing_min_lot_size: null,
+          erp_item_bom_routing_lot_size_increment: null,
+          erp_item_bom_wip_sweep_priority: null,
           erp_co_product_association,
+          erp_item_bom_routing_max_lot_size: null,
+
+          load_datetime: HARD_CODED_LOAD_DATETIME,
         };
       })
       .filter((x) => x.bom_id),

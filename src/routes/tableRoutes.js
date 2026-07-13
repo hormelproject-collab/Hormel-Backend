@@ -1862,6 +1862,358 @@ router.get("/modify-existing-bom-details", async (req, res) => {
     });
   }
 });
+router.get("/delete-existing-bom-records", async (req, res) => {
+  try {
+
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const requestedPageSize = Number.parseInt(req.query.pageSize, 10) || 50;
+    const pageSize = Math.max(1, requestedPageSize);
+    const offset = (page - 1) * pageSize;
+
+    const normalizeField = (value) => {
+      const allowed = new Set([
+        "",
+        "location",
+        "bom_id",
+        "bomId",
+        "produced_item",
+        "producedItem",
+        "produced_item_desc",
+        "producedItemDescription",
+        "item_release_flag",
+        "releaseFlag",
+      ]);
+
+      const field = String(value || "").trim();
+      if (!allowed.has(field)) return "";
+
+      const fieldMap = {
+        bomId: "bom_id",
+        producedItem: "produced_item",
+        producedItemDescription: "produced_item_desc",
+        releaseFlag: "item_release_flag",
+      };
+
+      return fieldMap[field] || field;
+    };
+
+    const searchBy1 = normalizeField(req.query.searchBy1);
+    const query1 = normalizeText(req.query.query1 || "");
+    const searchBy2 = normalizeField(req.query.searchBy2);
+    const query2 = normalizeText(req.query.query2 || "");
+
+    const pgParams = [];
+    const pgFilters = [];
+
+    const addPgParam = (value) => {
+      pgParams.push(value);
+      return `$${pgParams.length}`;
+    };
+
+    const addProducedItemInFilter = (items) => {
+      const cleaned = Array.from(
+        new Set((items || []).map(normalizeUpper).filter(Boolean))
+      );
+
+      if (!cleaned.length) {
+        pgFilters.push("1 = 0");
+        return;
+      }
+
+      const placeholders = cleaned.map((item) => addPgParam(item)).join(", ");
+
+      pgFilters.push(
+        `UPPER(TRIM(CAST(produced_item AS TEXT))) IN (${placeholders})`
+      );
+    };
+
+    const findItemsByDescription = async (descriptionText) => {
+      const q = normalizeText(descriptionText);
+      if (!q) return [];
+
+      const rows = await runBigQuery(
+        `
+          SELECT DISTINCT
+            UPPER(TRIM(CAST(item AS STRING))) AS item
+          FROM ${bqTableRefByKey("itemMaster")}
+          WHERE item IS NOT NULL
+            AND TRIM(CAST(item AS STRING)) != ''
+            AND LOWER(COALESCE(CAST(item_desc AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+        `,
+        { q }
+      );
+
+      return rows.map((row) => normalizeUpper(row.item)).filter(Boolean);
+    };
+
+    const findItemsByReleaseFlag = async (releaseText) => {
+      const q = normalizeText(releaseText);
+      if (!q) return [];
+
+      const rows = await runBigQuery(
+        `
+          SELECT DISTINCT
+            UPPER(TRIM(CAST(item AS STRING))) AS item
+          FROM ${bqTableRefByKey("itemReleaseFlag")}
+          WHERE item IS NOT NULL
+            AND TRIM(CAST(item AS STRING)) != ''
+            AND LOWER(COALESCE(CAST(release AS STRING), '')) LIKE CONCAT('%', LOWER(@q), '%')
+        `,
+        { q }
+      );
+
+      return rows.map((row) => normalizeUpper(row.item)).filter(Boolean);
+    };
+
+    const appendSearchFilter = async (field, value) => {
+      const q = normalizeText(value);
+      if (!field || !q) return;
+
+      if (field === "location") {
+        pgFilters.push(
+          `TRIM(CAST(location AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
+      if (field === "bom_id") {
+        pgFilters.push(
+          `TRIM(CAST(bom_id AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
+      if (field === "produced_item") {
+        pgFilters.push(
+          `TRIM(CAST(produced_item AS TEXT)) ILIKE ${addPgParam(`%${q}%`)}`
+        );
+        return;
+      }
+
+      if (field === "produced_item_desc") {
+        const items = await findItemsByDescription(q);
+        addProducedItemInFilter(items);
+        return;
+      }
+
+      if (field === "item_release_flag") {
+        const items = await findItemsByReleaseFlag(q);
+        addProducedItemInFilter(items);
+      }
+    };
+
+    await appendSearchFilter(searchBy1, query1);
+    await appendSearchFilter(searchBy2, query2);
+
+    const whereClause = pgFilters.length
+      ? `WHERE ${pgFilters.join(" AND ")}`
+      : "";
+
+    const limitParam = addPgParam(pageSize);
+    const offsetParam = addPgParam(offset);
+
+    const producedResult = await pool.query(
+      `
+        WITH produced_rows AS (
+          SELECT
+            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(bp.item AS TEXT)) AS produced_item,
+            COALESCE(TRIM(CAST(bp.location AS TEXT)), '') AS location
+          FROM ${pgRef(T.bomProduced)} bp
+          WHERE bp.bom_id IS NOT NULL
+            AND TRIM(CAST(bp.bom_id AS TEXT)) <> ''
+            AND bp.item IS NOT NULL
+            AND TRIM(CAST(bp.item AS TEXT)) <> ''
+        ),
+
+        filtered_produced_rows AS (
+          SELECT *
+          FROM produced_rows
+          ${whereClause}
+        ),
+
+        routing_association AS (
+          SELECT
+            TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+            UPPER(TRIM(CAST(ibr.item AS TEXT))) AS produced_item_key,
+            MAX(
+              CASE
+                WHEN COALESCE(
+                  NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), ''),
+                  '0'
+                ) = '1'
+                THEN 1
+                ELSE 0
+              END
+            ) AS is_coproduct
+          FROM ${pgRef(T.itemBomRouting)} ibr
+          WHERE ibr.bom_id IS NOT NULL
+            AND TRIM(CAST(ibr.bom_id AS TEXT)) <> ''
+            AND ibr.item IS NOT NULL
+            AND TRIM(CAST(ibr.item AS TEXT)) <> ''
+          GROUP BY
+            TRIM(CAST(ibr.bom_id AS TEXT)),
+            UPPER(TRIM(CAST(ibr.item AS TEXT)))
+        ),
+
+        final_rows AS (
+          SELECT
+            fpr.bom_id,
+            fpr.produced_item,
+            fpr.location,
+            CASE
+              WHEN COALESCE(ra.is_coproduct, 0) = 1 THEN '1'
+              ELSE '0'
+            END AS erp_co_product_association
+          FROM filtered_produced_rows fpr
+          LEFT JOIN routing_association ra
+            ON ra.bom_id = fpr.bom_id
+           AND ra.produced_item_key =
+               UPPER(TRIM(CAST(fpr.produced_item AS TEXT)))
+        ),
+
+        counted_rows AS (
+          SELECT
+            *,
+            COUNT(*) OVER() AS total_count
+          FROM final_rows
+        )
+
+        SELECT
+          bom_id,
+          produced_item,
+          location,
+          erp_co_product_association,
+          total_count
+        FROM counted_rows
+        ORDER BY
+          bom_id,
+          location,
+          CASE
+            WHEN erp_co_product_association = '1' THEN 1
+            ELSE 0
+          END,
+          produced_item
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
+      `,
+      pgParams
+    );
+
+    const producedRows = producedResult.rows || [];
+
+    const total = producedRows.length
+      ? Number(producedRows[0].total_count || 0)
+      : 0;
+
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+    const allPageItems = Array.from(
+      new Set(
+        producedRows
+          .map((row) => normalizeUpper(row.produced_item))
+          .filter(Boolean)
+      )
+    );
+
+    const itemMasterRows = allPageItems.length
+      ? await runBigQuery(
+          `
+            SELECT
+              item,
+              item_desc
+            FROM ${bqTableRefByKey("itemMaster")}
+            WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+          `,
+          { items: allPageItems }
+        )
+      : [];
+
+    const releaseFlagRows = allPageItems.length
+      ? await runBigQuery(
+          `
+            SELECT
+              item,
+              release
+            FROM ${bqTableRefByKey("itemReleaseFlag")}
+            WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+          `,
+          { items: allPageItems }
+        )
+      : [];
+
+    const itemDescMap = new Map();
+
+    for (const row of itemMasterRows) {
+      const itemKey = normalizeUpper(row.item);
+      if (!itemKey) continue;
+
+      if (!itemDescMap.has(itemKey)) {
+        itemDescMap.set(itemKey, normalizeText(row.item_desc ?? ""));
+      }
+    }
+
+    const releaseFlagMap = new Map();
+
+    for (const row of releaseFlagRows) {
+      const itemKey = normalizeUpper(row.item);
+      if (!itemKey) continue;
+
+      if (!releaseFlagMap.has(itemKey)) {
+        releaseFlagMap.set(itemKey, normalizeText(row.release ?? ""));
+      }
+    }
+
+    const mergedRows = producedRows.map((row, index) => {
+      const bomId = normalizeText(row.bom_id);
+      const producedItem = normalizeText(row.produced_item);
+      const itemKey = normalizeUpper(producedItem);
+      const location = normalizeText(row.location);
+      const coProductAssociation = normalizeText(
+        row.erp_co_product_association || "0"
+      );
+
+      return {
+        id: `${bomId}__${location || "NOLOCATION"}__${producedItem}__${offset + index}`,
+        location,
+        produced_item: producedItem,
+        produced_item_desc: itemDescMap.get(itemKey) ?? "",
+        bom_id: bomId,
+        item_release_flag: releaseFlagMap.get(itemKey) ?? "",
+        erp_co_product_association: coProductAssociation,
+      };
+    });
+
+    console.log("✅ delete-existing-bom-records rows:", mergedRows.length);
+    console.log("✅ first rows:", mergedRows.slice(0, 5));
+
+    return res.status(200).json({
+      success: true,
+      data: mergedRows,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasPrev: page > 1,
+        hasNext: page < totalPages,
+        searchBy1,
+        query1,
+        searchBy2,
+        query2,
+      },
+    });
+  } catch (error) {
+    console.error("DB Error (delete-existing-bom-records):", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch delete existing BOM records",
+      details: error.message,
+    });
+  }
+});
+
 
 router.get("/existing-bom-details", async (req, res) => {
   const client = await pool.connect();
@@ -4899,7 +5251,6 @@ router.post("/delete-bom/execute", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      // Expected BOM format: BOM_Item_Location
       return parts.length >= 3 ? parts[1] : "";
     };
 
@@ -4909,8 +5260,6 @@ router.post("/delete-bom/execute", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      // Expected BOM format: BOM_Item_Location
-      // Location may contain underscores, so keep all parts after item.
       return parts.length >= 3 ? parts.slice(2).join("_") : "";
     };
 
@@ -4920,9 +5269,102 @@ router.post("/delete-bom/execute", async (req, res) => {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      // Correct routing format: ROUTING_Item_resource
-      // Resource may contain underscores, so keep all parts after ROUTING + Item.
       return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const getAffectedItemsForSourceRow = (sourceTable, row) => {
+      const tableName = String(sourceTable || "").trim();
+
+      const producedItems = [];
+      const consumedItems = [];
+
+      const addProduced = (value) => {
+        const text = toText(value);
+        if (text) producedItems.push(text);
+      };
+
+      const addConsumed = (value) => {
+        const text = toText(value);
+        if (text) consumedItems.push(text);
+      };
+
+      if (tableName === T.bomProduced || tableName === "bom_produced") {
+        /**
+         * bom_produced:
+         * - row.item / row.produced_item = main produced item or co-product item
+         */
+        addProduced(
+          row.produced_item ??
+            row.produceditem ??
+            row.item ??
+            getProducedItemFromBomId(row.bom_id)
+        );
+      } else if (
+        tableName === T.itemBomRouting ||
+        tableName === "item_bom_routing"
+      ) {
+        /**
+         * item_bom_routing:
+         * - row.item = main produced item or co-product item
+         */
+        addProduced(
+          row.produced_item ??
+            row.produceditem ??
+            row.item ??
+            getProducedItemFromBomId(row.bom_id)
+        );
+      } else if (tableName === T.bomConsumed || tableName === "bom_consumed") {
+        /**
+         * bom_consumed:
+         * - row.item / consumed_item / component_item = component / consumed item
+         */
+        addConsumed(
+          row.consumed_item ??
+            row.consumeditem ??
+            row.component_item ??
+            row.componentitem ??
+            row.item
+        );
+      } else if (
+        tableName === T.bomParameters ||
+        tableName === "bom_parameters"
+      ) {
+        /**
+         * bom_parameters:
+         * - usually BOM-level
+         * - collect safely only if item columns exist
+         */
+        addProduced(
+          row.produced_item ??
+            row.produceditem ??
+            getProducedItemFromBomId(row.bom_id)
+        );
+
+        addConsumed(
+          row.consumed_item ??
+            row.consumeditem ??
+            row.component_item ??
+            row.componentitem
+        );
+      } else {
+        addProduced(
+          row.produced_item ??
+            row.produceditem ??
+            getProducedItemFromBomId(row.bom_id)
+        );
+
+        addConsumed(
+          row.consumed_item ??
+            row.consumeditem ??
+            row.component_item ??
+            row.componentitem
+        );
+      }
+
+      return {
+        producedItems,
+        consumedItems,
+      };
     };
 
     const resourceByBomAndLocation = new Map();
@@ -4972,6 +5414,7 @@ router.post("/delete-bom/execute", async (req, res) => {
     const consolidatedLocations = new Set();
     const consolidatedResources = new Set();
     const consolidatedProducedItems = new Set();
+    const consolidatedConsumedItems = new Set();
     const consolidatedTargetTables = new Set();
 
     let totalDeletedRecords = 0;
@@ -4998,6 +5441,7 @@ router.post("/delete-bom/execute", async (req, res) => {
       const sourceRows = sourceResult.rows || [];
 
       if (!sourceRows.length) {
+        movedCounts[sourceTable] = 0;
         continue;
       }
 
@@ -5019,6 +5463,13 @@ router.post("/delete-bom/execute", async (req, res) => {
         );
 
         const inserted = await client.query(query, values);
+
+        if (!inserted || inserted.rowCount !== 1) {
+          throw new Error(
+            `Archive insert failed for source table ${sourceTable} into archive table ${archiveTable}`
+          );
+        }
+
         const insertedRow = inserted.rows?.[0] || {};
 
         const archivedRecId =
@@ -5040,10 +5491,10 @@ router.post("/delete-bom/execute", async (req, res) => {
           }
         }
 
-        const producedItem =
-          row.produced_item ??
-          row.item ??
-          getProducedItemFromBomId(row.bom_id);
+        const { producedItems, consumedItems } = getAffectedItemsForSourceRow(
+          sourceTable,
+          row
+        );
 
         const rowLocation =
           toText(row.location) || getLocationFromBomId(row.bom_id);
@@ -5065,8 +5516,16 @@ router.post("/delete-bom/execute", async (req, res) => {
           consolidatedResources.add(String(rowResource).trim());
         }
 
-        if (producedItem) {
-          consolidatedProducedItems.add(String(producedItem).trim());
+        for (const producedItem of producedItems) {
+          if (producedItem) {
+            consolidatedProducedItems.add(String(producedItem).trim());
+          }
+        }
+
+        for (const consumedItem of consumedItems) {
+          if (consumedItem) {
+            consolidatedConsumedItems.add(String(consumedItem).trim());
+          }
         }
 
         consolidatedTargetTables.add(sourceTable);
@@ -5075,6 +5534,12 @@ router.post("/delete-bom/execute", async (req, res) => {
 
       const deletedCount = await deleteRowsByBomId(client, sourceTable, bomIds);
       movedCounts[sourceTable] = deletedCount;
+
+      if (deletedCount !== sourceRows.length) {
+        throw new Error(
+          `Archive/delete count mismatch for ${sourceTable}. Archived ${sourceRows.length}, deleted ${deletedCount}`
+        );
+      }
     }
 
     if (totalDeletedRecords === 0) {
@@ -5105,6 +5570,10 @@ router.post("/delete-bom/execute", async (req, res) => {
       .join(", ");
 
     const consolidatedProducedItemText = Array.from(consolidatedProducedItems)
+      .filter(Boolean)
+      .join(", ");
+
+    const consolidatedConsumedItemText = Array.from(consolidatedConsumedItems)
       .filter(Boolean)
       .join(", ");
 
@@ -5162,8 +5631,28 @@ router.post("/delete-bom/execute", async (req, res) => {
       consolidatedChangeLogRow.produced_item = consolidatedProducedItemText;
     }
 
+    if (changeLogColumns.includes("produced_items")) {
+      consolidatedChangeLogRow.produced_items = consolidatedProducedItemText;
+    }
+
     if (changeLogColumns.includes("item")) {
       consolidatedChangeLogRow.item = consolidatedProducedItemText;
+    }
+
+    if (changeLogColumns.includes("consumed_item")) {
+      consolidatedChangeLogRow.consumed_item = consolidatedConsumedItemText;
+    }
+
+    if (changeLogColumns.includes("consumed_items")) {
+      consolidatedChangeLogRow.consumed_items = consolidatedConsumedItemText;
+    }
+
+    if (changeLogColumns.includes("component_item")) {
+      consolidatedChangeLogRow.component_item = consolidatedConsumedItemText;
+    }
+
+    if (changeLogColumns.includes("component_items")) {
+      consolidatedChangeLogRow.component_items = consolidatedConsumedItemText;
     }
 
     if (changeLogColumns.includes("location")) {
@@ -5231,10 +5720,14 @@ router.post("/delete-bom/execute", async (req, res) => {
       changeLogColumns
     );
 
-    await client.query(
+    const changeLogInserted = await client.query(
       consolidatedChangeLogInsertQuery,
       consolidatedChangeLogInsertValues
     );
+
+    if (!changeLogInserted || changeLogInserted.rowCount !== 1) {
+      throw new Error("Failed to insert consolidated delete change log row");
+    }
 
     await client.query("COMMIT");
 
@@ -5247,6 +5740,8 @@ router.post("/delete-bom/execute", async (req, res) => {
       bomIds,
       movedCounts,
       ogRecIds,
+      producedItems: consolidatedProducedItemText,
+      consumedItems: consolidatedConsumedItemText,
     });
   } catch (error) {
     try {
@@ -8708,7 +9203,10 @@ router.post("/view-bom-data/search", async (req, res) => {
       value: safeText(req.body?.criterion2?.value),
     };
 
-    const criteria = [criterion1, criterion2].filter((criterion) => criterion.field);
+    const criteria = [criterion1, criterion2].filter(
+      (criterion) => criterion.field
+    );
+
     const selectedFields = criteria.map((criterion) => criterion.field);
 
     const emptyData = {
@@ -8762,32 +9260,36 @@ router.post("/view-bom-data/search", async (req, res) => {
     ];
 
     /*
-      Main table rules only:
+      Rules:
 
       Location:
-        available from bom_produced / bom_consumed.
-
-      BOMID:
-        available from all four main tables.
-
-      Resource:
-        available from item_bom_routing only.
-        Resource is derived from routing_id if resource column is unavailable.
+        Derived from BOM ID.
+        BOMID = BOMVersion_Item_Location.
+        So all 4 tables should be visible.
 
       Produced Item:
-        available from bom_produced / item_bom_routing.
+        Derived from BOM ID.
+        BOMID = BOMVersion_Item_Location.
+        So all 4 tables should be visible.
+
+      BOM ID:
+        Available in all 4 tables.
+
+      Resource:
+        Available from item_bom_routing only.
+        Resource is derived from routing_id if resource column is unavailable.
 
       Component Item:
-        available from bom_consumed only.
+        Available from bom_consumed only.
 
       Co-Product Item:
-        available from bom_produced / item_bom_routing.
+        Available from bom_produced / item_bom_routing.
         Co-product is identified from item_bom_routing.erp_co_product_association = 1.
     */
     const fieldTableMap = {
-      location: [TABLE_KEYS.bomProduced, TABLE_KEYS.bomConsumed],
+      location: ALL_TABLE_KEYS,
       bomId: ALL_TABLE_KEYS,
-      producedItem: [TABLE_KEYS.bomProduced, TABLE_KEYS.itemBomRouting],
+      producedItem: ALL_TABLE_KEYS,
       resource: [TABLE_KEYS.itemBomRouting],
       componentItem: [TABLE_KEYS.bomConsumed],
       coProductItem: [TABLE_KEYS.bomProduced, TABLE_KEYS.itemBomRouting],
@@ -8802,11 +9304,52 @@ router.post("/view-bom-data/search", async (req, res) => {
       );
     }
 
-    const tableNameByKey = {
-      bomParameters: T.bomParameters,
-      bomProduced: T.bomProduced,
-      bomConsumed: T.bomConsumed,
-      itemBomRouting: T.itemBomRouting,
+    const deriveProducedItemFromBomId = (bomId) => {
+      const value = safeText(bomId);
+      if (!value) return "";
+
+      const parts = value
+        .split("_")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      /*
+        BOMID = BOMVersion_Item_Location
+
+        Example:
+        BOM1_HRL00083_1014
+
+        Produced Item = HRL00083
+      */
+      if (parts.length >= 2) {
+        return parts[1];
+      }
+
+      return "";
+    };
+
+    const deriveLocationFromBomId = (bomId) => {
+      const value = safeText(bomId);
+      if (!value) return "";
+
+      const parts = value
+        .split("_")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      /*
+        BOMID = BOMVersion_Item_Location
+
+        Example:
+        BOM1_HRL00083_1014
+
+        Location = 1014
+      */
+      if (parts.length >= 3) {
+        return parts[2];
+      }
+
+      return "";
     };
 
     const deriveResourceFromRoutingId = (routingId) => {
@@ -8819,11 +9362,11 @@ router.post("/view-bom-data/search", async (req, res) => {
         .filter(Boolean);
 
       /*
-        Correct current format:
+        Expected format:
         ROUTING_item_resource
 
         Example:
-        ROUTING_HRL01639_RESOURCE123
+        ROUTING_HRL01639_1001_20054_R05_RETORT_05
 
         Resource starts after ROUTING + item.
       */
@@ -8852,8 +9395,8 @@ router.post("/view-bom-data/search", async (req, res) => {
       `${upperText(bomId)}__${upperText(item)}`;
 
     /*
-      Fetch from PostgreSQL MAIN tables only.
-      SELECT * is intentional because View BOM must show all columns.
+      SELECT * is intentional here.
+      We need source columns for filtering, but final response is projected to only required UI columns.
     */
     const [
       bomParametersResult,
@@ -8882,6 +9425,7 @@ router.post("/view-bom-data/search", async (req, res) => {
     const rawBomParameters = bomParametersResult.rows || [];
     const rawBomProduced = bomProducedResult.rows || [];
     const rawBomConsumed = bomConsumedResult.rows || [];
+
     const rawItemBomRouting = (itemBomRoutingResult.rows || []).map((row) => ({
       ...row,
       resource:
@@ -8889,8 +9433,8 @@ router.post("/view-bom-data/search", async (req, res) => {
     }));
 
     /*
-      Co-product item set from item_bom_routing main table only.
-      This is required to filter bom_produced when Co-Product Item criterion is selected.
+      Co-product item set from item_bom_routing.
+      Used to filter bom_produced when Co-Product Item criterion is selected.
     */
     const coProductProducedItemKeys = new Set(
       rawItemBomRouting
@@ -8906,23 +9450,32 @@ router.post("/view-bom-data/search", async (req, res) => {
       if (!field || !value) return true;
 
       switch (field) {
-        case "location":
-          return contains(row.location, value);
+        case "location": {
+          const locationFromBomId = deriveLocationFromBomId(row.bom_id);
+          return contains(locationFromBomId, value);
+        }
 
         case "bomId":
           return contains(row.bom_id, value);
 
-        case "producedItem":
-          return contains(row.item, value);
+        case "producedItem": {
+          const producedItemFromBomId = deriveProducedItemFromBomId(row.bom_id);
+          return contains(producedItemFromBomId, value);
+        }
 
         case "resource":
           return (
             tableKey === TABLE_KEYS.itemBomRouting &&
-            contains(row.resource || deriveResourceFromRoutingId(row.routing_id), value)
+            contains(
+              row.resource || deriveResourceFromRoutingId(row.routing_id),
+              value
+            )
           );
 
         case "componentItem":
-          return tableKey === TABLE_KEYS.bomConsumed && contains(row.item, value);
+          return (
+            tableKey === TABLE_KEYS.bomConsumed && contains(row.item, value)
+          );
 
         case "coProductItem":
           if (!contains(row.item, value)) return false;
@@ -8963,7 +9516,9 @@ router.post("/view-bom-data/search", async (req, res) => {
 
         if (tableKey === TABLE_KEYS.bomProduced) {
           outputRows = outputRows.filter((row) =>
-            coProductProducedItemKeys.has(normalizeItemKey(row.bom_id, row.item))
+            coProductProducedItemKeys.has(
+              normalizeItemKey(row.bom_id, row.item)
+            )
           );
         }
       }
@@ -8975,25 +9530,62 @@ router.post("/view-bom-data/search", async (req, res) => {
       );
     };
 
+    /*
+      Final display columns only.
+      Your ViewBomData.jsx dynamically reads columns from the returned object keys,
+      so only these fields will show in each tab. 【1-dfc302】
+    */
+
+    const projectBomParameters = (row) => ({
+      bom_id: row.bom_id,
+      erp_bom_start_date: row.erp_bom_start_date,
+      erp_bom_end_date: row.erp_bom_end_date,
+    });
+
+    const projectBomProduced = (row) => ({
+      bom_id: row.bom_id,
+      item: row.item,
+      location: row.location,
+      bom_version: row.bom_version,
+      quantity_produced_per: row.erp_bom_qty_produced_per,
+    });
+
+    const projectBomConsumed = (row) => ({
+      item: row.item,
+      location: row.location,
+      bom_id: row.bom_id,
+      quantity_consumed_per: row.erp_bom_quantity_consumed_per,
+      component_start_date: row.erp_bom_component_start_date,
+      component_end_date: row.erp_bom_component_end_date,
+    });
+
+    const projectItemBomRouting = (row) => ({
+      item: row.item,
+      routing_id: row.routing_id,
+      bom_id: row.bom_id,
+      priority: row.erp_item_bom_routing_priority,
+      erp_co_product_association: row.erp_co_product_association,
+    });
+
     const bomParameters = filterRowsForTable(
       rawBomParameters,
       TABLE_KEYS.bomParameters
-    );
+    ).map(projectBomParameters);
 
     const bomProduced = filterRowsForTable(
       rawBomProduced,
       TABLE_KEYS.bomProduced
-    );
+    ).map(projectBomProduced);
 
     const bomConsumed = filterRowsForTable(
       rawBomConsumed,
       TABLE_KEYS.bomConsumed
-    );
+    ).map(projectBomConsumed);
 
     const itemBomRouting = filterRowsForTable(
       rawItemBomRouting,
       TABLE_KEYS.itemBomRouting
-    );
+    ).map(projectItemBomRouting);
 
     return res.status(200).json({
       success: true,

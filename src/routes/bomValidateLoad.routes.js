@@ -4,6 +4,7 @@ import fs from "fs";
 import { BigQuery } from "@google-cloud/bigquery";
 import { validateAndLoadAllCsv } from "../postgres/ValidateOneTimeUpload.js";
 import appConfig from "../config/appConfig.js";
+import pool from "../db/postgresClient.js";
 
 const router = express.Router();
 const ROOT = process.cwd();
@@ -171,6 +172,17 @@ async function fetchBigQueryTable(tableConfig) {
 }
 
 export async function performScheduledGcpSync() {
+  // ✅ Clear existing PostgreSQL data first
+  await pool.query(`
+    TRUNCATE TABLE
+      bom_consumed,
+      bom_produced,
+      bom_parameters,
+      item_bom_routing
+  `);
+
+  console.log("✅ Existing BOM tables truncated");
+
   const [
     bom_parameters,
     bom_produced,
