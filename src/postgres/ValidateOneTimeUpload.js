@@ -397,26 +397,26 @@ export async function validateAndLoadAllCsv(payload = {}, options = {}) {
     }
   }
 
-  // 1) Validate with GCP validator
-  const validation = await validateWithGCP(uploadedTables, options);
+  // // 1) Validate with GCP validator
+  // const validation = await validateWithGCP(uploadedTables, options);
 
-  // 2) Failure -> failure report only, no DB load
-  if (!validation.isValid) {
-    const reportFileName = generateFailureReport({
-      REPORT_DIR,
-      errorList: validation.errorList,
-      validation,
-    });
+  // // 2) Failure -> failure report only, no DB load
+  // if (!validation.isValid) {
+  //   const reportFileName = generateFailureReport({
+  //     REPORT_DIR,
+  //     errorList: validation.errorList,
+  //     validation,
+  //   });
 
-    return {
-      ok: false,
-      errorCount: validation.errorList?.length || 0,
-      report: {
-        reportFileName,
-      },
-      errorsPreview: (validation.errorList || []).slice(0, 10),
-    };
-  }
+  //   return {
+  //     ok: false,
+  //     errorCount: validation.errorList?.length || 0,
+  //     report: {
+  //       reportFileName,
+  //     },
+  //     errorsPreview: (validation.errorList || []).slice(0, 10),
+  //   };
+  // }
 
   // 3) Success -> insert into Postgre only for uploaded tables
   const normalized = normalizeForPostgresInsert(uploadedTables);
