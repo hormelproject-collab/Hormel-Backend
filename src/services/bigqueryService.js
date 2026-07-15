@@ -733,6 +733,33 @@ export const fetchItemMasterReleaseDetailsByItems = async (items = []) => {
 
   return map;
 };
+
+export const fetchResourcesByProducedItemLocation = async (
+  producedItem,
+  location
+) => {
+    console.log("RESOURCE ROUTE HIT");
+  const rows = await runQuery(
+    `
+    SELECT DISTINCT
+      TRIM(CAST(resource AS STRING)) AS resource
+    FROM ${bqTableRefByKey(BQ_TABLE_KEYS.routingRescons)}
+    WHERE UPPER(TRIM(CAST(item AS STRING))) = @item
+      AND UPPER(TRIM(CAST(location AS STRING))) = @location
+      AND resource IS NOT NULL
+      AND TRIM(CAST(resource AS STRING)) <> ''
+    ORDER BY resource
+    `,
+    {
+      item: normalizeUpper(producedItem),
+      location: normalizeUpper(location),
+    }
+  );
+
+  return rows.map((row) => ({
+    resource: normalizeText(row.resource),
+  }));
+};
 export const fetchItemMasterWithReleaseFlag = async ({
   page = 1,
   pageSize = 50,
@@ -948,6 +975,7 @@ export const fetchLocationsBySelectedItems = async () => {
 };
 
 export const fetchAllResourcesFromRoutingResCons = async () => {
+    console.log("RESOURCE ROUTE HIT -- normal");
   const rows = await runQuery(
     `
       SELECT DISTINCT
@@ -1284,51 +1312,130 @@ export const fetchBomIdsLazy = async ({
     },
   };
 };
-
 export const fetchResourcesLazy = async ({
+  producedItem = "",
+  producedItems = [],
+  location = "",
+  locations = [],
   page = 1,
   pageSize = 50,
   search = "",
 } = {}) => {
   const safePage = Math.max(1, Number.parseInt(page, 10) || 1);
-  const safePageSize = Math.min(100, Math.max(1, Number.parseInt(pageSize, 10) || 50));
+  const safePageSize = Math.min(
+    100,
+    Math.max(1, Number.parseInt(pageSize, 10) || 50)
+  );
+
   const offset = (safePage - 1) * safePageSize;
   const searchText = normalizeText(search);
 
+  const itemList = [
+    ...new Set(
+      [
+        producedItem,
+        ...(Array.isArray(producedItems) ? producedItems : []),
+      ]
+        .map((value) => normalizeUpper(value))
+        .filter(Boolean)
+    ),
+  ];
+
+  const locationList = [
+    ...new Set(
+      [
+        location,
+        ...(Array.isArray(locations) ? locations : []),
+      ]
+        .map((value) => normalizeUpper(value))
+        .filter(Boolean)
+    ),
+  ];
+
+  if (!itemList.length) {
+    return {
+      data: [],
+      pagination: {
+        page: safePage,
+        pageSize: safePageSize,
+        total: 0,
+        totalPages: 1,
+        hasPrev: false,
+        hasNext: false,
+        search: searchText,
+      },
+    };
+  }
+ console.log('hitting resource-lazy')
   const rows = await runQuery(
-    `
-      WITH filtered_rows AS (
-        SELECT DISTINCT
-          TRIM(CAST(resource AS STRING)) AS resource,
-          COALESCE(CAST(resource_planning_relevance AS STRING), '') AS resource_planning_relevance
-        FROM ${bqTableRefByKey(BQ_TABLE_KEYS.resourceMaster)}
-        WHERE resource IS NOT NULL
-          AND TRIM(CAST(resource AS STRING)) != ''
-          AND (
-            @searchText = ''
-            OR LOWER(TRIM(CAST(resource AS STRING))) LIKE CONCAT('%', LOWER(@searchText), '%')
-          )
-      ),
-      counted_rows AS (
-        SELECT *, COUNT(1) OVER() AS total_count
-        FROM filtered_rows
-      )
-      SELECT resource, resource_planning_relevance, total_count
-      FROM counted_rows
-      ORDER BY resource
-      LIMIT ${safePageSize}
-      OFFSET ${offset}
-    `,
-    { searchText }
-  );
+  `
+    WITH resource_list AS (
+      SELECT DISTINCT
+        TRIM(CAST(rr.item AS STRING)) AS produced_item,
+        TRIM(CAST(rr.location AS STRING)) AS location,
+        TRIM(CAST(rr.resource AS STRING)) AS resource
+      FROM ${bqTableRefByKey(BQ_TABLE_KEYS.routingRescons)} rr
+      WHERE UPPER(TRIM(CAST(rr.item AS STRING))) IN UNNEST(@itemList)
+        AND (
+          ARRAY_LENGTH(@locationList) = 0
+          OR UPPER(TRIM(CAST(rr.location AS STRING))) IN UNNEST(@locationList)
+        )
+        AND rr.resource IS NOT NULL
+        AND TRIM(CAST(rr.resource AS STRING)) <> ''
+        AND (
+          @searchText = ''
+          OR LOWER(TRIM(CAST(rr.resource AS STRING)))
+             LIKE CONCAT('%', LOWER(@searchText), '%')
+        )
+    ),
+    resource_with_relevancy AS (
+      SELECT
+        rl.produced_item,
+        rl.location,
+        rl.resource,
+        COALESCE(
+          CAST(rm.resource_planning_relevance AS STRING),
+          ''
+        ) AS resource_planning_relevance
+      FROM resource_list rl
+      LEFT JOIN ${bqTableRefByKey(BQ_TABLE_KEYS.resourceMaster)} rm
+        ON UPPER(TRIM(CAST(rl.resource AS STRING))) =
+           UPPER(TRIM(CAST(rm.resource AS STRING)))
+    ),
+    counted_rows AS (
+      SELECT
+        *,
+        COUNT(1) OVER() AS total_count
+      FROM resource_with_relevancy
+    )
+    SELECT
+      produced_item,
+      location,
+      resource,
+      resource_planning_relevance,
+      total_count
+    FROM counted_rows
+    ORDER BY produced_item, location, resource
+    LIMIT ${safePageSize}
+    OFFSET ${offset}
+  `,
+  {
+    itemList,
+    locationList,
+    searchText,
+  }
+);
 
   const total = rows.length ? Number(rows[0].total_count || 0) : 0;
   const totalPages = Math.max(1, Math.ceil(total / safePageSize));
 
   return {
     data: rows.map((row) => ({
+      producedItem: normalizeText(row.produced_item),
+      location: normalizeText(row.location),
       resource: normalizeText(row.resource),
       resourcePlanningRelevance: normalizeText(row.resource_planning_relevance),
+      resourceRelevancy: normalizeText(row.resource_planning_relevance),
       resource_relevancy: normalizeText(row.resource_planning_relevance),
     })),
     pagination: {
@@ -1342,7 +1449,77 @@ export const fetchResourcesLazy = async ({
     },
   };
 };
+export const fetchBomVersionsByProducedItemLocation = async ({
+  producedItem,
+  location,
+} = {}) => {
+  const cleanProducedItem = normalizeText(producedItem);
+  const cleanLocation = normalizeText(location);
 
+  if (!cleanProducedItem || !cleanLocation) {
+    return [];
+  }
+
+  const tableName = appConfig.postgres.tables.bomProduced;
+  const columns = await getPostgresTableColumns(tableName);
+
+  const bomIdColumn = findColumn(columns, [
+    "bom_id",
+    "bomId",
+    "BOMID",
+    "bomid",
+  ]);
+
+  const bomVersionColumn = findColumn(columns, [
+    "bom_version",
+    "bomVersion",
+    "BOM_VERSION",
+    "version",
+  ]);
+
+  const itemColumn = findColumn(columns, [
+    "item",
+    "produced_item",
+    "producedItem",
+    "item_id",
+  ]);
+
+  const locationColumn = findColumn(columns, [
+    "location",
+    "Location",
+    "location_id",
+  ]);
+
+  if (!itemColumn || !locationColumn || !bomIdColumn) {
+    throw new Error(
+      "bom_produced table is missing item/location/bom_id columns required for BOM version lookup"
+    );
+  }
+
+  const versionExpression = bomVersionColumn
+    ? `COALESCE(
+        NULLIF(TRIM(CAST(bp.${quoteIdent(bomVersionColumn)} AS TEXT)), ''),
+        SPLIT_PART(TRIM(CAST(bp.${quoteIdent(bomIdColumn)} AS TEXT)), '_', 1)
+      )`
+    : `SPLIT_PART(TRIM(CAST(bp.${quoteIdent(bomIdColumn)} AS TEXT)), '_', 1)`;
+
+  const rows = await runPgQuery(
+    `
+      SELECT DISTINCT
+        ${versionExpression} AS bom_version
+      FROM ${pgTableRef(tableName)} bp
+      WHERE UPPER(TRIM(CAST(bp.${quoteIdent(itemColumn)} AS TEXT))) = UPPER($1)
+        AND UPPER(TRIM(CAST(bp.${quoteIdent(locationColumn)} AS TEXT))) = UPPER($2)
+        AND TRIM(CAST(bp.${quoteIdent(bomIdColumn)} AS TEXT)) <> ''
+      ORDER BY bom_version
+    `,
+    [cleanProducedItem, cleanLocation]
+  );
+
+  return rows
+    .map((row) => normalizeText(row.bom_version))
+    .filter(Boolean);
+};
 export const fetchCoProductItemsLazy = async ({
   page = 1,
   pageSize = 50,

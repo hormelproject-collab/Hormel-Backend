@@ -272,9 +272,8 @@ export function validateModifyEntryPayload(payload = {}) {
       if (componentItem) seenComponents.add(key);
     });
 
-    const seenCoProducts = new Set();
-    const seenRoutingRows = new Set();
-    const seenPriorities = new Set();
+  const seenCoProducts = new Set();
+const seenPriorityRoutingMap = new Map();
 
     const addDuplicatePriorityError = ({ priorityValue, record, item, routingId }) => {
       failures.push(
@@ -293,19 +292,43 @@ export function validateModifyEntryPayload(payload = {}) {
         })
       );
     };
+const validatePriorityDuplicate = ({ priorityValue, record, item, routingId }) => {
+  if (priorityValue === "" || priorityValue === null || priorityValue === undefined) return;
 
-    if (priority !== "" && priority !== null && priority !== undefined) {
-      const mainPriorityKey = `${bomId}__${priority}`.toUpperCase();
-      if (seenPriorities.has(mainPriorityKey)) {
-        addDuplicatePriorityError({
-          priorityValue: priority,
-          record: `${locationIndex + 1}.R`,
-          item: producedItem,
-          routingId,
-        });
-      }
-      seenPriorities.add(mainPriorityKey);
-    }
+  const cleanPriority = norm(priorityValue);
+  const cleanRoutingId = norm(routingId).toUpperCase();
+
+  if (!cleanPriority || !cleanRoutingId) return;
+
+  const priorityBomKey = `${bomId}__${cleanPriority}`.toUpperCase();
+  const existingRoutingIds = seenPriorityRoutingMap.get(priorityBomKey) || new Set();
+
+  // Same BOM + same Priority + same Routing ID is allowed.
+  // This is valid when multiple co-products are attached to same resource/routing.
+  if (existingRoutingIds.has(cleanRoutingId)) {
+    return;
+  }
+
+  // Same BOM + same Priority + different Routing ID is duplicate.
+  if (existingRoutingIds.size > 0) {
+    addDuplicatePriorityError({
+      priorityValue: cleanPriority,
+      record,
+      item,
+      routingId,
+    });
+    return;
+  }
+
+  existingRoutingIds.add(cleanRoutingId);
+  seenPriorityRoutingMap.set(priorityBomKey, existingRoutingIds);
+};
+  validatePriorityDuplicate({
+  priorityValue: priority,
+  record: `${locationIndex + 1}.R`,
+  item: producedItem,
+  routingId,
+});
 
     coProductItems.forEach((cp, cpIndex) => {
       const coProductItem = getCoProductItem(cp);
@@ -314,9 +337,10 @@ export function validateModifyEntryPayload(payload = {}) {
       const cpResource = norm(cp?.resource) || getResourceFromRoutingId(cp?.routingId) || resource;
       const cpRoutingId = norm(cp?.routingId) || buildRoutingId(producedItem, cpResource);
       const cpPriority = getCoProductPriority(cp);
-      const coProductKey = `${bomId}__${location}__${coProductItem}`.toUpperCase();
-      const routingKey = `${bomId}__${cpRoutingId}__${coProductItem}`.toUpperCase();
-      const priorityKey = `${bomId}__${cpPriority}`.toUpperCase();
+
+      const coProductKey = `${bomId}__${cpRoutingId}__${coProductItem}`.toUpperCase();
+     
+
 
       if (!coProductItem) {
         failures.push(
@@ -405,53 +429,34 @@ export function validateModifyEntryPayload(payload = {}) {
         );
       }
 
-      if (coProductItem && seenCoProducts.has(coProductKey)) {
-        failures.push(
-          buildErrorRow({
-            table: "BOM_PRODUCED",
-            record: `${locationIndex + 1}.CP${cpIndex + 1}`,
-            bomId,
-            item: coProductItem,
-            location,
-            field: "coProductItem",
-            seq: "M1006",
-            validation: "Duplicate co-product item for the same BOM/location is not allowed.",
-            error: `Co-product "${coProductItem}" is duplicated for BOM "${bomId}" at location "${location}".`,
-            rm: "Remove duplicate co-product rows for the same BOM/location.",
-          })
-        );
-      }
+    if (coProductItem && cpRoutingId && seenCoProducts.has(coProductKey)) {
+  failures.push(
+    buildErrorRow({
+      table: "BOM_PRODUCED",
+      record: `${locationIndex + 1}.CP${cpIndex + 1}`,
+      bomId,
+      item: coProductItem,
+      location,
+      routingId: cpRoutingId,
+      field: "coProductItem",
+      seq: "M1006",
+      validation: "Duplicate co-product item for the same BOM/routing ID is not allowed.",
+      error: `Co-product "${coProductItem}" is duplicated for BOM "${bomId}" and routing ID "${cpRoutingId}".`,
+      rm: "Remove duplicate co-product rows only when the item, BOM ID, and routing ID are the same.",
+    })
+  );
+}
 
-      if (cpRoutingId && coProductItem && seenRoutingRows.has(routingKey)) {
-        failures.push(
-          buildErrorRow({
-            table: "ITEM_BOM_ROUTING",
-            record: `${locationIndex + 1}.CP${cpIndex + 1}.R`,
-            bomId,
-            item: coProductItem,
-            location,
-            routingId: cpRoutingId,
-            field: "routingId",
-            seq: "M1019",
-            validation: "Duplicate item/BOM/routing combination is not allowed.",
-            error: `Duplicate routing row found for item "${coProductItem}", BOM "${bomId}", routing "${cpRoutingId}".`,
-            rm: "Remove duplicate routing rows.",
-          })
-        );
-      }
+     
 
-      if (cpPriority !== "" && cpPriority !== null && cpPriority !== undefined && seenPriorities.has(priorityKey)) {
-        addDuplicatePriorityError({
-          priorityValue: cpPriority,
-          record: `${locationIndex + 1}.CP${cpIndex + 1}.R`,
-          item: coProductItem,
-          routingId: cpRoutingId,
-        });
-      }
+   validatePriorityDuplicate({
+  priorityValue: cpPriority,
+  record: `${locationIndex + 1}.CP${cpIndex + 1}.R`,
+  item: coProductItem,
+  routingId: cpRoutingId,
+});
 
       if (coProductItem) seenCoProducts.add(coProductKey);
-      if (cpRoutingId && coProductItem) seenRoutingRows.add(routingKey);
-      if (cpPriority !== "" && cpPriority !== null && cpPriority !== undefined) seenPriorities.add(priorityKey);
     });
   });
 

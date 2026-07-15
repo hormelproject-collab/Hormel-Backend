@@ -2,6 +2,7 @@ import express from "express";
 import appConfig from "../config/appConfig.js";
 import {
   fetchFromTable,
+  fetchResourcesByProducedItemLocation,
   fetchItemMasterWithReleaseFlag,
   fetchLocationsBySelectedItems,
   fetchResourceComponentMetadata,
@@ -11,6 +12,7 @@ import {
   fetchResourceRelevancyByResource,
   fetchItemReleaseFlagByItem,
   fetchResourcesLazy,
+  fetchBomVersionsByProducedItemLocation,
   fetchCoProductItemsLazy,
   fetchBomIdsLazy
 } from "../services/bigqueryService.js";
@@ -149,7 +151,48 @@ router.post("/locations-by-items", async (req, res) => {
     });
   }
 });
+router.get(
+  "/bom-routing-step1/resources-by-item-location",
+  async (req, res) => {
+    try {
+        console.log("RESOURCE ROUTE HIT");
+      const producedItem = String(
+        req.query.producedItem || ""
+      ).trim();
 
+      const location = String(
+        req.query.location || ""
+      ).trim();
+
+      if (!producedItem || !location) {
+        return res.status(400).json({
+          error: "producedItem and location are required",
+        });
+      }
+
+      const data =
+        await fetchResourcesByProducedItemLocation(
+          producedItem,
+          location
+        );
+
+      return res.status(200).json({
+        success: true,
+        data,
+      });
+    } catch (error) {
+      console.error(
+        "Error fetching resources by item/location:",
+        error
+      );
+
+      return res.status(500).json({
+        error: "Failed to fetch resources",
+        details: error.message,
+      });
+    }
+  }
+);
 router.post("/by-items", async (req, res) => {
   try {
     const { itemIds } = req.body;
@@ -261,15 +304,16 @@ router.get("/bom-routing-step1/bom-details/:bomId", async (req, res) => {
   }
 });
 
-router.get("/bom-routing-step1/resources", async (_req, res) => {
-  try {
-    const data = await fetchAllResourcesFromRoutingResCons();
-    return res.status(200).json({ success: true, data });
-  } catch (error) {
-    console.error("Error fetching resources:", error);
-    return res.status(500).json({ error: "Failed to fetch resources", details: error.message });
-  }
-});
+// router.get("/bom-routing-step1/resources", async (_req, res) => {
+//   try {
+//       console.log("RESOURCE ROUTE HIT --normal");
+//     const data = await fetchAllResourcesFromRoutingResCons();
+//     return res.status(200).json({ success: true, data });
+//   } catch (error) {
+//     console.error("Error fetching resources:", error);
+//     return res.status(500).json({ error: "Failed to fetch resources", details: error.message });
+//   }
+// });
 
 router.get("/bom-routing-step1/resource-relevancy/:resource", async (req, res) => {
   try {
@@ -360,19 +404,30 @@ router.get("/bom-routing-step1/bom-ids-lazy", async (req, res) => {
 
 router.get("/bom-routing-step1/resources-lazy", async (req, res) => {
   try {
+    const producedItems = String(req.query.producedItems || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    const locations = String(req.query.locations || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+
     const result = await fetchResourcesLazy({
+      producedItem: req.query.producedItem,
+      producedItems,
+      location: req.query.location,
+      locations,
       page: req.query.page,
       pageSize: req.query.pageSize,
       search: req.query.search,
     });
-
-    return res.status(200).json({
-      success: true,
-      data: result.data,
-      pagination: result.pagination,
-    });
+    console.log(JSON.stringify(result));
+    return res.status(200).json(result);
   } catch (error) {
     console.error("Error fetching lazy resources:", error);
+
     return res.status(500).json({
       success: false,
       error: "Failed to fetch resources",
@@ -380,7 +435,37 @@ router.get("/bom-routing-step1/resources-lazy", async (req, res) => {
     });
   }
 });
+router.get("/bom-routing-step1/bom-versions-by-item-location", async (req, res) => {
+  try {
+    const producedItem = String(req.query.producedItem || req.query.item || "").trim();
+    const location = String(req.query.location || "").trim();
 
+    if (!producedItem || !location) {
+      return res.status(400).json({
+        success: false,
+        error: "producedItem and location are required",
+      });
+    }
+
+    const data = await fetchBomVersionsByProducedItemLocation({
+      producedItem,
+      location,
+    });
+
+    return res.status(200).json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error("Error fetching BOM versions by produced item/location:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch BOM versions",
+      details: error.message,
+    });
+  }
+});
 router.get("/bom-routing-step1/co-product-items-lazy", async (req, res) => {
   try {
     const result = await fetchCoProductItemsLazy({

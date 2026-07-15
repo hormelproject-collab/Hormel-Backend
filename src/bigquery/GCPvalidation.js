@@ -1,4 +1,4 @@
-import bigquery from "./bigquery.js";
+import bigquery from "../db/bigqueryClient.js";
 
 
 

@@ -7,7 +7,7 @@ import XLSX from "xlsx";
 import os from "os";
 import { fetchItemMasterReleaseDetailsByItems } from "../services/bigqueryService.js";
 import { validateItemBomRoutingCreatePayload } from "../bigquery/manualentryitembomValidation.js";
-import { fetchItemMasterWithReleaseFlag } from "../services/bigQueryService.js";
+import { fetchItemMasterWithReleaseFlag } from "../services/bigqueryService.js";
 import validateModifyEntryPayload from "../bigquery/modifyentryvalidation.js";
 
 const router = express.Router();
@@ -35,7 +35,7 @@ const CFG = Object.freeze({
     database: appConfig.postgres.database,
   },
   bq: {
-    projectId: appConfig.bigQuery.projectId,
+    projectId: appConfig.bigQuery.projectIds.dev,
     dataset: appConfig.bigQuery.datasetId,
   },
   tables: {
@@ -3130,8 +3130,9 @@ router.put("/modify-bom", async (req, res) => {
     const consolidatedLocations = new Set();
     const consolidatedResources = new Set();
     const consolidatedSummaryCategories = new Set();
-    const consolidatedItems = new Set();
+    const consolidatedProducedItems = new Set();
     const consolidatedConsumedItems = new Set();
+    const consolidatedItems = new Set();
 
     const modifyChangeCounters = {
       componentsAdded: 0,
@@ -3386,7 +3387,12 @@ router.put("/modify-bom", async (req, res) => {
       if (!mainRoutingId) {
         throw new Error("routingId could not be derived");
       }
+      const mainProducedItem = toText(producedItem.item);
 
+      if (mainProducedItem) {
+        consolidatedProducedItems.add(mainProducedItem);
+        consolidatedItems.add(mainProducedItem);
+      }
       const requestedComponentItems = Array.isArray(location?.componentItems)
         ? location.componentItems
         : [];
@@ -3475,32 +3481,6 @@ router.put("/modify-bom", async (req, res) => {
         bomProducedIdColumn
       );
 
-      await client.query(
-        `
-        UPDATE ${pgRef(T.bomProduced)}
-        SET
-          item = $1,
-          location = $2,
-          bom_status = $3,
-          bom_version = $4,
-          prefix = $5,
-          bom_plan_type = $6,
-          erp_bom_qty_produced_per = $7,
-          load_datetime = $8
-        WHERE ${quoteIdent(bomProducedIdColumn)} = $9
-        `,
-        [
-          producedItem.item || null,
-          locationName,
-          HARD_CODED_BOM_STATUS,
-          derivedBomVersion || null,
-          HARD_CODED_PREFIX,
-          HARD_CODED_BOM_PLAN_TYPE,
-          1,
-          HARD_CODED_LOAD_DATETIME,
-          primaryProducedActualRecId,
-        ]
-      );
 
       const liveCoProductMap = new Map(
         liveCoProductRows.map((row) => [buildProducedKey(row), row])
@@ -3611,6 +3591,7 @@ router.put("/modify-bom", async (req, res) => {
           await client.query(producedInsert.query, producedInsert.values);
         }
 
+        consolidatedProducedItems.add(coProductItem);
         consolidatedItems.add(coProductItem);
         consolidatedLocations.add(locationName);
 
@@ -3732,27 +3713,7 @@ router.put("/modify-bom", async (req, res) => {
         itemBomRoutingIdColumn
       );
 
-      await client.query(
-        buildRoutingUpdateQuery({ includeResource: true }),
-        itemBomRoutingResourceColumn
-          ? [
-            producedItem.item || primaryRoutingLiveRow.item || null,
-            mainRoutingId || primaryRoutingLiveRow.routing_id || null,
-            priority,
-            null,
-            HARD_CODED_LOAD_DATETIME,
-            resource,
-            primaryRoutingActualRecId,
-          ]
-          : [
-            producedItem.item || primaryRoutingLiveRow.item || null,
-            mainRoutingId || primaryRoutingLiveRow.routing_id || null,
-            priority,
-            null,
-            HARD_CODED_LOAD_DATETIME,
-            primaryRoutingActualRecId,
-          ]
-      );
+
 
       const liveMainRoutingMap = new Map(
         liveMainRoutingRows.map((row) => [
@@ -3790,6 +3751,10 @@ router.put("/modify-bom", async (req, res) => {
         coProductAssociation,
         templateRow,
       }) => {
+        if (priorityValue === "" || priorityValue === null || priorityValue === undefined || Number.isNaN(Number(priorityValue))) {
+          throw new Error(`Item BOM Routing Priority is required for item ${item}`);
+        }
+
         const newRoutingRow = {
           ...templateRow,
           bom_id: bomId,
@@ -3798,8 +3763,7 @@ router.put("/modify-bom", async (req, res) => {
           ...(itemBomRoutingResourceColumn
             ? { resourceValue }
             : {}),
-
-          erp_item_bom_routing_priority: priorityValue,
+          erp_item_bom_routing_priority: Number(priorityValue),
           erp_item_bom_routing_min_lot_size:
             templateRow?.erp_item_bom_routing_min_lot_size ?? 1,
           erp_item_bom_routing_lot_size_increment:
@@ -3839,6 +3803,19 @@ router.put("/modify-bom", async (req, res) => {
         await client.query(routingInsert.query, routingInsert.values);
       };
 
+      const existingMainRoutingPriority =
+        primaryRoutingLiveRow?.erp_item_bom_routing_priority === "" ||
+          primaryRoutingLiveRow?.erp_item_bom_routing_priority === null ||
+          primaryRoutingLiveRow?.erp_item_bom_routing_priority === undefined
+          ? null
+          : Number(primaryRoutingLiveRow.erp_item_bom_routing_priority);
+
+      if (existingMainRoutingPriority === null || Number.isNaN(existingMainRoutingPriority)) {
+        throw new Error(
+          `Existing Item BOM Routing Priority is missing for main produced item ${producedItem.item}`
+        );
+      }
+
       for (const cp of requestedCoProductItems) {
         const coProductItem = String(cp?.coProductItem || "").trim();
 
@@ -3864,33 +3841,6 @@ router.put("/modify-bom", async (req, res) => {
           );
         }
 
-        const rawCoProductPriority =
-          cp?.itemBomRoutingPriority ??
-          cp?.item_bom_routing_priority ??
-          cp?.erp_item_bom_routing_priority ??
-          cp?.routingPriority ??
-          "";
-
-        const coProductPriority =
-          rawCoProductPriority === "" ||
-            rawCoProductPriority === null ||
-            rawCoProductPriority === undefined
-            ? null
-            : Number(rawCoProductPriority);
-
-        if (coProductPriority === null || Number.isNaN(coProductPriority)) {
-          throw new Error(
-            `Item BOM Routing Priority is required for co-product ${coProductItem}`
-          );
-        }
-
-        const mainRoutingKey = [
-          bomId,
-          coProductRoutingId,
-          producedItem.item,
-          "MAIN",
-        ].join("__");
-
         const coProductRoutingKey = [
           bomId,
           coProductRoutingId,
@@ -3900,49 +3850,39 @@ router.put("/modify-bom", async (req, res) => {
 
         requestedCoProductRoutingMap.set(coProductRoutingKey, true);
 
-        const existingMainRoutingRow =
-          liveMainRoutingMap.get(mainRoutingKey) || null;
-
         const existingCoProductRoutingRow =
           liveCoProductRoutingMap.get(coProductRoutingKey) || null;
 
-        if (existingMainRoutingRow) {
-          const existingMainRoutingRecId = getResolvedRowId(
-            existingMainRoutingRow,
-            itemBomRoutingIdColumn
-          );
+        const rawCoProductPriority =
+          cp?.itemBomRoutingPriority ??
+          cp?.item_bom_routing_priority ??
+          cp?.erp_item_bom_routing_priority ??
+          cp?.routingPriority ??
+          "";
 
-          await client.query(
-            buildRoutingUpdateQuery({ includeResource: true }),
-            itemBomRoutingResourceColumn
-              ? [
-                producedItem.item || existingMainRoutingRow.item || null,
-                coProductRoutingId,
-                coProductPriority,
-                null,
-                HARD_CODED_LOAD_DATETIME,
-                coProductResource,
-                existingMainRoutingRecId,
-              ]
-              : [
-                producedItem.item || existingMainRoutingRow.item || null,
-                coProductRoutingId,
-                coProductPriority,
-                null,
-                HARD_CODED_LOAD_DATETIME,
-                existingMainRoutingRecId,
-              ]
+        const existingCoProductPriority =
+          existingCoProductRoutingRow?.erp_item_bom_routing_priority === "" ||
+            existingCoProductRoutingRow?.erp_item_bom_routing_priority === null ||
+            existingCoProductRoutingRow?.erp_item_bom_routing_priority === undefined
+            ? null
+            : Number(existingCoProductRoutingRow.erp_item_bom_routing_priority);
+
+        const coProductPriority =
+          rawCoProductPriority === "" ||
+            rawCoProductPriority === null ||
+            rawCoProductPriority === undefined
+            ? existingCoProductPriority ?? existingMainRoutingPriority
+            : Number(rawCoProductPriority);
+
+        if (coProductPriority === null || Number.isNaN(coProductPriority)) {
+          throw new Error(
+            `Item BOM Routing Priority is required for co-product ${coProductItem}`
           );
-        } else {
-          await insertItemBomRoutingRow({
-            item: producedItem.item,
-            routingId: coProductRoutingId,
-            resourceValue: coProductResource,
-            priorityValue: coProductPriority,
-            coProductAssociation: null,
-            templateRow: primaryRoutingLiveRow,
-          });
         }
+
+        // IMPORTANT:
+        // Do not insert/update main item routing row here.
+        // Modify flow only manages co-product IBR rows.
 
         if (existingCoProductRoutingRow) {
           const existingCoProductRoutingRecId = getResolvedRowId(
@@ -3982,8 +3922,11 @@ router.put("/modify-bom", async (req, res) => {
           });
         }
 
-        consolidatedItems.add(producedItem.item);
-        consolidatedItems.add(coProductItem);
+        if (coProductItem) {
+          consolidatedProducedItems.add(coProductItem);
+          consolidatedItems.add(coProductItem);
+        }
+
         consolidatedLocations.add(locationName);
 
         if (coProductResource) {
@@ -4004,26 +3947,10 @@ router.put("/modify-bom", async (req, res) => {
         const rowBomId = toText(row?.bom_id).toUpperCase();
         const rowItem = toText(row?.item).toUpperCase();
 
-        /*
-          Delete only co-product records from item_bom_routing.
-      
-          Requirement:
-          - If user removes a co-product in Modify BOM,
-            delete that co-product from bom_produced and item_bom_routing.
-          - Match by BOM ID + co-product item.
-          - Do NOT delete main produced item routing rows.
-        */
         const isRemovedCoProductItem =
           rowBomId === toText(bomId).toUpperCase() &&
           removedCoProductItems.has(rowItem);
 
-        /*
-          Keep existing behavior:
-          If an old co-product routing row is no longer requested,
-          remove that old co-product routing row.
-          This still only applies to liveCoProductRoutingRows,
-          so main item rows are not touched.
-        */
         const isOldCoProductRoutingNoLongerRequested =
           !requestedCoProductRoutingMap.has(key);
 
@@ -4031,11 +3958,9 @@ router.put("/modify-bom", async (req, res) => {
           continue;
         }
 
-        await deleteExactItemBomRoutingRowByBomIdAndItem({
-          client,
-          bomId: rowBomId,
-          item: rowItem,
-        });
+        // Delete exact co-product IBR row only.
+        // Main produced item routing rows are never deleted here.
+        await deleteExactRowById(T.itemBomRouting, itemBomRoutingIdColumn, row);
 
         consolidatedSummaryCategories.add("routing information");
       }
@@ -4197,10 +4122,15 @@ router.put("/modify-bom", async (req, res) => {
       .filter(Boolean)
       .join(", ");
 
-    const consolidatedItemText = Array.from(consolidatedItems)
+    const consolidatedProducedItemText = Array.from(consolidatedProducedItems)
       .filter(Boolean)
       .join(", ");
+
     const consolidatedConsumedItemText = Array.from(consolidatedConsumedItems)
+      .filter(Boolean)
+      .join(", ");
+
+    const consolidatedItemText = Array.from(consolidatedItems)
       .filter(Boolean)
       .join(", ");
 
@@ -4245,18 +4175,29 @@ router.put("/modify-bom", async (req, res) => {
 
     if (changeLogColumns.includes("produced_item")) {
       consolidatedChangeLogRow.produced_item =
-        producedItem.item || consolidatedItemText || "";
+        consolidatedProducedItemText || producedItem.item || "";
+    }
+
+    if (changeLogColumns.includes("produced_items")) {
+      consolidatedChangeLogRow.produced_items =
+        consolidatedProducedItemText || producedItem.item || "";
+    }
+
+    if (changeLogColumns.includes("consumed_item")) {
+      consolidatedChangeLogRow.consumed_item = consolidatedConsumedItemText;
+    }
+
+    if (changeLogColumns.includes("consumed_items")) {
+      consolidatedChangeLogRow.consumed_items = consolidatedConsumedItemText;
     }
 
     if (changeLogColumns.includes("item")) {
       consolidatedChangeLogRow.item =
-        consolidatedItemText || producedItem.item || "";
-    }
-    if (changeLogColumns.includes("consumed_item")) {
-      consolidatedChangeLogRow.consumed_item = consolidatedConsumedItemText;
-    }
-    if (changeLogColumns.includes("consumed_items")) {
-      consolidatedChangeLogRow.consumed_items = consolidatedConsumedItemText;
+        consolidatedItemText ||
+        consolidatedProducedItemText ||
+        consolidatedConsumedItemText ||
+        producedItem.item ||
+        "";
     }
 
     if (changeLogColumns.includes("location")) {
@@ -6036,8 +5977,17 @@ router.get("/existing-item-bom-routing-search", async (req, res) => {
     const routingValueExpr = `TRIM(CAST(ibr.routing_id AS TEXT))`;
     const itemValueExpr = `TRIM(CAST(ibr.item AS TEXT))`;
     const bomValueExpr = `TRIM(CAST(ibr.bom_id AS TEXT))`;
-    const associationExpr = `COALESCE(NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), ''), '')`;
 
+    const associationExpr = `
+      COALESCE(
+        NULLIF(TRIM(CAST(ibr.erp_co_product_association AS TEXT)), ''),
+        ''
+      )
+    `;
+
+    // IMPORTANT:
+    // Actual column is erp_item_bom_routing_priority.
+    // Do NOT use item_bom_routing_priority because it does not exist.
     const itemBomRoutingPriorityExpr = `
       COALESCE(
         NULLIF(TRIM(CAST(ibr.erp_item_bom_routing_priority AS TEXT)), ''),
@@ -6045,7 +5995,13 @@ router.get("/existing-item-bom-routing-search", async (req, res) => {
       )
     `;
 
-    const locationExpr = `''`;
+    // Location comes from bom_produced.
+    const locationExpr = `
+      COALESCE(
+        NULLIF(TRIM(CAST(bp.location AS TEXT)), ''),
+        ''
+      )
+    `;
 
     const resourceExpr = `
       COALESCE(
@@ -6129,7 +6085,17 @@ router.get("/existing-item-bom-routing-search", async (req, res) => {
 
     const result = await pool.query(
       `
-        WITH filtered_rows AS (
+        WITH bom_produced_location AS (
+          SELECT DISTINCT
+            TRIM(CAST(bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(location AS TEXT)) AS location
+          FROM ${pgRef(T.bomProduced)}
+          WHERE bom_id IS NOT NULL
+            AND TRIM(CAST(bom_id AS TEXT)) <> ''
+            AND location IS NOT NULL
+            AND TRIM(CAST(location AS TEXT)) <> ''
+        ),
+        filtered_rows AS (
           SELECT
             TRIM(CAST(ibr.rec_id AS TEXT)) AS rec_id,
             ${itemValueExpr} AS item,
@@ -6137,9 +6103,12 @@ router.get("/existing-item-bom-routing-search", async (req, res) => {
             ${routingValueExpr} AS routing_id,
             ${associationExpr} AS erp_co_product_association,
             ${itemBomRoutingPriorityExpr} AS erp_item_bom_routing_priority,
+            ${itemBomRoutingPriorityExpr} AS item_bom_routing_priority,
             ${locationExpr} AS location,
             ${resourceExpr} AS resource
           FROM ${pgRef(T.itemBomRouting)} ibr
+          LEFT JOIN bom_produced_location bp
+            ON bp.bom_id = TRIM(CAST(ibr.bom_id AS TEXT))
           ${whereClause}
         ),
         counted_rows AS (
@@ -6155,6 +6124,7 @@ router.get("/existing-item-bom-routing-search", async (req, res) => {
           routing_id,
           erp_co_product_association,
           erp_item_bom_routing_priority,
+          item_bom_routing_priority,
           location,
           resource,
           total_count
@@ -6210,7 +6180,6 @@ router.get("/existing-item-bom-routing-search", async (req, res) => {
 });
 
 
-
 /* =========================================================
    DELETE ITEM BOM ROUTING - Execute delete with archive
 ========================================================= */
@@ -6262,18 +6231,41 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       return parts.length >= 3 ? parts.slice(2).join("_") : "";
     };
 
-    const getResourceFromRoutingId = (routingId) => {
+    const parseRoutingIdParts = (routingId) => {
       const value = normalizeTextLocal(routingId);
-      if (!value) return "";
 
-      const parts = value
+      if (!value) {
+        return {
+          itemFromRoutingId: "",
+          resourceFromRoutingId: "",
+        };
+      }
+
+      const cleanValue = value.replace(/^ROUTING_/i, "");
+
+      const parts = cleanValue
         .split("_")
         .map((p) => p.trim())
         .filter(Boolean);
 
-      // Required frontend/display format: ROUTING_item_resource
-      // Resource is everything after the second underscore.
-      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+      return {
+        itemFromRoutingId: parts[0] || "",
+        resourceFromRoutingId:
+          parts.length >= 2 ? parts.slice(1).join("_") : "",
+      };
+    };
+
+    const getResourceFromRoutingId = (routingId) => {
+      return parseRoutingIdParts(routingId).resourceFromRoutingId;
+    };
+
+    const buildMainItemRoutingId = (mainProducedItem, resource) => {
+      const cleanItem = normalizeTextLocal(mainProducedItem);
+      const cleanResource = normalizeTextLocal(resource);
+
+      if (!cleanItem || !cleanResource) return "";
+
+      return `ROUTING_${cleanItem}_${cleanResource}`;
     };
 
     const getSourceRowsForRecord = async (record) => {
@@ -6288,9 +6280,9 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       if (recId) {
         return client.query(
           `
-            SELECT *
-            FROM ${pgRef(T.itemBomRouting)}
-            WHERE TRIM(CAST(rec_id AS TEXT)) = $1
+          SELECT *
+          FROM ${pgRef(T.itemBomRouting)}
+          WHERE TRIM(CAST(rec_id AS TEXT)) = $1
           `,
           [recId]
         );
@@ -6326,9 +6318,9 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
       return client.query(
         `
-          SELECT *
-          FROM ${pgRef(T.itemBomRouting)}
-          WHERE ${conditions.join(" AND ")}
+        SELECT *
+        FROM ${pgRef(T.itemBomRouting)}
+        WHERE ${conditions.join(" AND ")}
         `,
         params
       );
@@ -6346,6 +6338,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     const changeLogTable = T.changeLog;
 
     const archiveExists = await pgTableExists(client, archiveTable);
+
     if (!archiveExists) {
       return res.status(500).json({
         success: false,
@@ -6357,6 +6350,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       client,
       bomProducedArchiveTable
     );
+
     if (!bomProducedArchiveExists) {
       return res.status(500).json({
         success: false,
@@ -6365,6 +6359,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     }
 
     const changeLogExists = await pgTableExists(client, changeLogTable);
+
     if (!changeLogExists) {
       return res.status(500).json({
         success: false,
@@ -6380,10 +6375,12 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     const chicagoNowText = getChicagoDateTimeFormatted();
 
     const archiveColumns = await getExistingColumns(client, archiveTable);
+
     const bomProducedArchiveColumns = await getExistingColumns(
       client,
       bomProducedArchiveTable
     );
+
     const changeLogColumns = await getExistingColumns(client, changeLogTable);
 
     const archivedRecIds = [];
@@ -6420,13 +6417,47 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
           processedLiveKeys.add(liveUniqueKey);
 
+          const parsedRouting = parseRoutingIdParts(row.routing_id);
+
+          /*
+            Important:
+            routing_id must always be ROUTING_mainProducedItem_resource.
+            Even if the row.item is a co-product, the routing_id item part
+            should remain the main produced item.
+          */
+          const mainProducedItem =
+            normalizeTextLocal(parsedRouting.itemFromRoutingId) ||
+            normalizeTextLocal(row.produced_item) ||
+            normalizeTextLocal(record?.produced_item) ||
+            normalizeTextLocal(record?.producedItem) ||
+            normalizeTextLocal(row.item);
+
+          const rowItem = normalizeTextLocal(row.item);
+
+          const derivedLocation = normalizeTextLocal(
+            row.location || getLocationFromBomId(row.bom_id)
+          );
+
+          const derivedResource =
+            normalizeTextLocal(row.resource) ||
+            normalizeTextLocal(parsedRouting.resourceFromRoutingId);
+
+          const normalizedRoutingId =
+            buildMainItemRoutingId(mainProducedItem, derivedResource) ||
+            normalizeTextLocal(row.routing_id);
+
           const archiveRow = { ...row };
 
           delete archiveRow.postgresql_rec_id;
 
+          if (archiveColumns.includes("routing_id")) {
+            archiveRow.routing_id = normalizedRoutingId;
+          }
+
           if (archiveColumns.includes("engineering_change_id")) {
             archiveRow.engineering_change_id = engineeringChangeId;
           }
+
           if (archiveColumns.includes("engineeringchangeid")) {
             archiveRow.engineeringchangeid = engineeringChangeId;
           }
@@ -6434,6 +6465,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           if (archiveColumns.includes("change_type")) {
             archiveRow.change_type = "Deleted";
           }
+
           if (archiveColumns.includes("changetype")) {
             archiveRow.changetype = "Deleted";
           }
@@ -6441,9 +6473,11 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           if (archiveColumns.includes("notes")) {
             archiveRow.notes = notes || "";
           }
+
           if (archiveColumns.includes("summarynotes")) {
             archiveRow.summarynotes = notes || "";
           }
+
           if (archiveColumns.includes("change_summary")) {
             archiveRow.change_summary = "";
           }
@@ -6451,6 +6485,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           if (archiveColumns.includes("source_table")) {
             archiveRow.source_table = T.itemBomRouting;
           }
+
           if (archiveColumns.includes("source_rec_id")) {
             archiveRow.source_rec_id =
               row.rec_id ?? row.record_id ?? row.recordid ?? null;
@@ -6482,12 +6517,15 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           if (archiveColumns.includes("archived_at")) {
             archiveRow.archived_at = chicagoNowText;
           }
+
           if (archiveColumns.includes("archived_on")) {
             archiveRow.archived_on = chicagoNowText;
           }
+
           if (archiveColumns.includes("deleted_at")) {
             archiveRow.deleted_at = chicagoNowText;
           }
+
           if (archiveColumns.includes("deleted_on")) {
             archiveRow.deleted_on = chicagoNowText;
           }
@@ -6512,31 +6550,41 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
             }
           }
 
-          const producedItem = normalizeTextLocal(
-            row.produced_item ?? row.item ?? ""
-          );
-          const derivedLocation = normalizeTextLocal(
-            row.location || getLocationFromBomId(row.bom_id)
-          );
-          const derivedResource = normalizeTextLocal(
-            row.resource || getResourceFromRoutingId(row.routing_id)
-          );
-
           if (row.bom_id) {
             consolidatedBomIds.add(normalizeTextLocal(row.bom_id));
           }
+
           if (derivedLocation) {
             consolidatedLocations.add(derivedLocation);
           }
+
           if (derivedResource) {
             consolidatedResources.add(derivedResource);
           }
-          if (producedItem) {
-            consolidatedProducedItems.add(producedItem);
+
+          /*
+            produced_item in change log should contain:
+            - main produced item
+            - co-product item(s), if the deleted row is a co-product
+          */
+          if (mainProducedItem) {
+            consolidatedProducedItems.add(mainProducedItem);
           }
 
+          if (isTruthyCoProductAssociation(row) && rowItem) {
+            consolidatedProducedItems.add(rowItem);
+          }
+
+          /*
+            Main item:
+              Delete only from item_bom_routing.
+
+            Co-product:
+              Delete from item_bom_routing and bom_produced.
+          */
           if (isTruthyCoProductAssociation(row)) {
             const bomProducedMatchInput = getBomProducedMatchInputFromRow(row);
+
             const bomProducedMatchKey = [
               bomProducedMatchInput.bomId,
               bomProducedMatchInput.location,
@@ -6608,13 +6656,16 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     const deletedBomIdCount = consolidatedBomIds.size;
     const coProductCount = Math.max(0, Number(bomProducedDeletedCount || 0));
 
-    let deleteChangeSummary =
-      `Deleted ${deletedBomIdCount} BOM ID${deletedBomIdCount === 1 ? "" : "s"
-      } in bom_produced and item_bom_routing.`;
+    /*
+      Correct summary:
+      - Main item deletion only affects item_bom_routing.
+      - Co-product deletion affects item_bom_routing and bom_produced.
+    */
+    let deleteChangeSummary = `Deleted ${deletedBomIdCount} BOM ID${deletedBomIdCount === 1 ? "" : "s"
+      } in item_bom_routing.`;
 
     if (coProductCount > 0) {
-      deleteChangeSummary +=
-        ` Deleted ${coProductCount} co-product${coProductCount === 1 ? "" : "s"
+      deleteChangeSummary += ` Deleted ${coProductCount} co-product${coProductCount === 1 ? "" : "s"
         } in bom_produced and item_bom_routing.`;
     }
 
@@ -6623,16 +6674,20 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("rec_id")) {
       consolidatedChangeLogRow.rec_id = generateUniqueBigInt();
     }
+
     if (changeLogColumns.includes("record_id")) {
       consolidatedChangeLogRow.record_id = generateUniqueBigInt();
     }
+
     if (changeLogColumns.includes("postgresql_rec_id")) {
-      consolidatedChangeLogRow.postgresql_rec_id = firstArchivedPostgresqlRecId;
+      consolidatedChangeLogRow.postgresql_rec_id =
+        firstArchivedPostgresqlRecId;
     }
 
     if (changeLogColumns.includes("engineering_change_id")) {
       consolidatedChangeLogRow.engineering_change_id = engineeringChangeId;
     }
+
     if (changeLogColumns.includes("engineeringchangeid")) {
       consolidatedChangeLogRow.engineeringchangeid = engineeringChangeId;
     }
@@ -6640,6 +6695,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("change_type")) {
       consolidatedChangeLogRow.change_type = "Deleted";
     }
+
     if (changeLogColumns.includes("changetype")) {
       consolidatedChangeLogRow.changetype = "Deleted";
     }
@@ -6651,6 +6707,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("bom_id")) {
       consolidatedChangeLogRow.bom_id = consolidatedBomIdText;
     }
+
     if (changeLogColumns.includes("bom_ids")) {
       consolidatedChangeLogRow.bom_ids = consolidatedBomIdText;
     }
@@ -6659,6 +6716,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       consolidatedChangeLogRow.produced_item =
         consolidatedProducedItemText;
     }
+
     if (changeLogColumns.includes("item")) {
       consolidatedChangeLogRow.item = consolidatedProducedItemText;
     }
@@ -6666,6 +6724,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("location")) {
       consolidatedChangeLogRow.location = consolidatedLocationText;
     }
+
     if (changeLogColumns.includes("locations")) {
       consolidatedChangeLogRow.locations = consolidatedLocationText;
     }
@@ -6673,6 +6732,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("resource")) {
       consolidatedChangeLogRow.resource = consolidatedResourceText;
     }
+
     if (changeLogColumns.includes("resources")) {
       consolidatedChangeLogRow.resources = consolidatedResourceText;
     }
@@ -6680,9 +6740,11 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("summarynotes")) {
       consolidatedChangeLogRow.summarynotes = notes || "";
     }
+
     if (changeLogColumns.includes("notes")) {
       consolidatedChangeLogRow.notes = notes || "";
     }
+
     if (changeLogColumns.includes("change_summary")) {
       consolidatedChangeLogRow.change_summary = deleteChangeSummary;
     }
@@ -6690,9 +6752,11 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("user_name")) {
       consolidatedChangeLogRow.user_name = changedBy;
     }
+
     if (changeLogColumns.includes("created_by")) {
       consolidatedChangeLogRow.created_by = changedBy;
     }
+
     if (changeLogColumns.includes("updated_by")) {
       consolidatedChangeLogRow.updated_by = changedBy;
     }
@@ -6700,9 +6764,11 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     if (changeLogColumns.includes("change_date")) {
       consolidatedChangeLogRow.change_date = chicagoNowText;
     }
+
     if (changeLogColumns.includes("created_at")) {
       consolidatedChangeLogRow.created_at = chicagoNowText;
     }
+
     if (changeLogColumns.includes("created_on")) {
       consolidatedChangeLogRow.created_on = chicagoNowText;
     }
@@ -6731,12 +6797,16 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       bomProducedDeletedCount,
       archivedRecIds,
       archivedBomProducedRecIds,
+      changeSummary: deleteChangeSummary,
     });
   } catch (error) {
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
-      console.error("Rollback Error (delete-item-bom-routing/execute):", rollbackError);
+      console.error(
+        "Rollback Error (delete-item-bom-routing/execute):",
+        rollbackError
+      );
     }
 
     console.error("DB Error (delete-item-bom-routing/execute):", error);
@@ -8415,6 +8485,7 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
 
     if (!engineeringChangeId) {
       return res.status(400).json({
+        success: false,
         error: "engineeringChangeId/changeID is required",
       });
     }
@@ -8428,27 +8499,8 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
         .map((v) => v.trim())
         .filter(Boolean);
 
-    const uniqueBy = (rows, keyFn) => {
-      const map = new Map();
-
-      for (const row of rows || []) {
-        const key = keyFn(row);
-        if (!map.has(key)) {
-          map.set(key, row);
-        }
-      }
-
-      return [...map.values()];
-    };
-
-    const deriveLocationFromBomId = (value) => {
-      const parts = safeText(value)
-        .split("_")
-        .map((p) => p.trim())
-        .filter(Boolean);
-
-      return parts.length >= 3 ? parts[2] : "";
-    };
+    const uniqueValues = (values) =>
+      Array.from(new Set((values || []).map(safeText).filter(Boolean)));
 
     const buildRoutingId = (item, resource) => {
       const cleanItem = safeText(item);
@@ -8471,28 +8523,81 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
       return Number.isFinite(parsed) ? parsed : 0;
     };
 
+    const deriveLocationFromBomId = (bomId) => {
+      const parts = safeText(bomId)
+        .split("_")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      return parts.length >= 3 ? parts.slice(2).join("_") : "";
+    };
+
+    const fetchItemDescriptionMapFromBigQuery = async (items) => {
+      const itemList = uniqueValues(items).map(normalizeKey).filter(Boolean);
+      const itemDescriptionMap = new Map();
+
+      if (!itemList.length) return itemDescriptionMap;
+
+      const rows = await runBigQuery(
+        `
+        SELECT
+          TRIM(CAST(item AS STRING)) AS item,
+          TRIM(CAST(item_desc AS STRING)) AS item_desc
+        FROM ${bqTableRefByKey("itemMaster")}
+        WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@itemList)
+        `,
+        { itemList }
+      );
+
+      for (const row of rows || []) {
+        const itemKey = normalizeKey(row.item);
+        if (!itemKey) continue;
+
+        itemDescriptionMap.set(itemKey, safeText(row.item_desc));
+      }
+
+      return itemDescriptionMap;
+    };
+
     const changeLogTable = T.changeLog;
     const changeLogColumns = await getExistingColumns(pool, changeLogTable);
 
-    const dateSelectExpr = changeLogColumns.includes("created_at")
-      ? "created_at AS actual_change_ts"
-      : changeLogColumns.includes("created_on")
-        ? "created_on AS actual_change_ts"
-        : changeLogColumns.includes("change_date")
-          ? "change_date AS actual_change_ts"
+    /*
+      IMPORTANT:
+      Change Date should come from planning_bom_change_log_summary.change_date first.
+      Only fallback to created_at/created_on if change_date is not available.
+    */
+    const dateSelectExpr = changeLogColumns.includes("change_date")
+      ? "change_date AS actual_change_ts"
+      : changeLogColumns.includes("created_at")
+        ? "created_at AS actual_change_ts"
+        : changeLogColumns.includes("created_on")
+          ? "created_on AS actual_change_ts"
           : "NULL AS actual_change_ts";
 
-    const changeLogOrderBy = changeLogColumns.includes("created_at")
-      ? "created_at DESC NULLS LAST, rec_id DESC NULLS LAST"
-      : changeLogColumns.includes("created_on")
-        ? "created_on DESC NULLS LAST, rec_id DESC NULLS LAST"
-        : changeLogColumns.includes("change_date")
-          ? "change_date DESC NULLS LAST, rec_id DESC NULLS LAST"
+    const changeLogOrderBy = changeLogColumns.includes("change_date")
+      ? "change_date DESC NULLS LAST, rec_id DESC NULLS LAST"
+      : changeLogColumns.includes("created_at")
+        ? "created_at DESC NULLS LAST, rec_id DESC NULLS LAST"
+        : changeLogColumns.includes("created_on")
+          ? "created_on DESC NULLS LAST, rec_id DESC NULLS LAST"
           : changeLogColumns.includes("rec_id")
             ? "rec_id DESC NULLS LAST"
             : "1";
 
-    const summaryQuery = `
+    /*
+      Source of truth:
+      planning_bom_change_log_summary:
+      - engineering_change_id
+      - bom_id
+      - location
+      - resource
+      - produced_item = main deleted item + co-products
+      - change_date
+      - change_summary
+    */
+    const summaryResult = await pool.query(
+      `
       SELECT
         engineering_change_id,
         change_type,
@@ -8512,13 +8617,15 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
       WHERE TRIM(CAST(engineering_change_id AS TEXT)) = $1
         AND LOWER(TRIM(CAST(change_type AS TEXT))) LIKE 'deleted%'
       ORDER BY ${changeLogOrderBy}
-    `;
+      `,
+      [engineeringChangeId]
+    );
 
-    const summaryResult = await pool.query(summaryQuery, [engineeringChangeId]);
     const summaryRows = summaryResult.rows || [];
 
     if (!summaryRows.length) {
       return res.status(404).json({
+        success: false,
         error: "No matching deleted rows found in planning_bom_change_log_summary",
         details: { engineeringChangeId },
       });
@@ -8526,64 +8633,33 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
 
     const firstRow = summaryRows[0] || {};
 
-    /*
-      Source of truth:
-      - BOMID, location, resource come from planning_bom_change_log_summary.
-      - Deleted produced/co-product items come from bom_produced_og.
-      - Deleted component items come from bom_consumed_og.
-      - Co-product classification comes from item_bom_routing_og.erp_co_product_association = 1.
-      - Routing ID format is ROUTING_item_resource.
-    */
-    const summaryCombos = [];
-    const seenCombo = new Set();
+    const combinedChangeSummary = summaryRows
+      .map((row) => safeText(row.change_summary))
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
 
-    for (const row of summaryRows) {
-      const bomIds = splitCsv(row.bom_id);
-      const locations = splitCsv(row.location);
-      const resources = splitCsv(row.resource);
+    const isBomRoutingDelete =
+      combinedChangeSummary.includes("bom_produced") &&
+      combinedChangeSummary.includes("item_bom_routing");
 
-      const maxLen = Math.max(bomIds.length, locations.length, resources.length, 1);
-
-      for (let index = 0; index < maxLen; index += 1) {
-        const bomId = bomIds[index] || bomIds[0] || "";
-        if (!bomId) continue;
-
-        const location =
-          locations[index] ||
-          locations[0] ||
-          deriveLocationFromBomId(bomId);
-
-        const resource =
-          resources[index] ||
-          resources[0] ||
-          "";
-
-        const comboKey = [
-          normalizeKey(bomId),
-          normalizeKey(location),
-          normalizeKey(resource),
-        ].join("__");
-
-        if (seenCombo.has(comboKey)) continue;
-        seenCombo.add(comboKey);
-
-        summaryCombos.push({
-          bomId,
-          location,
-          resource,
-          summaryNotes: safeText(row.summarynotes),
-          changeSummary: safeText(row.change_summary),
-          postgresqlRecId: row.postgresql_rec_id || "",
-          recId: row.rec_id || "",
-        });
-      }
-    }
-
-    const summaryBomIds = Array.from(
-      new Set(summaryCombos.map((combo) => combo.bomId).filter(Boolean))
+    const allBomIds = uniqueValues(
+      summaryRows.flatMap((row) => splitCsv(row.bom_id))
     );
 
-    if (!summaryBomIds.length) {
+    const allProducedItems = uniqueValues(
+      summaryRows.flatMap((row) => splitCsv(row.produced_item))
+    );
+
+    const allLocations = uniqueValues(
+      summaryRows.flatMap((row) => splitCsv(row.location))
+    );
+
+    const allResources = uniqueValues(
+      summaryRows.flatMap((row) => splitCsv(row.resource))
+    );
+
+    if (!allBomIds.length || !allProducedItems.length) {
       return res.status(200).json({
         success: true,
         data: {
@@ -8591,17 +8667,26 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
           changeDate: firstRow.actual_change_ts || "",
           user: firstRow.user_name || "SYSTEM_USER",
           changeType: "Deleted",
+
           item: firstRow.produced_item || "",
           itemDescription: "",
           location: firstRow.location || "",
-          bomId: "",
+          bomId: firstRow.bom_id || "",
           resource: firstRow.resource || "",
           routingId: "",
+
           summaryNotes: firstRow.summarynotes || "",
           notes: firstRow.summarynotes || "",
           changeSummary: firstRow.change_summary || "",
+
+          isBomRoutingDelete,
+          summaryDisplayType: isBomRoutingDelete
+            ? "DELETED_ITEM_BOM_ROUTING_RECORD_SUMMARY"
+            : "DELETED_BOM_SUMMARY",
+
           showRoutingInDeletedTable: true,
           showConnectedRoutingTable: false,
+
           deletedBomRecords: [],
           connectedRoutingRecords: [],
           summaryRows,
@@ -8609,322 +8694,254 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
       });
     }
 
-    const [
-      producedOgColumns,
-      consumedOgColumns,
-      routingOgColumns,
-      itemDetailsColumns,
-    ] = await Promise.all([
-      getExistingColumns(pool, T.bomProducedOg),
-      getExistingColumns(pool, T.bomConsumedOg),
-      getExistingColumns(pool, T.itemBomRoutingOg),
-      getExistingColumns(pool, T.itemDetails),
-    ]);
+    /*
+      Use item_bom_routing_og only for:
+      - routing priority
+      - co-product classification
+      - matching routing rows
+    */
+    const routingOgColumns = await getExistingColumns(pool, T.itemBomRoutingOg);
 
-    const producedOgOrderBy = [
-      producedOgColumns.includes("load_datetime")
-        ? "load_datetime DESC NULLS LAST"
-        : "",
-      producedOgColumns.includes("postgresql_rec_id")
-        ? "postgresql_rec_id DESC NULLS LAST"
-        : "",
-      producedOgColumns.includes("rec_id")
-        ? "rec_id DESC NULLS LAST"
-        : "",
-    ]
-      .filter(Boolean)
-      .join(", ") || "1";
+    const routingOgOrderBy =
+      [
+        routingOgColumns.includes("load_datetime")
+          ? "load_datetime DESC NULLS LAST"
+          : "",
+        routingOgColumns.includes("postgresql_rec_id")
+          ? "postgresql_rec_id DESC NULLS LAST"
+          : "",
+        routingOgColumns.includes("rec_id")
+          ? "rec_id DESC NULLS LAST"
+          : "",
+      ]
+        .filter(Boolean)
+        .join(", ") || "1";
 
-    const consumedOgOrderBy = [
-      consumedOgColumns.includes("load_datetime")
-        ? "load_datetime DESC NULLS LAST"
-        : "",
-      consumedOgColumns.includes("postgresql_rec_id")
-        ? "postgresql_rec_id DESC NULLS LAST"
-        : "",
-      consumedOgColumns.includes("rec_id")
-        ? "rec_id DESC NULLS LAST"
-        : "",
-    ]
-      .filter(Boolean)
-      .join(", ") || "1";
+    const routingOgResult = await pool.query(
+      `
+      SELECT *
+      FROM ${pgRef(T.itemBomRoutingOg)}
+      WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
+      ORDER BY ${routingOgOrderBy}
+      `,
+      [allBomIds]
+    );
 
-    const routingOgOrderBy = [
-      routingOgColumns.includes("load_datetime")
-        ? "load_datetime DESC NULLS LAST"
-        : "",
-      routingOgColumns.includes("postgresql_rec_id")
-        ? "postgresql_rec_id DESC NULLS LAST"
-        : "",
-      routingOgColumns.includes("rec_id")
-        ? "rec_id DESC NULLS LAST"
-        : "",
-    ]
-      .filter(Boolean)
-      .join(", ") || "1";
-
-    const [
-      producedOgResult,
-      consumedOgResult,
-      routingOgResult,
-    ] = await Promise.all([
-      pool.query(
-        `
-          SELECT *
-          FROM ${pgRef(T.bomProducedOg)}
-          WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
-          ORDER BY ${producedOgOrderBy}
-        `,
-        [summaryBomIds]
-      ),
-      pool.query(
-        `
-          SELECT *
-          FROM ${pgRef(T.bomConsumedOg)}
-          WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
-          ORDER BY ${consumedOgOrderBy}
-        `,
-        [summaryBomIds]
-      ),
-      pool.query(
-        `
-          SELECT *
-          FROM ${pgRef(T.itemBomRoutingOg)}
-          WHERE TRIM(CAST(bom_id AS TEXT)) = ANY($1::text[])
-          ORDER BY ${routingOgOrderBy}
-        `,
-        [summaryBomIds]
-      ),
-    ]);
-
-    const producedOgRows = producedOgResult.rows || [];
-    const consumedOgRows = consumedOgResult.rows || [];
     const routingOgRows = routingOgResult.rows || [];
 
-    /*
-      Build routing map by BOM + item + routing_id.
-      Routing ID is deterministic:
-        ROUTING_item_resource
-    */
-    const routingByBomItemRouting = new Map();
+    const routingOgByBomItemResource = new Map();
 
     for (const row of routingOgRows) {
-      const item = safeText(row.item);
       const bomId = safeText(row.bom_id);
+      const item = safeText(row.item);
       const routingId = safeText(row.routing_id);
 
       if (!bomId || !item || !routingId) continue;
 
-      routingByBomItemRouting.set(
-        [
-          normalizeKey(bomId),
-          normalizeKey(item),
-          normalizeKey(routingId),
-        ].join("__"),
-        row
-      );
+      const routingParts = routingId
+        .replace(/^ROUTING_/i, "")
+        .split("_")
+        .map((part) => part.trim())
+        .filter(Boolean);
+
+      const resource =
+        routingParts.length >= 2 ? routingParts.slice(1).join("_") : "";
+
+      const key = [
+        normalizeKey(bomId),
+        normalizeKey(item),
+        normalizeKey(resource),
+      ].join("__");
+
+      if (!routingOgByBomItemResource.has(key)) {
+        routingOgByBomItemResource.set(key, row);
+      }
     }
 
-    const allItems = Array.from(
-      new Set(
-        [
-          ...producedOgRows.map((row) => safeText(row.item)),
-          ...consumedOgRows.map((row) => safeText(row.item)),
-          ...routingOgRows.map((row) => safeText(row.item)),
-        ].filter(Boolean)
-      )
+    const itemDescriptionMap = await fetchItemDescriptionMapFromBigQuery(
+      allProducedItems
     );
 
-    const itemDescriptionMap = new Map();
-
-    if (itemDetailsColumns.includes("item") && allItems.length) {
-      let descriptionSql = "'' AS item_description";
-
-      if (itemDetailsColumns.includes("item_description")) {
-        descriptionSql = "item_description";
-      } else if (itemDetailsColumns.includes("item_desc")) {
-        descriptionSql = "item_desc AS item_description";
-      }
-
-      const itemDetailsQuery = `
-        SELECT
-          TRIM(CAST(item AS TEXT)) AS item,
-          ${descriptionSql}
-        FROM ${pgRef(T.itemDetails)}
-        WHERE UPPER(TRIM(CAST(item AS TEXT))) = ANY($1::text[])
-      `;
-
-      const itemDetailsResult = await pool.query(
-        itemDetailsQuery,
-        [allItems.map(normalizeKey)]
-      );
-
-      for (const row of itemDetailsResult.rows || []) {
-        itemDescriptionMap.set(
-          normalizeKey(row.item),
-          safeText(row.item_description)
-        );
-      }
-    }
-
     const deletedBomRecords = [];
-    const seenOutputRows = new Set();
+    const connectedRoutingRecords = [];
+    const seenDeletedRows = new Set();
+    const seenRoutingRows = new Set();
 
-    for (const combo of summaryCombos) {
-      const comboBomKey = normalizeKey(combo.bomId);
-      const comboLocationKey = normalizeKey(combo.location);
+    for (const summaryRow of summaryRows) {
+      const bomIds = splitCsv(summaryRow.bom_id);
+      const locations = splitCsv(summaryRow.location);
+      const resources = splitCsv(summaryRow.resource);
+      const producedItems = splitCsv(summaryRow.produced_item);
 
-      /*
-        1. Produced rows from bom_produced_og:
-           includes main item and co-products.
-           Co-product flag is checked from item_bom_routing_og.
-      */
-      const producedRowsForCombo = producedOgRows.filter((row) => {
-        const rowBomId = safeText(row.bom_id);
-        const rowLocation = safeText(row.location);
+      const resolvedBomIds = bomIds.length ? bomIds : allBomIds;
+      const resolvedProducedItems = producedItems.length
+        ? producedItems
+        : allProducedItems;
 
-        return (
-          normalizeKey(rowBomId) === comboBomKey &&
-          (!combo.location || normalizeKey(rowLocation) === comboLocationKey)
-        );
-      });
+      for (const bomId of resolvedBomIds) {
+        const locationList = locations.length
+          ? locations
+          : [deriveLocationFromBomId(bomId)].filter(Boolean);
 
-      for (const row of producedRowsForCombo) {
-        const item = safeText(row.item);
-        if (!item) continue;
+        const resourceList = resources.length ? resources : allResources;
 
-        const routingId = buildRoutingId(item, combo.resource);
-        const routingKey = [
-          comboBomKey,
-          normalizeKey(item),
-          normalizeKey(routingId),
-        ].join("__");
+        for (const location of locationList.length ? locationList : [""]) {
+          for (const item of resolvedProducedItems) {
+            const itemKey = normalizeKey(item);
 
-        const routingRow = routingByBomItemRouting.get(routingKey) || null;
-        const coProductAssociation = routingRow
-          ? getCoProductAssociationFlag(routingRow)
-          : 0;
+            for (const resource of resourceList.length ? resourceList : [""]) {
+              const routingId = buildRoutingId(item, resource);
 
-        const outputKey = [
-          "PRODUCED",
-          comboBomKey,
-          comboLocationKey,
-          normalizeKey(item),
-          normalizeKey(routingId),
-        ].join("__");
+              const routingLookupKey = [
+                normalizeKey(bomId),
+                itemKey,
+                normalizeKey(resource),
+              ].join("__");
 
-        if (seenOutputRows.has(outputKey)) continue;
-        seenOutputRows.add(outputKey);
+              const routingRow =
+                routingOgByBomItemResource.get(routingLookupKey) || null;
 
-        deletedBomRecords.push({
-          recordType: coProductAssociation === 1 ? "Co-Product" : "Produced",
-          producedItem: item,
-          item,
-          itemDescription: itemDescriptionMap.get(normalizeKey(item)) || "",
-          location: combo.location || safeText(row.location),
-          bomId: combo.bomId,
-          resource: combo.resource,
-          routingId,
-          itemBomRoutingPriority:
-            routingRow?.erp_item_bom_routing_priority ??
-            routingRow?.item_bom_routing_priority ??
-            "",
-          coProductAssociation,
-          erpCoProductAssociation: coProductAssociation,
-          erp_co_product_association: coProductAssociation,
-          isCoProduct: coProductAssociation === 1,
-          summaryNotes: combo.summaryNotes || safeText(firstRow.summarynotes),
-          changeSummary: combo.changeSummary || safeText(firstRow.change_summary),
-          targetTable: "bom_produced_og",
-          postgresqlRecId:
-            row.postgresql_rec_id ||
-            routingRow?.postgresql_rec_id ||
-            combo.postgresqlRecId ||
-            "",
-          recId:
-            row.rec_id ||
-            routingRow?.rec_id ||
-            combo.recId ||
-            "",
-        });
-      }
+              const fallbackCoProductAssociation =
+                resolvedProducedItems.length > 1 &&
+                itemKey !== normalizeKey(resolvedProducedItems[0])
+                  ? 1
+                  : 0;
 
-      /*
-        2. Component rows from bom_consumed_og:
-           component does not need routing row. Routing ID can still be built
-           as ROUTING_component_resource only for display consistency.
-      */
-      const consumedRowsForCombo = consumedOgRows.filter((row) => {
-        const rowBomId = safeText(row.bom_id);
-        const rowLocation = safeText(row.location);
+              const coProductAssociation = routingRow
+                ? getCoProductAssociationFlag(routingRow)
+                : fallbackCoProductAssociation;
 
-        return (
-          normalizeKey(rowBomId) === comboBomKey &&
-          (!combo.location || normalizeKey(rowLocation) === comboLocationKey)
-        );
-      });
+              const itemBomRoutingPriority =
+                routingRow?.erp_item_bom_routing_priority ??
+                routingRow?.item_bom_routing_priority ??
+                routingRow?.priority ??
+                "";
 
-      for (const row of consumedRowsForCombo) {
-        const item = safeText(row.item);
-        if (!item) continue;
+              const rowKey = [
+                normalizeKey(bomId),
+                normalizeKey(location),
+                itemKey,
+                normalizeKey(resource),
+                normalizeKey(routingId),
+              ].join("__");
 
-        const routingId = buildRoutingId(item, combo.resource);
+              if (!seenDeletedRows.has(rowKey)) {
+                seenDeletedRows.add(rowKey);
 
-        const outputKey = [
-          "CONSUMED",
-          comboBomKey,
-          comboLocationKey,
-          normalizeKey(item),
-        ].join("__");
+                deletedBomRecords.push({
+                  recordType:
+                    coProductAssociation === 1 ? "Co-Product" : "Produced",
 
-        if (seenOutputRows.has(outputKey)) continue;
-        seenOutputRows.add(outputKey);
+                  producedItem: item,
+                  item,
+                  itemDescription: itemDescriptionMap.get(itemKey) || "",
 
-        deletedBomRecords.push({
-          recordType: "Component",
-          producedItem: item,
-          item,
-          itemDescription: itemDescriptionMap.get(normalizeKey(item)) || "",
-          location: combo.location || safeText(row.location),
-          bomId: combo.bomId,
-          resource: combo.resource,
-          routingId,
-          itemBomRoutingPriority: "",
-          coProductAssociation: 0,
-          erpCoProductAssociation: 0,
-          erp_co_product_association: 0,
-          isCoProduct: false,
-          summaryNotes: combo.summaryNotes || safeText(firstRow.summarynotes),
-          changeSummary: combo.changeSummary || safeText(firstRow.change_summary),
-          targetTable: "bom_consumed_og",
-          postgresqlRecId: row.postgresql_rec_id || combo.postgresqlRecId || "",
-          recId: row.rec_id || combo.recId || "",
-        });
+                  location,
+                  bomId,
+                  resource,
+                  routingId,
+
+                  itemBomRoutingPriority,
+                  priority: itemBomRoutingPriority,
+
+                  coProductAssociation,
+                  erpCoProductAssociation: coProductAssociation,
+                  erp_co_product_association: coProductAssociation,
+                  isCoProduct: coProductAssociation === 1,
+
+                  summaryNotes:
+                    safeText(summaryRow.summarynotes) ||
+                    safeText(firstRow.summarynotes),
+                  changeSummary:
+                    safeText(summaryRow.change_summary) ||
+                    safeText(firstRow.change_summary),
+
+                  targetTable: "planning_bom_change_log_summary",
+
+                  postgresqlRecId:
+                    summaryRow.postgresql_rec_id ||
+                    routingRow?.postgresql_rec_id ||
+                    "",
+                  recId:
+                    summaryRow.rec_id ||
+                    routingRow?.rec_id ||
+                    "",
+                });
+              }
+
+              const routingKey = [
+                normalizeKey(bomId),
+                itemKey,
+                normalizeKey(resource),
+                normalizeKey(routingId),
+              ].join("__");
+
+              if (!seenRoutingRows.has(routingKey)) {
+                seenRoutingRows.add(routingKey);
+
+                connectedRoutingRecords.push({
+                  item,
+                  producedItem: item,
+                  bomId,
+                  resource,
+                  routingId,
+
+                  itemBomRoutingPriority,
+                  priority: itemBomRoutingPriority,
+
+                  coProductAssociation,
+                  erpCoProductAssociation: coProductAssociation,
+                  erp_co_product_association: coProductAssociation,
+                  isCoProduct: coProductAssociation === 1,
+                });
+              }
+            }
+          }
+        }
       }
     }
 
     return res.status(200).json({
       success: true,
       data: {
-        engineeringChangeId: firstRow.engineering_change_id || engineeringChangeId,
+        engineeringChangeId:
+          firstRow.engineering_change_id || engineeringChangeId,
+
+        /*
+          This now comes from change_date first.
+        */
         changeDate: firstRow.actual_change_ts || "",
+
         user: firstRow.user_name || "SYSTEM_USER",
         changeType: "Deleted",
-        item: firstRow.produced_item || "",
+
+        item: allProducedItems.join(", "),
         itemDescription: "",
-        location: firstRow.location || "",
-        bomId: summaryBomIds.join(", "),
-        resource: firstRow.resource || "",
+        location: allLocations.join(", "),
+        bomId: allBomIds.join(", "),
+        resource: allResources.join(", "),
         routingId: "",
+
         summaryNotes: firstRow.summarynotes || "",
         notes: firstRow.summarynotes || "",
         changeSummary: firstRow.change_summary || "",
+
+        /*
+          Frontend can use this to show screenshot format:
+          Step 2: Deleted Item BOM Routing Record Summary
+          Columns:
+          Location, Item, BOM ID, Resource, Priority, Routing ID
+        */
+        isBomRoutingDelete,
+        summaryDisplayType: isBomRoutingDelete
+          ? "DELETED_ITEM_BOM_ROUTING_RECORD_SUMMARY"
+          : "DELETED_BOM_SUMMARY",
 
         showRoutingInDeletedTable: true,
         showConnectedRoutingTable: false,
 
         deletedBomRecords,
-        connectedRoutingRecords: [],
+        connectedRoutingRecords,
         summaryRows,
       },
     });
@@ -8932,17 +8949,22 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
     console.error("DB Error (engineering-changes-detail-delete-bom):", error);
 
     return res.status(500).json({
+      success: false,
       error: "Failed to fetch engineering delete BOM detail",
       details: error.message,
     });
   }
 });
 
+
 router.get("/engineering-changes-detail-modify", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const engineeringChangeId = String(req.query.engineeringChangeId || "").trim();
+    const engineeringChangeId = String(
+      req.query.engineeringChangeId || ""
+    ).trim();
+
     const requestBomId = String(req.query.bomId || "").trim();
     const requestLocation = String(req.query.location || "").trim();
     const requestResource = String(req.query.resource || "").trim();
@@ -8963,8 +8985,6 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
     };
 
     const upperText = (value) => safeText(value).toUpperCase();
-    const sameText = (a, b) => upperText(a) === upperText(b);
-    const isSame = (a, b) => safeText(a) === safeText(b);
 
     const splitCsv = (value) =>
       String(value || "")
@@ -8975,20 +8995,57 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
     const uniqueValues = (values) =>
       Array.from(new Set((values || []).map(safeText).filter(Boolean)));
 
-    const buildDetailRow = (field, value) => ({
-      field,
-      value: value ?? "",
-    });
+    const normalizeNumberText = (value) => {
+      const text = safeText(value);
+      if (!text) return "";
+      const num = Number(text);
+      return Number.isFinite(num) ? String(num) : text;
+    };
 
-    const buildChangeRow = (field, originalValue, updatedValue, description = "") => ({
-      field,
-      originalValue: originalValue ?? "",
-      updatedValue: updatedValue ?? "",
-      description: description ?? "",
-      changed: !isSame(originalValue, updatedValue),
-    });
+    const sameValue = (a, b) =>
+      normalizeNumberText(a) === normalizeNumberText(b);
 
-    /* Correct format: ROUTING_Item_resource */
+    const getQtyProducedPer = (row) => {
+      if (!row) return "";
+      return (
+        row.erp_bom_qty_produced_per ??
+        row.bom_qty_produced_per ??
+        row.qty_produced_per ??
+        ""
+      );
+    };
+
+    const getConsumedPer = (row) => {
+      if (!row) return "";
+      return (
+        row.erp_bom_quantity_consumed_per ??
+        row.bom_quantity_consumed_per ??
+        row.standard_usage ??
+        ""
+      );
+    };
+
+    const getRoutingPriority = (row) => {
+      if (!row) return "";
+      return (
+        row.erp_item_bom_routing_priority ??
+        row.item_bom_routing_priority ??
+        row.routing_priority ??
+        ""
+      );
+    };
+
+    const getCoProductAssociationFlag = (row) => {
+      const parsed = Number(
+        row?.erp_co_product_association ??
+        row?.co_product_association ??
+        row?.co_prod_association ??
+        0
+      );
+
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+
     const parseRoutingId = (routingId) => {
       const value = safeText(routingId);
       if (!value) return { item: "", resource: "" };
@@ -9006,14 +9063,29 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
         };
       }
 
-      return { item: parts[0] || "", resource: "" };
+      return {
+        item: parts[0] || "",
+        resource: "",
+      };
     };
 
-    const buildRoutingId = (item, resource) => {
-      const cleanItem = safeText(item);
-      const cleanResource = safeText(resource);
-      if (!cleanItem || !cleanResource) return "";
-      return `ROUTING_${cleanItem}_${cleanResource}`;
+    const getResourceFromRoutingRow = (row) => {
+      return (
+        safeText(row?.resource) ||
+        safeText(row?.Resource) ||
+        parseRoutingId(row?.routing_id).resource ||
+        ""
+      );
+    };
+
+    const displayUpdatedValue = (originalValue, updatedValue) => {
+      if (!safeText(updatedValue)) return "Item removed";
+
+      if (sameValue(originalValue, updatedValue)) {
+        return "No Changes";
+      }
+
+      return updatedValue;
     };
 
     const fetchRows = async ({ tableName, whereClause, values, orderBy = "" }) => {
@@ -9023,99 +9095,105 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
         WHERE ${whereClause}
         ${orderBy ? `ORDER BY ${orderBy}` : ""}
       `;
+
       const result = await client.query(query, values);
       return result.rows || [];
     };
 
-    const getQtyProducedPer = (row) => {
-      if (!row) return "";
-      return (
-        row.erp_bom_qty_produced_per ??
-        row.bom_qty_produced_per ??
-        row.qty_produced_per ??
-        ""
-      );
-    };
+    const buildUpperItemArray = (items) =>
+      uniqueValues(items)
+        .map(upperText)
+        .filter(Boolean);
 
-    const getConsumedPer = (row) => {
-      if (!row) return "";
-      return (
-        row.erp_bom_quantity_consumed_per ??
-        row.bom_quantity_consumed_per ??
-        ""
-      );
-    };
-
-    const getRoutingPriority = (row) => {
-      if (!row) return "";
-      return (
-        row.erp_item_bom_routing_priority ??
-        row.item_bom_routing_priority ??
-        ""
-      );
-    };
-
-    const getCoProductAssociationFlag = (row) => {
-      const parsed = Number(
-        row?.erp_co_product_association ??
-        row?.co_product_association ??
-        row?.co_prod_association ??
-        0
-      );
-      return Number.isFinite(parsed) ? parsed : 0;
-    };
-
-    const buildItemKey = (row) => upperText(row?.item);
-
-    const descriptionColumnSql = async () => {
-      const itemDetailsColumns = await getExistingColumns(client, T.itemDetails);
-      if (itemDetailsColumns.includes("item_description")) {
-        return "item_description";
-      }
-      if (itemDetailsColumns.includes("item_desc")) {
-        return "item_desc AS item_description";
-      }
-      return "'' AS item_description";
-    };
-
-    const fetchItemDescriptionMap = async (items) => {
-      const itemList = uniqueValues(items).map(upperText);
-      const descriptionMap = new Map();
-      if (!itemList.length) return descriptionMap;
-
-      const descriptionSelect = await descriptionColumnSql();
-      const itemDetailsResult = await client.query(
-        `
-          SELECT
-            TRIM(CAST(item AS TEXT)) AS item,
-            ${descriptionSelect}
-          FROM ${pgRef(T.itemDetails)}
-          WHERE UPPER(TRIM(CAST(item AS TEXT))) = ANY($1::text[])
-        `,
-        [itemList]
-      );
-
-      for (const row of itemDetailsResult.rows || []) {
-        descriptionMap.set(upperText(row.item), safeText(row.item_description));
+    const getEngineeringChangeColumn = (columns) => {
+      if (columns.includes("engineering_change_id")) {
+        return "engineering_change_id";
       }
 
-      return descriptionMap;
+      if (columns.includes("engineeringchangeid")) {
+        return "engineeringchangeid";
+      }
+
+      return "";
     };
 
-    /*
-      Fetch the exact planning_bom_change_log_summary row for this engineering change.
-      This is the source for BOMID, location, resource and produced_item.
-    */
-    const headerQuery = `
+    const bqTable = (tableName) => {
+      const cleanTableName = safeText(tableName);
+      if (!cleanTableName) return "";
+
+      if (cleanTableName.includes(".")) {
+        return `\`${cleanTableName}\``;
+      }
+
+      return `\`${CFG.bq.projectId}.${CFG.bq.dataset}.${cleanTableName}\``;
+    };
+
+    const fetchItemDetailsMap = async (items) => {
+      const itemList = buildUpperItemArray(items);
+      const detailMap = new Map();
+
+      if (!itemList.length) return detailMap;
+
+      const itemMasterTable = bqTable(CFG.tables.bqItemMaster);
+      const itemReleaseFlagTable = bqTable(CFG.tables.bqItemReleaseFlag);
+
+      const [itemMasterRows] = await bigquery.query({
+        query: `
+      SELECT
+        TRIM(CAST(item AS STRING)) AS item,
+        TRIM(CAST(item_desc AS STRING)) AS item_desc
+      FROM ${itemMasterTable}
+      WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@itemList)
+    `,
+        params: { itemList },
+      });
+
+      for (const row of itemMasterRows || []) {
+        const key = upperText(row.item);
+
+        detailMap.set(key, {
+          ...(detailMap.get(key) || {}),
+          description: safeText(row.item_desc),
+          itemReleaseFlag: detailMap.get(key)?.itemReleaseFlag || "",
+        });
+      }
+
+      const [releaseRows] = await bigquery.query({
+        query: `
+      SELECT
+        TRIM(CAST(item AS STRING)) AS item,
+        TRIM(CAST(release AS STRING)) AS item_release_flag
+      FROM ${itemReleaseFlagTable}
+      WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@itemList)
+    `,
+        params: { itemList },
+      });
+
+      for (const row of releaseRows || []) {
+        const key = upperText(row.item);
+
+        detailMap.set(key, {
+          ...(detailMap.get(key) || {}),
+          description: detailMap.get(key)?.description || "",
+          itemReleaseFlag: safeText(row.item_release_flag),
+        });
+      }
+
+      return detailMap;
+    };
+
+    const headerResult = await client.query(
+      `
       SELECT *
       FROM ${pgRef(T.changeLog)}
       WHERE TRIM(CAST(engineering_change_id AS TEXT)) = $1
         AND LOWER(TRIM(CAST(change_type AS TEXT))) LIKE 'modif%'
       ORDER BY change_date DESC NULLS LAST, rec_id DESC NULLS LAST
       LIMIT 1
-    `;
+      `,
+      [engineeringChangeId]
+    );
 
-    const headerResult = await client.query(headerQuery, [engineeringChangeId]);
     const headerRow = headerResult.rows[0] || null;
 
     if (!headerRow) {
@@ -9135,15 +9213,23 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
       splitCsv(headerRow.locations)[0] ||
       requestLocation;
 
-    const resolvedResource =
-      splitCsv(headerRow.resource)[0] ||
-      splitCsv(headerRow.resources)[0] ||
-      requestResource;
+    const resolvedResources = uniqueValues([
+      ...splitCsv(headerRow.resource),
+      ...splitCsv(headerRow.resources),
+      requestResource,
+    ]);
 
-    const producedItemsFromLog = uniqueValues([
+    const resolvedResource = resolvedResources[0] || "";
+
+    const producedItemsFromSummary = uniqueValues([
       ...splitCsv(headerRow.produced_item),
-      safeText(headerRow.item),
+      ...splitCsv(headerRow.produced_items),
       requestProducedItem,
+    ]);
+
+    const consumedItemsFromSummary = uniqueValues([
+      ...splitCsv(headerRow.consumed_item),
+      ...splitCsv(headerRow.consumed_items),
     ]);
 
     if (!resolvedBomId) {
@@ -9160,235 +9246,431 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
       });
     }
 
-    const producedItemsUpper = producedItemsFromLog.map(upperText);
+    const producedUpper = buildUpperItemArray(producedItemsFromSummary);
+    const consumedUpper = buildUpperItemArray(consumedItemsFromSummary);
+    const resolvedResourceUpperSet = new Set(resolvedResources.map(upperText));
 
-    const [
-      updatedRoutingRowsForItems,
-      originalRoutingRowsForItems,
-      updatedProducedRowsAll,
-      originalProducedRowsAll,
-      updatedConsumedRows,
-      originalConsumedRows,
-    ] = await Promise.all([
-      fetchRows({
-        tableName: T.itemBomRouting,
-        whereClause: `
+    const bomProducedOgColumns = await getExistingColumns(client, T.bomProducedOg);
+    const bomConsumedOgColumns = await getExistingColumns(client, T.bomConsumedOg);
+    const itemBomRoutingOgColumns = await getExistingColumns(
+      client,
+      T.itemBomRoutingOg
+    );
+
+    const bomProducedOgEcColumn =
+      getEngineeringChangeColumn(bomProducedOgColumns);
+
+    const bomConsumedOgEcColumn =
+      getEngineeringChangeColumn(bomConsumedOgColumns);
+
+    const itemBomRoutingOgEcColumn =
+      getEngineeringChangeColumn(itemBomRoutingOgColumns);
+
+    const producedOgWhereClause = bomProducedOgEcColumn
+      ? `
+          TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(location AS TEXT)) = $2
+          AND TRIM(CAST(${quoteIdent(bomProducedOgEcColumn)} AS TEXT)) = $3
+          AND (
+            CARDINALITY($4::text[]) = 0
+            OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($4::text[])
+          )
+        `
+      : `
+          TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(location AS TEXT)) = $2
+          AND (
+            CARDINALITY($3::text[]) = 0
+            OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($3::text[])
+          )
+        `;
+
+    const producedOgValues = bomProducedOgEcColumn
+      ? [resolvedBomId, resolvedLocation, engineeringChangeId, producedUpper]
+      : [resolvedBomId, resolvedLocation, producedUpper];
+
+    const consumedOgWhereClause = bomConsumedOgEcColumn
+      ? `
+          TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(location AS TEXT)) = $2
+          AND TRIM(CAST(${quoteIdent(bomConsumedOgEcColumn)} AS TEXT)) = $3
+          AND (
+            CARDINALITY($4::text[]) = 0
+            OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($4::text[])
+          )
+        `
+      : `
+          TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(location AS TEXT)) = $2
+          AND (
+            CARDINALITY($3::text[]) = 0
+            OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($3::text[])
+          )
+        `;
+
+    const consumedOgValues = bomConsumedOgEcColumn
+      ? [resolvedBomId, resolvedLocation, engineeringChangeId, consumedUpper]
+      : [resolvedBomId, resolvedLocation, consumedUpper];
+
+    const routingOgWhereClause = itemBomRoutingOgEcColumn
+      ? `
+          TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(${quoteIdent(itemBomRoutingOgEcColumn)} AS TEXT)) = $2
+          AND (
+            CARDINALITY($3::text[]) = 0
+            OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($3::text[])
+          )
+        `
+      : `
           TRIM(CAST(bom_id AS TEXT)) = $1
           AND (
             CARDINALITY($2::text[]) = 0
             OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($2::text[])
           )
-        `,
-        values: [resolvedBomId, producedItemsUpper],
-        orderBy: "load_datetime DESC NULLS LAST, rec_id DESC NULLS LAST",
-      }),
-      fetchRows({
-        tableName: T.itemBomRoutingOg,
-        whereClause: `
-          TRIM(CAST(bom_id AS TEXT)) = $1
-          AND (
-            CARDINALITY($2::text[]) = 0
-            OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($2::text[])
-          )
-        `,
-        values: [resolvedBomId, producedItemsUpper],
-        orderBy: "load_datetime DESC NULLS LAST, postgresql_rec_id DESC NULLS LAST, rec_id DESC NULLS LAST",
-      }),
-      fetchRows({
-        tableName: T.bomProduced,
-        whereClause: `TRIM(CAST(bom_id AS TEXT)) = $1 AND TRIM(CAST(location AS TEXT)) = $2`,
-        values: [resolvedBomId, resolvedLocation],
-        orderBy: "load_datetime DESC NULLS LAST, rec_id DESC NULLS LAST",
-      }),
-      fetchRows({
-        tableName: T.bomProducedOg,
-        whereClause: `TRIM(CAST(bom_id AS TEXT)) = $1 AND TRIM(CAST(location AS TEXT)) = $2`,
-        values: [resolvedBomId, resolvedLocation],
-        orderBy: "load_datetime DESC NULLS LAST, postgresql_rec_id DESC NULLS LAST, rec_id DESC NULLS LAST",
-      }),
-      fetchRows({
-        tableName: T.bomConsumed,
-        whereClause: `TRIM(CAST(bom_id AS TEXT)) = $1 AND TRIM(CAST(location AS TEXT)) = $2`,
-        values: [resolvedBomId, resolvedLocation],
-        orderBy: "load_datetime DESC NULLS LAST, rec_id DESC NULLS LAST",
-      }),
-      fetchRows({
-        tableName: T.bomConsumedOg,
-        whereClause: `TRIM(CAST(bom_id AS TEXT)) = $1 AND TRIM(CAST(location AS TEXT)) = $2`,
-        values: [resolvedBomId, resolvedLocation],
-        orderBy: "load_datetime DESC NULLS LAST, postgresql_rec_id DESC NULLS LAST, rec_id DESC NULLS LAST",
-      }),
-    ]);
+        `;
 
-    /*
-      Routing does not have location. Match it using BOMID + produced item.
-      If resource exists in the change log, narrow using resource parsed from ROUTING_Item_resource.
-    */
+    const routingOgValues = itemBomRoutingOgEcColumn
+      ? [resolvedBomId, engineeringChangeId, producedUpper]
+      : [resolvedBomId, producedUpper];
+
+    const updatedProducedRows = await fetchRows({
+      tableName: T.bomProduced,
+      whereClause: `
+        TRIM(CAST(bom_id AS TEXT)) = $1
+        AND TRIM(CAST(location AS TEXT)) = $2
+        AND (
+          CARDINALITY($3::text[]) = 0
+          OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($3::text[])
+        )
+      `,
+      values: [resolvedBomId, resolvedLocation, producedUpper],
+      orderBy: "load_datetime DESC NULLS LAST, rec_id DESC NULLS LAST",
+    });
+
+    const originalProducedRows = await fetchRows({
+      tableName: T.bomProducedOg,
+      whereClause: producedOgWhereClause,
+      values: producedOgValues,
+      orderBy:
+        "load_datetime DESC NULLS LAST, postgresql_rec_id DESC NULLS LAST, rec_id DESC NULLS LAST",
+    });
+
+    const updatedConsumedRows = await fetchRows({
+      tableName: T.bomConsumed,
+      whereClause: `
+        TRIM(CAST(bom_id AS TEXT)) = $1
+        AND TRIM(CAST(location AS TEXT)) = $2
+        AND (
+          CARDINALITY($3::text[]) = 0
+          OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($3::text[])
+        )
+      `,
+      values: [resolvedBomId, resolvedLocation, consumedUpper],
+      orderBy: "load_datetime DESC NULLS LAST, rec_id DESC NULLS LAST",
+    });
+
+    const originalConsumedRows = await fetchRows({
+      tableName: T.bomConsumedOg,
+      whereClause: consumedOgWhereClause,
+      values: consumedOgValues,
+      orderBy:
+        "load_datetime DESC NULLS LAST, postgresql_rec_id DESC NULLS LAST, rec_id DESC NULLS LAST",
+    });
+
+    const updatedRoutingRowsAll = await fetchRows({
+      tableName: T.itemBomRouting,
+      whereClause: `
+        TRIM(CAST(bom_id AS TEXT)) = $1
+        AND (
+          CARDINALITY($2::text[]) = 0
+          OR UPPER(TRIM(CAST(item AS TEXT))) = ANY($2::text[])
+        )
+      `,
+      values: [resolvedBomId, producedUpper],
+      orderBy: "load_datetime DESC NULLS LAST, rec_id DESC NULLS LAST",
+    });
+
+    const originalRoutingRowsAll = await fetchRows({
+      tableName: T.itemBomRoutingOg,
+      whereClause: routingOgWhereClause,
+      values: routingOgValues,
+      orderBy:
+        "load_datetime DESC NULLS LAST, postgresql_rec_id DESC NULLS LAST, rec_id DESC NULLS LAST",
+    });
+
     const filterRoutingRowsForResource = (rows) => {
       return (rows || []).filter((row) => {
-        const parsed = parseRoutingId(row.routing_id);
-        const rowResource = parsed.resource;
-        const resourceMatches = !resolvedResource || sameText(rowResource, resolvedResource);
-        return resourceMatches;
+        if (!resolvedResourceUpperSet.size) return true;
+
+        const rowResource = getResourceFromRoutingRow(row);
+        return resolvedResourceUpperSet.has(upperText(rowResource));
       });
     };
 
-    const updatedRoutingRows = filterRoutingRowsForResource(updatedRoutingRowsForItems);
-    const originalRoutingRows = filterRoutingRowsForResource(originalRoutingRowsForItems);
+    const updatedRoutingRows = filterRoutingRowsForResource(updatedRoutingRowsAll);
+    const originalRoutingRows = filterRoutingRowsForResource(originalRoutingRowsAll);
 
-    const updatedMainRoutingRow =
-      updatedRoutingRows.find((row) => getCoProductAssociationFlag(row) !== 1) || null;
+    const allItemsForDescription = uniqueValues([
+      ...producedItemsFromSummary,
+      ...consumedItemsFromSummary,
+      ...updatedProducedRows.map((row) => row.item),
+      ...originalProducedRows.map((row) => row.item),
+      ...updatedConsumedRows.map((row) => row.item),
+      ...originalConsumedRows.map((row) => row.item),
+      requestProducedItem,
+    ]);
 
-    const originalMainRoutingRow =
-      originalRoutingRows.find((row) => getCoProductAssociationFlag(row) !== 1) || null;
+    const itemDetailsMap = await fetchItemDetailsMap(allItemsForDescription);
 
-    const displayProducedItem =
-      safeText(updatedMainRoutingRow?.item) ||
-      producedItemsFromLog.find(Boolean) ||
-      safeText(updatedProducedRowsAll.find((row) => Number(getQtyProducedPer(row) || 0) === 1)?.item) ||
-      safeText(updatedProducedRowsAll[0]?.item) ||
+    const mainProducedRow =
+      updatedProducedRows.find((row) => Number(getQtyProducedPer(row)) === 1) ||
+      originalProducedRows.find((row) => Number(getQtyProducedPer(row)) === 1) ||
+      updatedProducedRows.find(
+        (row) => upperText(row.item) === upperText(requestProducedItem)
+      ) ||
+      originalProducedRows.find(
+        (row) => upperText(row.item) === upperText(requestProducedItem)
+      ) ||
+      updatedProducedRows[0] ||
+      originalProducedRows[0] ||
+      null;
+
+    const mainProducedItem =
+      safeText(mainProducedRow?.item) ||
+      requestProducedItem ||
+      producedItemsFromSummary[0] ||
       "";
 
-    const displayRoutingId =
-      safeText(updatedMainRoutingRow?.routing_id) ||
-      safeText(originalMainRoutingRow?.routing_id) ||
-      buildRoutingId(displayProducedItem, resolvedResource);
+    const mainProducedItemUpper = upperText(mainProducedItem);
 
-    const displayRoutingPriority =
-      getRoutingPriority(updatedMainRoutingRow) || getRoutingPriority(originalMainRoutingRow);
-
-    const bomRecordDetails = [
-      buildDetailRow("Location", resolvedLocation),
-      buildDetailRow("BOM ID", resolvedBomId),
-      buildDetailRow("Produced Item", displayProducedItem),
-      buildDetailRow("Routing ID", displayRoutingId),
-      buildDetailRow("Item BOM Routing Priority", displayRoutingPriority),
-    ].filter((row) => safeText(row.value) !== "");
-
-    const allItemsForDescription = Array.from(
-      new Set([
-        ...updatedConsumedRows.map((row) => safeText(row.item)),
-        ...originalConsumedRows.map((row) => safeText(row.item)),
-        ...updatedProducedRowsAll.map((row) => safeText(row.item)),
-        ...originalProducedRowsAll.map((row) => safeText(row.item)),
-      ].filter(Boolean))
+    const coProductItemsFromSummary = producedItemsFromSummary.filter(
+      (item) => upperText(item) !== mainProducedItemUpper
     );
 
-    const itemDescriptionMap = await fetchItemDescriptionMap(allItemsForDescription);
-
-    /* ------------------------------------------------------------------
-       Component comparison:
-       - OG only   => Existing component table, updated value = Item removed
-       - Main only => Added component table, value = standard usage from main
-       - Both      => Existing component table, original=OG and updated=Main
-    ------------------------------------------------------------------ */
     const updatedConsumedMap = new Map();
+
     for (const row of updatedConsumedRows) {
-      const key = buildItemKey(row);
-      if (key && !updatedConsumedMap.has(key)) updatedConsumedMap.set(key, row);
+      const key = upperText(row.item);
+      if (key && !updatedConsumedMap.has(key)) {
+        updatedConsumedMap.set(key, row);
+      }
     }
 
     const originalConsumedMap = new Map();
+
     for (const row of originalConsumedRows) {
-      const key = buildItemKey(row);
-      if (key && !originalConsumedMap.has(key)) originalConsumedMap.set(key, row);
+      const key = upperText(row.item);
+      if (key && !originalConsumedMap.has(key)) {
+        originalConsumedMap.set(key, row);
+      }
     }
 
-    const componentKeys = Array.from(
-      new Set([...originalConsumedMap.keys(), ...updatedConsumedMap.keys()])
-    );
+    const componentKeys = uniqueValues([
+      ...consumedItemsFromSummary.map(upperText),
+      ...Array.from(originalConsumedMap.keys()),
+      ...Array.from(updatedConsumedMap.keys()),
+    ]);
 
-    const componentItemChanges = [];
+    const existingComponentRows = [];
+    const addedComponentRows = [];
+
     for (const key of componentKeys) {
       const originalRow = originalConsumedMap.get(key) || null;
       const updatedRow = updatedConsumedMap.get(key) || null;
-      const item = safeText(originalRow?.item || updatedRow?.item);
-      const itemDescription = itemDescriptionMap.get(upperText(item)) || "";
+
+      const item = safeText(originalRow?.item || updatedRow?.item || key);
+      const itemDetails = itemDetailsMap.get(upperText(item)) || {};
+
       const originalUsage = getConsumedPer(originalRow);
       const updatedUsage = getConsumedPer(updatedRow);
 
-      if (originalRow && updatedRow) {
-        componentItemChanges.push(
-          buildChangeRow("Component Item", item, item, itemDescription),
-          buildChangeRow("Standard Usage", originalUsage, updatedUsage, itemDescription)
-        );
-      } else if (originalRow && !updatedRow) {
-        componentItemChanges.push(
-          buildChangeRow("Component Item", item, "", itemDescription),
-          buildChangeRow("Standard Usage", originalUsage, "", itemDescription)
-        );
-      } else if (!originalRow && updatedRow) {
-        componentItemChanges.push(
-          buildChangeRow("Component Item", "", item, itemDescription),
-          buildChangeRow("Standard Usage", "", updatedUsage, itemDescription)
-        );
+      if (!originalRow && updatedRow) {
+        addedComponentRows.push({
+          item,
+          description: itemDetails.description || "",
+          itemReleaseFlag: itemDetails.itemReleaseFlag || "",
+          value: updatedUsage,
+        });
+      } else {
+        existingComponentRows.push({
+          item,
+          description: itemDetails.description || "",
+          itemReleaseFlag: itemDetails.itemReleaseFlag || "",
+          originalValue: originalUsage,
+          updatedValue: displayUpdatedValue(originalUsage, updatedUsage),
+          changed: !sameValue(originalUsage, updatedUsage),
+        });
       }
     }
 
-    /* ------------------------------------------------------------------
-       Co-product comparison:
-       Co-products are identified from item_bom_routing/_og where
-       erp_co_product_association = 1. Then quantities come from
-       bom_produced/_og.
-    ------------------------------------------------------------------ */
-    const updatedCoProductItems = new Set(
-      updatedRoutingRows
-        .filter((row) => getCoProductAssociationFlag(row) === 1)
-        .map((row) => upperText(row.item))
-        .filter(Boolean)
-    );
+    const updatedProducedMap = new Map();
 
-    const originalCoProductItems = new Set(
-      originalRoutingRows
-        .filter((row) => getCoProductAssociationFlag(row) === 1)
-        .map((row) => upperText(row.item))
-        .filter(Boolean)
-    );
-
-    const updatedCoProductMap = new Map();
-    for (const row of updatedProducedRowsAll) {
-      const key = buildItemKey(row);
-      if (!key || !updatedCoProductItems.has(key)) continue;
-      if (!updatedCoProductMap.has(key)) updatedCoProductMap.set(key, row);
+    for (const row of updatedProducedRows) {
+      const key = upperText(row.item);
+      if (key && !updatedProducedMap.has(key)) {
+        updatedProducedMap.set(key, row);
+      }
     }
 
-    const originalCoProductMap = new Map();
-    for (const row of originalProducedRowsAll) {
-      const key = buildItemKey(row);
-      if (!key || !originalCoProductItems.has(key)) continue;
-      if (!originalCoProductMap.has(key)) originalCoProductMap.set(key, row);
+    const originalProducedMap = new Map();
+
+    for (const row of originalProducedRows) {
+      const key = upperText(row.item);
+      if (key && !originalProducedMap.has(key)) {
+        originalProducedMap.set(key, row);
+      }
     }
 
-    const coProductKeys = Array.from(
-      new Set([...originalCoProductMap.keys(), ...updatedCoProductMap.keys()])
-    );
+    const updatedCoProductRoutingMap = new Map();
 
-    const coProductChanges = [];
+    for (const row of updatedRoutingRows) {
+      if (getCoProductAssociationFlag(row) !== 1) continue;
+
+      const key = upperText(row.item);
+      if (key && !updatedCoProductRoutingMap.has(key)) {
+        updatedCoProductRoutingMap.set(key, row);
+      }
+    }
+
+    const originalCoProductRoutingMap = new Map();
+
+    for (const row of originalRoutingRows) {
+      if (getCoProductAssociationFlag(row) !== 1) continue;
+
+      const key = upperText(row.item);
+      if (key && !originalCoProductRoutingMap.has(key)) {
+        originalCoProductRoutingMap.set(key, row);
+      }
+    }
+
+    const coProductKeys = uniqueValues([
+      ...coProductItemsFromSummary.map(upperText),
+      ...Array.from(originalProducedMap.keys()).filter(
+        (key) => key !== mainProducedItemUpper
+      ),
+      ...Array.from(updatedProducedMap.keys()).filter(
+        (key) => key !== mainProducedItemUpper
+      ),
+      ...Array.from(originalCoProductRoutingMap.keys()),
+      ...Array.from(updatedCoProductRoutingMap.keys()),
+    ]);
+
+    const existingCoProductRows = [];
+    const addedCoProductRows = [];
+
     for (const key of coProductKeys) {
-      const originalRow = originalCoProductMap.get(key) || null;
-      const updatedRow = updatedCoProductMap.get(key) || null;
-      const item = safeText(originalRow?.item || updatedRow?.item);
-      const itemDescription = itemDescriptionMap.get(upperText(item)) || "";
-      const originalQty = getQtyProducedPer(originalRow);
-      const updatedQty = getQtyProducedPer(updatedRow);
+      if (!key || key === mainProducedItemUpper) continue;
 
-      if (originalRow && updatedRow) {
-        coProductChanges.push(
-          buildChangeRow("Co-Product Item", item, item, itemDescription),
-          buildChangeRow("Qty Produced", originalQty, updatedQty, itemDescription)
-        );
-      } else if (originalRow && !updatedRow) {
-        coProductChanges.push(
-          buildChangeRow("Co-Product Item", item, "", itemDescription),
-          buildChangeRow("Qty Produced", originalQty, "", itemDescription)
-        );
-      } else if (!originalRow && updatedRow) {
-        coProductChanges.push(
-          buildChangeRow("Co-Product Item", "", item, itemDescription),
-          buildChangeRow("Qty Produced", "", updatedQty, itemDescription)
-        );
+      const originalProduced = originalProducedMap.get(key) || null;
+      const updatedProduced = updatedProducedMap.get(key) || null;
+
+      const originalRouting = originalCoProductRoutingMap.get(key) || null;
+      const updatedRouting = updatedCoProductRoutingMap.get(key) || null;
+
+      const item = safeText(
+        originalProduced?.item ||
+        updatedProduced?.item ||
+        originalRouting?.item ||
+        updatedRouting?.item ||
+        key
+      );
+
+      const itemDetails = itemDetailsMap.get(upperText(item)) || {};
+
+      const originalQty = getQtyProducedPer(originalProduced);
+      const updatedQty = getQtyProducedPer(updatedProduced);
+
+      const originalResource = getResourceFromRoutingRow(originalRouting);
+      const updatedResource = getResourceFromRoutingRow(updatedRouting);
+
+      const originalPriority = getRoutingPriority(originalRouting);
+      const updatedPriority = getRoutingPriority(updatedRouting);
+
+      if (!originalProduced && updatedProduced) {
+        addedCoProductRows.push({
+          item,
+          description: itemDetails.description || "",
+          itemReleaseFlag: itemDetails.itemReleaseFlag || "",
+          resource: updatedResource,
+          priority: updatedPriority,
+          value: updatedQty,
+        });
+      } else {
+        existingCoProductRows.push({
+          item,
+          description: itemDetails.description || "",
+          itemReleaseFlag: itemDetails.itemReleaseFlag || "",
+          originalResource,
+          updatedResource:
+            !safeText(updatedResource) || sameValue(originalResource, updatedResource)
+              ? "No Changes"
+              : updatedResource,
+          originalPriority,
+          updatedPriority:
+            !safeText(updatedPriority) || sameValue(originalPriority, updatedPriority)
+              ? "No Changes"
+              : updatedPriority,
+          originalValue: originalQty,
+          updatedValue: displayUpdatedValue(originalQty, updatedQty),
+          changed:
+            !sameValue(originalQty, updatedQty) ||
+            !sameValue(originalResource, updatedResource) ||
+            !sameValue(originalPriority, updatedPriority),
+        });
       }
     }
+
+    const mainRoutingRow =
+      updatedRoutingRows.find(
+        (row) =>
+          getCoProductAssociationFlag(row) !== 1 &&
+          upperText(row.item) === mainProducedItemUpper
+      ) ||
+      updatedRoutingRows.find((row) => getCoProductAssociationFlag(row) !== 1) ||
+      originalRoutingRows.find(
+        (row) =>
+          getCoProductAssociationFlag(row) !== 1 &&
+          upperText(row.item) === mainProducedItemUpper
+      ) ||
+      originalRoutingRows.find((row) => getCoProductAssociationFlag(row) !== 1) ||
+      null;
+
+    const mainItemDetails = itemDetailsMap.get(mainProducedItemUpper) || {};
+
+    const bomRecordDetails = [
+      {
+        field: "Location",
+        value: resolvedLocation,
+      },
+      {
+        field: "BOM ID",
+        value: resolvedBomId,
+      },
+      {
+        field: "Produced Item",
+        value: mainProducedItem,
+      },
+      {
+        field: "Item Description",
+        value: mainItemDetails.description || "",
+      },
+      {
+        field: "Item Release Flag",
+        value: mainItemDetails.itemReleaseFlag || "",
+      },
+      {
+        field: "Resource",
+        value: resolvedResource || getResourceFromRoutingRow(mainRoutingRow),
+      },
+      {
+        field: "Routing ID",
+        value: safeText(mainRoutingRow?.routing_id),
+      },
+      {
+        field: "Item BOM Routing Priority",
+        value: getRoutingPriority(mainRoutingRow),
+      },
+    ].filter((row) => safeText(row.value) !== "");
 
     return res.status(200).json({
       success: true,
@@ -9396,23 +9678,39 @@ router.get("/engineering-changes-detail-modify", async (req, res) => {
         header: {
           engineeringChangeId,
           changeDate: headerRow?.change_date || "",
-          userName: headerRow?.user_name || "",
+          userName:
+            headerRow?.user_name ||
+            headerRow?.created_by ||
+            headerRow?.updated_by ||
+            "",
           changeType: headerRow?.change_type || "Modified",
           bomId: resolvedBomId,
           location: resolvedLocation,
           resource: resolvedResource,
-          producedItem: displayProducedItem,
-          routingId: displayRoutingId,
-          itemBomRoutingPriority: displayRoutingPriority,
-          summaryNotes: headerRow?.summarynotes || "",
+          resources: resolvedResources,
+          producedItem: mainProducedItem,
+          producedItems: producedItemsFromSummary,
+          consumedItems: consumedItemsFromSummary,
+          itemDescription: mainItemDetails.description || "",
+          itemReleaseFlag: mainItemDetails.itemReleaseFlag || "",
+          summaryNotes: headerRow?.summarynotes || headerRow?.notes || "",
+          changeSummary: headerRow?.change_summary || "",
         },
+
         bomRecordDetails,
-        componentItemChanges,
-        coProductChanges,
+
+        existingComponentRows,
+        addedComponentRows,
+        existingCoProductRows,
+        addedCoProductRows,
+
+        componentItemChanges: [],
+        coProductChanges: [],
       },
     });
   } catch (error) {
     console.error("DB Error (engineering-changes-detail-modify):", error);
+
     return res.status(500).json({
       success: false,
       message: "Failed to fetch engineering modify detail",
