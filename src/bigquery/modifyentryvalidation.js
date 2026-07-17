@@ -5,7 +5,6 @@
    - co-products / qty produced
    - resource
    - routing ID
-   - item BOM routing priority
 */
 
 const norm = (value) => String(value ?? "").trim();
@@ -15,7 +14,6 @@ const toNum = (value) => {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
 };
-const isInt = (value) => Number.isInteger(Number(value));
 
 const buildErrorRow = ({
   table = "MODIFY_ENTRY",
@@ -92,12 +90,6 @@ const getCoProductQty = (cp) =>
   cp?.erp_bom_qty_produced_per ??
   "";
 
-const getCoProductPriority = (cp) =>
-  cp?.itemBomRoutingPriority ??
-  cp?.item_bom_routing_priority ??
-  cp?.erp_item_bom_routing_priority ??
-  cp?.routingPriority ??
-  "";
 
 export function validateModifyEntryPayload(payload = {}) {
   const failures = [];
@@ -138,7 +130,6 @@ export function validateModifyEntryPayload(payload = {}) {
     const resourceInfo = locationRow?.resourceInfo || {};
     const resource = norm(resourceInfo?.resource) || getResourceFromRoutingId(resourceInfo?.routingId);
     const routingId = norm(resourceInfo?.routingId) || buildRoutingId(producedItem, resource);
-    const priority = resourceInfo?.priority;
     const componentItems = ensureArray(locationRow?.componentItems);
     const coProductItems = ensureArray(locationRow?.coProductItems ?? locationRow?.coProducts);
 
@@ -194,23 +185,6 @@ export function validateModifyEntryPayload(payload = {}) {
       );
     }
 
-    if (priority !== "" && priority !== null && priority !== undefined && !isInt(priority)) {
-      failures.push(
-        buildErrorRow({
-          table: "ITEM_BOM_ROUTING",
-          record: `${locationIndex + 1}.R`,
-          bomId,
-          item: producedItem,
-          location,
-          routingId,
-          seq: "M1021",
-          field: "itemBomRoutingPriority",
-          validation: "Item BOM Routing Priority must be an integer.",
-          error: `Routing priority "${priority}" is not a whole number.`,
-          rm: "Enter a whole number for Item BOM Routing Priority.",
-        })
-      );
-    }
 
     const seenComponents = new Set();
     componentItems.forEach((component, componentIndex) => {
@@ -273,70 +247,12 @@ export function validateModifyEntryPayload(payload = {}) {
     });
 
   const seenCoProducts = new Set();
-const seenPriorityRoutingMap = new Map();
-
-    const addDuplicatePriorityError = ({ priorityValue, record, item, routingId }) => {
-      failures.push(
-        buildErrorRow({
-          table: "ITEM_BOM_ROUTING",
-          record,
-          bomId,
-          item,
-          location,
-          routingId,
-          field: "itemBomRoutingPriority",
-          seq: "M1020",
-          validation: "Duplicate priority for the same BOM is not allowed.",
-          error: `Duplicate Item BOM Routing Priority "${priorityValue}" found for BOM "${bomId}".`,
-          rm: "Use a unique Item BOM Routing Priority within the BOM.",
-        })
-      );
-    };
-const validatePriorityDuplicate = ({ priorityValue, record, item, routingId }) => {
-  if (priorityValue === "" || priorityValue === null || priorityValue === undefined) return;
-
-  const cleanPriority = norm(priorityValue);
-  const cleanRoutingId = norm(routingId).toUpperCase();
-
-  if (!cleanPriority || !cleanRoutingId) return;
-
-  const priorityBomKey = `${bomId}__${cleanPriority}`.toUpperCase();
-  const existingRoutingIds = seenPriorityRoutingMap.get(priorityBomKey) || new Set();
-
-  // Same BOM + same Priority + same Routing ID is allowed.
-  // This is valid when multiple co-products are attached to same resource/routing.
-  if (existingRoutingIds.has(cleanRoutingId)) {
-    return;
-  }
-
-  // Same BOM + same Priority + different Routing ID is duplicate.
-  if (existingRoutingIds.size > 0) {
-    addDuplicatePriorityError({
-      priorityValue: cleanPriority,
-      record,
-      item,
-      routingId,
-    });
-    return;
-  }
-
-  existingRoutingIds.add(cleanRoutingId);
-  seenPriorityRoutingMap.set(priorityBomKey, existingRoutingIds);
-};
-  validatePriorityDuplicate({
-  priorityValue: priority,
-  record: `${locationIndex + 1}.R`,
-  item: producedItem,
-  routingId,
-});
-
     coProductItems.forEach((cp, cpIndex) => {
       const coProductItem = getCoProductItem(cp);
       const qty = getCoProductQty(cp);
       const qtyNum = toNum(qty);
       const cpResource = norm(cp?.resource) || getResourceFromRoutingId(cp?.routingId) || resource;
       const cpRoutingId = norm(cp?.routingId) || buildRoutingId(producedItem, cpResource);
-      const cpPriority = getCoProductPriority(cp);
 
       const coProductKey = `${bomId}__${cpRoutingId}__${coProductItem}`.toUpperCase();
      
@@ -411,23 +327,6 @@ const validatePriorityDuplicate = ({ priorityValue, record, item, routingId }) =
         );
       }
 
-      if (cpPriority === "" || cpPriority === null || cpPriority === undefined || !isInt(cpPriority)) {
-        failures.push(
-          buildErrorRow({
-            table: "ITEM_BOM_ROUTING",
-            record: `${locationIndex + 1}.CP${cpIndex + 1}.R`,
-            bomId,
-            item: coProductItem,
-            location,
-            routingId: cpRoutingId,
-            field: "itemBomRoutingPriority",
-            seq: "M1021",
-            validation: "Item BOM Routing Priority is required and must be an integer.",
-            error: `Co-product "${coProductItem || "blank"}" has invalid priority "${cpPriority}".`,
-            rm: "Enter a whole number for Item BOM Routing Priority.",
-          })
-        );
-      }
 
     if (coProductItem && cpRoutingId && seenCoProducts.has(coProductKey)) {
   failures.push(
@@ -446,16 +345,6 @@ const validatePriorityDuplicate = ({ priorityValue, record, item, routingId }) =
     })
   );
 }
-
-     
-
-   validatePriorityDuplicate({
-  priorityValue: cpPriority,
-  record: `${locationIndex + 1}.CP${cpIndex + 1}.R`,
-  item: coProductItem,
-  routingId: cpRoutingId,
-});
-
       if (coProductItem) seenCoProducts.add(coProductKey);
     });
   });

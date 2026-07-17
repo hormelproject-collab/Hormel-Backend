@@ -639,7 +639,7 @@ export async function validateManualEntryPayload(payload, pool) {
   }
 
   /* ======================================================
-     1018/1019/1020/1021: routing rules
+     1018/1019/1021: routing rules
   ====================================================== */
   for (const rt of routing) {
     const b = norm(rt.bom_id);
@@ -753,38 +753,6 @@ export async function validateManualEntryPayload(payload, pool) {
             fallbackErrorDetails: `Duplicate routing row found for item "${rt.item}", BOM "${rt.bom_id}", routing "${rt.routing_id}".`,
             fallbackRemediationMessage:
               "Remove duplicate routing rows.",
-          })
-        );
-      }
-      seen.add(key);
-    }
-  }
-
-  // 1020 duplicate bomid+priority
-  {
-    const seen = new Set();
-    for (const rt of routing) {
-      const key = `${norm(rt.bom_id)}__${String(rt.priority ?? "NULL")}`;
-      if (seen.has(key)) {
-        failures.push(
-          buildErrorRow({
-            table: "ITEM_BOM_ROUTING",
-            record: rt.recordNo,
-            bomId: rt.bom_id,
-            item: rt.item,
-            location: rt.location,
-            routingId: rt.routing_id,
-            seq: 1020,
-            values: {
-              value: rt.bom_id,
-              erp_item_bom_routing_priority: rt.priority,
-              bom_id: rt.bom_id,
-            },
-            fallbackValidation:
-              "Duplicate priority for the same BOMID",
-            fallbackErrorDetails: `Duplicate routing priority "${rt.priority}" found for BOM "${rt.bom_id}".`,
-            fallbackRemediationMessage:
-              "Use unique routing priorities within the BOM.",
           })
         );
       }

@@ -1205,12 +1205,8 @@ router.get("/existing-bom-search", async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
 
-    // No hard cap here.
-    // Frontend should send pageSize = 50.
-    // LIMIT/OFFSET below is only for backend pagination.
     const requestedPageSize = Number.parseInt(req.query.pageSize, 10) || 50;
     const pageSize = Math.max(1, requestedPageSize);
-
     const offset = (page - 1) * pageSize;
 
     const normalizeField = (value) => {
@@ -1245,6 +1241,21 @@ router.get("/existing-bom-search", async (req, res) => {
     const query1 = normalizeText(req.query.query1 || "");
     const searchBy2 = normalizeField(req.query.searchBy2);
     const query2 = normalizeText(req.query.query2 || "");
+
+    const searchCriteria = [
+      { field: searchBy1, query: query1 },
+      { field: searchBy2, query: query2 },
+    ].filter((criteria) => criteria.field && criteria.query);
+
+    const activeDescriptionQueries = searchCriteria
+      .filter((criteria) => criteria.field === "produced_item_desc")
+      .map((criteria) => criteria.query)
+      .filter(Boolean);
+
+    const activeReleaseQueries = searchCriteria
+      .filter((criteria) => criteria.field === "item_release_flag")
+      .map((criteria) => criteria.query)
+      .filter(Boolean);
 
     const pgParams = [];
     const pgFilters = [];
@@ -1466,6 +1477,43 @@ router.get("/existing-bom-search", async (req, res) => {
       )
     );
 
+    const buildLikeOrClause = (columnExpression, queries, paramPrefix) => {
+      const cleanQueries = Array.from(
+        new Set((queries || []).map(normalizeText).filter(Boolean))
+      );
+
+      if (!cleanQueries.length) {
+        return {
+          clause: "",
+          params: {},
+        };
+      }
+
+      const params = {};
+      const parts = cleanQueries.map((q, index) => {
+        const paramName = `${paramPrefix}${index}`;
+        params[paramName] = q;
+        return `LOWER(COALESCE(CAST(${columnExpression} AS STRING), '')) LIKE CONCAT('%', LOWER(@${paramName}), '%')`;
+      });
+
+      return {
+        clause: `AND (${parts.join(" OR ")})`,
+        params,
+      };
+    };
+
+    const itemDescLike = buildLikeOrClause(
+      "item_desc",
+      activeDescriptionQueries,
+      "descQ"
+    );
+
+    const releaseLike = buildLikeOrClause(
+      "release",
+      activeReleaseQueries,
+      "releaseQ"
+    );
+
     const itemMasterRows = allPageItems.length
       ? await runBigQuery(
         `
@@ -1474,8 +1522,12 @@ router.get("/existing-bom-search", async (req, res) => {
               item_desc
             FROM ${bqTableRefByKey("itemMaster")}
             WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+            ${itemDescLike.clause}
           `,
-        { items: allPageItems }
+        {
+          items: allPageItems,
+          ...itemDescLike.params,
+        }
       )
       : [];
 
@@ -1487,14 +1539,52 @@ router.get("/existing-bom-search", async (req, res) => {
               release
             FROM ${bqTableRefByKey("itemReleaseFlag")}
             WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+            ${releaseLike.clause}
           `,
-        { items: allPageItems }
+        {
+          items: allPageItems,
+          ...releaseLike.params,
+        }
       )
       : [];
 
+    const fallbackItemMasterRows =
+      allPageItems.length && activeDescriptionQueries.length && itemMasterRows.length === 0
+        ? await runBigQuery(
+          `
+              SELECT
+                item,
+                item_desc
+              FROM ${bqTableRefByKey("itemMaster")}
+              WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+            `,
+          { items: allPageItems }
+        )
+        : [];
+
+    const fallbackReleaseFlagRows =
+      allPageItems.length && activeReleaseQueries.length && releaseFlagRows.length === 0
+        ? await runBigQuery(
+          `
+              SELECT
+                item,
+                release
+              FROM ${bqTableRefByKey("itemReleaseFlag")}
+              WHERE UPPER(TRIM(CAST(item AS STRING))) IN UNNEST(@items)
+            `,
+          { items: allPageItems }
+        )
+        : [];
+
+    const finalItemMasterRows =
+      itemMasterRows.length > 0 ? itemMasterRows : fallbackItemMasterRows;
+
+    const finalReleaseFlagRows =
+      releaseFlagRows.length > 0 ? releaseFlagRows : fallbackReleaseFlagRows;
+
     const itemDescMap = new Map();
 
-    for (const row of itemMasterRows) {
+    for (const row of finalItemMasterRows) {
       const itemKey = normalizeUpper(row.item);
       if (!itemKey) continue;
 
@@ -1505,7 +1595,7 @@ router.get("/existing-bom-search", async (req, res) => {
 
     const releaseFlagMap = new Map();
 
-    for (const row of releaseFlagRows) {
+    for (const row of finalReleaseFlagRows) {
       const itemKey = normalizeUpper(row.item);
       if (!itemKey) continue;
 
@@ -2882,6 +2972,35 @@ router.put("/modify-bom", async (req, res) => {
 
       return `ROUTING_${cleanItem}_${cleanResource}`;
     };
+    const getRoutingResource = (row) => {
+      return (
+        toText(row?.resource) ||
+        toText(row?.Resource) ||
+        getResourceFromRoutingId(row?.routing_id || row?.routingId)
+      );
+    };
+
+    const buildProducedRoutingIdFromResource = (resourceValue) => {
+      return buildRoutingId(producedItem.item, resourceValue);
+    };
+
+    const buildCoProductRoutingKey = ({ item, routingId, resourceValue }) => {
+      const cleanResource = toText(resourceValue) || getResourceFromRoutingId(routingId);
+      const normalizedRoutingId =
+        buildProducedRoutingIdFromResource(cleanResource) || toText(routingId);
+
+      return [
+        bomId,
+        normalizedRoutingId,
+        toText(item),
+        "COPRODUCT",
+      ].join("__");
+    };
+
+    const buildMainRoutingKeyByResource = (row) => {
+      const rowResource = getRoutingResource(row);
+      return rowResource.toUpperCase();
+    };
 
     const normalizeRoutingIdForRow = (row, fallbackResource = "") => {
       const item = toText(row?.item);
@@ -3482,9 +3601,11 @@ router.put("/modify-bom", async (req, res) => {
       );
 
 
-      const liveCoProductMap = new Map(
-        liveCoProductRows.map((row) => [buildProducedKey(row), row])
-      );
+const liveCoProductMap = new Map(
+  liveCoProductRows.map((row) => [buildProducedKey(row), row])
+);
+
+   
 
       const requestedCoProductMap = new Map();
       const removedCoProductItems = new Set();
@@ -3601,11 +3722,23 @@ router.put("/modify-bom", async (req, res) => {
 
         consolidatedSummaryCategories.add("co-product information");
       }
-
+      const requestedCoProductItemsByItem = new Set(
+        requestedCoProductItems
+          .map((cp) => toText(cp?.coProductItem).toUpperCase())
+          .filter(Boolean)
+      );
       for (const row of liveCoProductRows) {
         const key = buildProducedKey(row);
 
+        const rowItemKey = toText(row?.item).toUpperCase();
+
         if (requestedCoProductMap.has(key)) continue;
+
+        // Do not delete BOM Produced row if the same co-product item
+        // is still attached to another resource in Item BOM Routing.
+        if (rowItemKey && requestedCoProductItemsByItem.has(rowItemKey)) {
+          continue;
+        }
 
         const removedCoProductItem = toText(row?.item);
 
@@ -3662,11 +3795,29 @@ router.put("/modify-bom", async (req, res) => {
       const liveMainRoutingRows = liveRoutingRows.filter(
         (row) => !isCoProductRouting(row)
       );
+      const parentRoutingByResource = new Map();
 
+      for (const row of liveMainRoutingRows) {
+        const parentResourceKey = buildMainRoutingKeyByResource(row);
+        if (!parentResourceKey) continue;
+
+        if (!parentRoutingByResource.has(parentResourceKey)) {
+          parentRoutingByResource.set(parentResourceKey, row);
+        }
+      }
       const liveCoProductRoutingRows = liveRoutingRows.filter((row) =>
         isCoProductRouting(row)
       );
-
+const liveCoProductRoutingMap = new Map(
+  liveCoProductRoutingRows.map((row) => [
+    buildCoProductRoutingKey({
+      item: row?.item,
+      routingId: row?.routing_id,
+      resourceValue: getRoutingResource(row),
+    }),
+    row,
+  ])
+);
       const routingChanges = [];
 
       if (
@@ -3727,17 +3878,7 @@ router.put("/modify-bom", async (req, res) => {
         ])
       );
 
-      const liveCoProductRoutingMap = new Map(
-        liveCoProductRoutingRows.map((row) => [
-          [
-            toText(row.bom_id),
-            toText(row.routing_id),
-            toText(row.item),
-            "COPRODUCT",
-          ].join("__"),
-          row,
-        ])
-      );
+      
 
       const requestedCoProductRoutingMap = new Map();
 
@@ -3751,7 +3892,12 @@ router.put("/modify-bom", async (req, res) => {
         coProductAssociation,
         templateRow,
       }) => {
-        if (priorityValue === "" || priorityValue === null || priorityValue === undefined || Number.isNaN(Number(priorityValue))) {
+        if (
+          priorityValue === "" ||
+          priorityValue === null ||
+          priorityValue === undefined ||
+          Number.isNaN(Number(priorityValue))
+        ) {
           throw new Error(`Item BOM Routing Priority is required for item ${item}`);
         }
 
@@ -3803,6 +3949,7 @@ router.put("/modify-bom", async (req, res) => {
         await client.query(routingInsert.query, routingInsert.values);
       };
 
+
       const existingMainRoutingPriority =
         primaryRoutingLiveRow?.erp_item_bom_routing_priority === "" ||
           primaryRoutingLiveRow?.erp_item_bom_routing_priority === null ||
@@ -3841,24 +3988,26 @@ router.put("/modify-bom", async (req, res) => {
           );
         }
 
-        const coProductRoutingKey = [
-          bomId,
-          coProductRoutingId,
-          coProductItem,
-          "COPRODUCT",
-        ].join("__");
+        const coProductRoutingKey = buildCoProductRoutingKey({
+          item: coProductItem,
+          routingId: coProductRoutingId,
+          resourceValue: coProductResource,
+        });
 
         requestedCoProductRoutingMap.set(coProductRoutingKey, true);
 
         const existingCoProductRoutingRow =
           liveCoProductRoutingMap.get(coProductRoutingKey) || null;
 
-        const rawCoProductPriority =
-          cp?.itemBomRoutingPriority ??
-          cp?.item_bom_routing_priority ??
-          cp?.erp_item_bom_routing_priority ??
-          cp?.routingPriority ??
-          "";
+        const parentRoutingForSameResource =
+          parentRoutingByResource.get(coProductResource.toUpperCase()) || null;
+
+        const parentPriorityForSameResource =
+          parentRoutingForSameResource?.erp_item_bom_routing_priority === "" ||
+            parentRoutingForSameResource?.erp_item_bom_routing_priority === null ||
+            parentRoutingForSameResource?.erp_item_bom_routing_priority === undefined
+            ? null
+            : Number(parentRoutingForSameResource.erp_item_bom_routing_priority);
 
         const existingCoProductPriority =
           existingCoProductRoutingRow?.erp_item_bom_routing_priority === "" ||
@@ -3868,11 +4017,9 @@ router.put("/modify-bom", async (req, res) => {
             : Number(existingCoProductRoutingRow.erp_item_bom_routing_priority);
 
         const coProductPriority =
-          rawCoProductPriority === "" ||
-            rawCoProductPriority === null ||
-            rawCoProductPriority === undefined
-            ? existingCoProductPriority ?? existingMainRoutingPriority
-            : Number(rawCoProductPriority);
+          parentPriorityForSameResource ??
+          existingCoProductPriority ??
+          existingMainRoutingPriority;
 
         if (coProductPriority === null || Number.isNaN(coProductPriority)) {
           throw new Error(
@@ -3936,30 +4083,43 @@ router.put("/modify-bom", async (req, res) => {
         consolidatedSummaryCategories.add("routing information");
       }
 
-      for (const row of liveCoProductRoutingRows) {
-        const key = [
-          toText(row.bom_id),
-          toText(row.routing_id),
-          toText(row.item),
-          "COPRODUCT",
-        ].join("__");
+      const requestedTouchedCoProductItems = new Set(
+        requestedCoProductItems
+          .map((cp) => toText(cp?.coProductItem).toUpperCase())
+          .filter(Boolean)
+      );
 
+      for (const row of liveCoProductRoutingRows) {
         const rowBomId = toText(row?.bom_id).toUpperCase();
         const rowItem = toText(row?.item).toUpperCase();
 
-        const isRemovedCoProductItem =
-          rowBomId === toText(bomId).toUpperCase() &&
-          removedCoProductItems.has(rowItem);
-
-        const isOldCoProductRoutingNoLongerRequested =
-          !requestedCoProductRoutingMap.has(key);
-
-        if (!isRemovedCoProductItem && !isOldCoProductRoutingNoLongerRequested) {
+        if (rowBomId !== toText(bomId).toUpperCase()) {
           continue;
         }
 
-        // Delete exact co-product IBR row only.
-        // Main produced item routing rows are never deleted here.
+        const key = buildCoProductRoutingKey({
+          item: row?.item,
+          routingId: row?.routing_id,
+          resourceValue: getRoutingResource(row),
+        });
+
+        const isStillRequested = requestedCoProductRoutingMap.has(key);
+
+        if (isStillRequested) {
+          continue;
+        }
+
+        const isTouchedByThisModify =
+          requestedTouchedCoProductItems.has(rowItem) ||
+          removedCoProductItems.has(rowItem);
+
+        // Important:
+        // Do not delete unrelated co-product IBR rows for other resources
+        // just because those rows were not present in current payload.
+        if (!isTouchedByThisModify) {
+          continue;
+        }
+
         await deleteExactRowById(T.itemBomRouting, itemBomRoutingIdColumn, row);
 
         consolidatedSummaryCategories.add("routing information");
@@ -6268,6 +6428,33 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       return `ROUTING_${cleanItem}_${cleanResource}`;
     };
 
+    const hasRemainingCoProductItemBomRoutingRows = async ({
+      bomId,
+      coProductItem,
+    }) => {
+      const cleanBomId = normalizeTextLocal(bomId);
+      const cleanCoProductItem = normalizeTextLocal(coProductItem);
+
+      if (!cleanBomId || !cleanCoProductItem) return false;
+
+      const result = await client.query(
+        `
+        SELECT 1
+        FROM ${pgRef(T.itemBomRouting)}
+        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+          AND TRIM(CAST(item AS TEXT)) = $2
+          AND COALESCE(
+                NULLIF(TRIM(CAST(erp_co_product_association AS TEXT)), ''),
+                '0'
+              ) = '1'
+        LIMIT 1
+        `,
+        [cleanBomId, cleanCoProductItem]
+      );
+
+      return (result.rows || []).length > 0;
+    };
+
     const getSourceRowsForRecord = async (record) => {
       const recId = normalizeTextLocal(record?.rec_id);
       const bomId = normalizeTextLocal(record?.bom_id);
@@ -6392,6 +6579,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
     const processedLiveKeys = new Set();
     const processedBomProducedMatchKeys = new Set();
+    const pendingBomProducedCoProductDeleteMap = new Map();
 
     const consolidatedBomIds = new Set();
     const consolidatedLocations = new Set();
@@ -6403,10 +6591,17 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       const sourceRows = sourceResult.rows || [];
 
       for (const sourceRow of sourceRows) {
-        const targetRows = await getDeleteTargetRowsForItemBomRouting(
-          client,
-          sourceRow
-        );
+        /*
+          Important:
+          If selected row is a co-product IBR row, delete only that exact
+          selected resource row from item_bom_routing.
+
+          Do not expand co-product rows using getDeleteTargetRowsForItemBomRouting,
+          because same co-product can be attached to multiple resources.
+        */
+        const targetRows = isTruthyCoProductAssociation(sourceRow)
+          ? [sourceRow]
+          : await getDeleteTargetRowsForItemBomRouting(client, sourceRow);
 
         for (const row of targetRows) {
           const liveUniqueKey = buildItemBomRoutingUniqueKey(row);
@@ -6419,12 +6614,6 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
 
           const parsedRouting = parseRoutingIdParts(row.routing_id);
 
-          /*
-            Important:
-            routing_id must always be ROUTING_mainProducedItem_resource.
-            Even if the row.item is a co-product, the routing_id item part
-            should remain the main produced item.
-          */
           const mainProducedItem =
             normalizeTextLocal(parsedRouting.itemFromRoutingId) ||
             normalizeTextLocal(row.produced_item) ||
@@ -6562,11 +6751,6 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
             consolidatedResources.add(derivedResource);
           }
 
-          /*
-            produced_item in change log should contain:
-            - main produced item
-            - co-product item(s), if the deleted row is a co-product
-          */
           if (mainProducedItem) {
             consolidatedProducedItems.add(mainProducedItem);
           }
@@ -6576,11 +6760,10 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           }
 
           /*
-            Main item:
-              Delete only from item_bom_routing.
-
             Co-product:
-              Delete from item_bom_routing and bom_produced.
+            Do not delete bom_produced immediately.
+            First delete selected IBR row/resource.
+            Later check if any other IBR row remains for same bom_id + co-product item.
           */
           if (isTruthyCoProductAssociation(row)) {
             const bomProducedMatchInput = getBomProducedMatchInputFromRow(row);
@@ -6594,30 +6777,12 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
             if (
               bomProducedMatchInput.bomId &&
               bomProducedMatchInput.location &&
-              bomProducedMatchInput.coProductItem &&
-              !processedBomProducedMatchKeys.has(bomProducedMatchKey)
+              bomProducedMatchInput.coProductItem
             ) {
-              processedBomProducedMatchKeys.add(bomProducedMatchKey);
-
-              const bomProducedResult =
-                await archiveAndDeleteMatchingBomProducedCoProductOnly(
-                  client,
-                  row,
-                  {
-                    bomProducedArchiveTable,
-                    bomProducedArchiveColumns,
-                    engineeringChangeId,
-                    notes,
-                  }
-                );
-
-              archivedBomProducedRecIds.push(
-                ...(bomProducedResult.archivedBomProducedRecIds || [])
-              );
-
-              bomProducedDeletedCount += Number(
-                bomProducedResult.bomProducedDeletedCount || 0
-              );
+              pendingBomProducedCoProductDeleteMap.set(bomProducedMatchKey, {
+                row,
+                bomProducedMatchInput,
+              });
             }
           }
 
@@ -6626,6 +6791,54 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
           movedCount += 1;
         }
       }
+    }
+
+    /*
+      After selected IBR rows are deleted:
+      Delete bom_produced co-product only if no other co-product IBR rows remain
+      for same bom_id + coProductItem.
+    */
+    for (const [
+      bomProducedMatchKey,
+      pendingDelete,
+    ] of pendingBomProducedCoProductDeleteMap.entries()) {
+      if (processedBomProducedMatchKeys.has(bomProducedMatchKey)) {
+        continue;
+      }
+
+      const { row, bomProducedMatchInput } = pendingDelete || {};
+
+      const stillHasOtherIbrResource =
+        await hasRemainingCoProductItemBomRoutingRows({
+          bomId: bomProducedMatchInput?.bomId,
+          coProductItem: bomProducedMatchInput?.coProductItem,
+        });
+
+      if (stillHasOtherIbrResource) {
+        continue;
+      }
+
+      processedBomProducedMatchKeys.add(bomProducedMatchKey);
+
+      const bomProducedResult =
+        await archiveAndDeleteMatchingBomProducedCoProductOnly(
+          client,
+          row,
+          {
+            bomProducedArchiveTable,
+            bomProducedArchiveColumns,
+            engineeringChangeId,
+            notes,
+          }
+        );
+
+      archivedBomProducedRecIds.push(
+        ...(bomProducedResult.archivedBomProducedRecIds || [])
+      );
+
+      bomProducedDeletedCount += Number(
+        bomProducedResult.bomProducedDeletedCount || 0
+      );
     }
 
     if (movedCount === 0) {
@@ -6653,20 +6866,17 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
       .filter(Boolean)
       .join(", ");
 
-    const deletedBomIdCount = consolidatedBomIds.size;
+    const itemBomRoutingDeletedCount = Math.max(0, Number(movedCount || 0));
     const coProductCount = Math.max(0, Number(bomProducedDeletedCount || 0));
 
-    /*
-      Correct summary:
-      - Main item deletion only affects item_bom_routing.
-      - Co-product deletion affects item_bom_routing and bom_produced.
-    */
-    let deleteChangeSummary = `Deleted ${deletedBomIdCount} BOM ID${deletedBomIdCount === 1 ? "" : "s"
-      } in item_bom_routing.`;
+    let deleteChangeSummary = `Deleted ${itemBomRoutingDeletedCount} Item BOM Routing Record${
+      itemBomRoutingDeletedCount === 1 ? "" : "s"
+    }.`;
 
     if (coProductCount > 0) {
-      deleteChangeSummary += ` Deleted ${coProductCount} co-product${coProductCount === 1 ? "" : "s"
-        } in bom_produced and item_bom_routing.`;
+      deleteChangeSummary += ` Deleted ${coProductCount} Co-Product Record${
+        coProductCount === 1 ? "" : "s"
+      } from Bom Produced.`;
     }
 
     const consolidatedChangeLogRow = {};
@@ -6713,8 +6923,7 @@ router.post("/delete-item-bom-routing/execute", async (req, res) => {
     }
 
     if (changeLogColumns.includes("produced_item")) {
-      consolidatedChangeLogRow.produced_item =
-        consolidatedProducedItemText;
+      consolidatedChangeLogRow.produced_item = consolidatedProducedItemText;
     }
 
     if (changeLogColumns.includes("item")) {
@@ -8803,7 +9012,7 @@ router.get("/engineering-changes-detail-delete-bom", async (req, res) => {
 
               const fallbackCoProductAssociation =
                 resolvedProducedItems.length > 1 &&
-                itemKey !== normalizeKey(resolvedProducedItems[0])
+                  itemKey !== normalizeKey(resolvedProducedItems[0])
                   ? 1
                   : 0;
 

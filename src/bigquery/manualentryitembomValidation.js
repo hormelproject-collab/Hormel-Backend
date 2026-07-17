@@ -304,16 +304,7 @@ export async function validateItemBomRoutingCreatePayload(payload, pool) {
     )
   );
 
-  const existingPriorityKeySet = new Set(
-    existingRoutingRows
-      .filter((row) => row.erp_item_bom_routing_priority !== null)
-      .map(
-        (row) =>
-          `${norm(row.bom_id).toUpperCase()}__${String(
-            row.erp_item_bom_routing_priority
-          ).trim()}`
-      )
-  );
+
 
   /* ======================================================
      1018: ITEM_BOM_ROUTING bom_id must exist in
@@ -460,57 +451,7 @@ export async function validateItemBomRoutingCreatePayload(payload, pool) {
     }
   }
 
-  /* ======================================================
-     1020: Duplicate BOMID + priority
-     Checks payload duplicates and existing PostgreSQL rows.
-  ====================================================== */
-/* ======================================================
-   1020: Duplicate BOMID + priority
-   IMPORTANT:
-   Co-product rows intentionally share same priority with main row.
-   So payload self-duplicate priority check must run only for MAIN rows.
-   Existing DB duplicate priority check also only needs to run once for MAIN row.
-====================================================== */
-{
-  const seen = new Set();
-
-  const mainRoutingRows = routing.filter((row) => row.source === "MAIN");
-
-  for (const rt of mainRoutingRows) {
-    const priorityText = String(rt.priority ?? "NULL").trim();
-
-    const key = `${norm(rt.bom_id).toUpperCase()}__${priorityText}`;
-
-    if (seen.has(key) || existingPriorityKeySet.has(key)) {
-      failures.push(
-        buildErrorRow({
-          table: "ITEM_BOM_ROUTING",
-          record: rt.recordNo,
-          bomId: rt.bom_id,
-          item: rt.item,
-          location: rt.location,
-          routingId: rt.routing_id,
-          seq: 1020,
-          values: {
-            value: rt.bom_id,
-            priority: rt.priority,
-            item_bom_routing_priority: rt.priority,
-            erp_item_bom_routing_priority: rt.priority,
-            bom_id: rt.bom_id,
-          },
-          fallbackValidation: "Duplicate priority for the same BOMID",
-          fallbackErrorDetails: `Duplicate routing priority "${rt.priority}" found for BOM "${rt.bom_id}".`,
-          fallbackRemediationMessage:
-            "Use a unique routing priority within the BOM.",
-        })
-      );
-    }
-
-    seen.add(key);
-  }
-}
-
-  const errorCodes = [
+    const errorCodes = [
     ...new Set(
       failures.flatMap((row) =>
         ensureArray(row?.messages)
