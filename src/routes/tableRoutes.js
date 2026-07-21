@@ -1657,6 +1657,9 @@ router.get("/existing-bom-search", async (req, res) => {
 
 
 router.get("/modify-existing-bom-details", async (req, res) => {
+  console.log("\n✨ === /modify-existing-bom-details ENDPOINT HIT ===");
+  console.log("📍 Incoming request at:", new Date().toISOString());
+  
   try {
     const normalizeText = (value) => String(value ?? "").trim();
 
@@ -1751,7 +1754,10 @@ router.get("/modify-existing-bom-details", async (req, res) => {
     const producedItem = normalizeText(req.query.producedItem);
     const location = normalizeText(req.query.location);
 
+    console.log("🔍 /modify-existing-bom-details called with:", { bomId, producedItem, location });
+
     if (!bomId) {
+      console.warn("❌ bomId is missing");
       return res.status(400).json({
         success: false,
         error: "bomId is required",
@@ -1878,8 +1884,107 @@ router.get("/modify-existing-bom-details", async (req, res) => {
       coProductParams
     );
 
-    const componentRows = componentResult.rows || [];
-    const coProductRows = coProductResult.rows || [];
+    let componentRows = componentResult.rows || [];
+    let coProductRows = coProductResult.rows || [];
+
+    console.log("📦 Components from main table:", componentRows.length);
+    console.log("🏭 Co-Products from main table:", coProductRows.length);
+
+    if (!componentRows.length && !coProductRows.length) {
+      console.info(
+        "❌ No live BOM rows found for modify-existing-bom-details; falling back to archive tables:",
+        bomId,
+        location
+      );
+
+      const archiveComponentResult = await pool.query(
+        `
+        SELECT
+          TRIM(CAST(bc.bom_id AS TEXT)) AS bom_id,
+          TRIM(CAST(bc.item AS TEXT)) AS component_item,
+          TRIM(CAST(bc.location AS TEXT)) AS location,
+          bc.erp_bom_quantity_consumed_per AS standard_usage
+        FROM ${pgRef(T.bomConsumedOg)} bc
+        WHERE TRIM(CAST(bc.bom_id AS TEXT)) = $1
+          ${componentLocationFilter}
+        ORDER BY
+          TRIM(CAST(bc.item AS TEXT))
+      `,
+        componentParams
+      );
+
+      const archiveCoProductResult = await pool.query(
+        `
+        WITH produced_rows AS (
+          SELECT
+            TRIM(CAST(bp.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(bp.item AS TEXT)) AS item,
+            TRIM(CAST(bp.location AS TEXT)) AS location,
+            bp.erp_bom_qty_produced_per AS qty
+          FROM ${pgRef(T.bomProducedOg)} bp
+          WHERE TRIM(CAST(bp.bom_id AS TEXT)) = $1
+            ${coProductLocationFilter}
+        ),
+        coproduct_routing AS (
+          SELECT
+            TRIM(CAST(ibr.bom_id AS TEXT)) AS bom_id,
+            TRIM(CAST(ibr.item AS TEXT)) AS item,
+            TRIM(CAST(ibr.routing_id AS TEXT)) AS routing_id,
+            COALESCE(
+              TRIM(CAST(ibr.erp_co_product_association AS TEXT)),
+              ''
+            ) AS erp_co_product_association,
+            ibr.erp_item_bom_routing_priority AS erp_item_bom_routing_priority,
+            COALESCE(
+              NULLIF(
+                TRIM(
+                  regexp_replace(
+                    TRIM(CAST(ibr.routing_id AS TEXT)),
+                    '^([^_]*_){2}',
+                    ''
+                  )
+                ),
+                ''
+              ),
+              ''
+            ) AS resource
+          FROM ${pgRef(T.itemBomRoutingOg)} ibr
+          WHERE TRIM(CAST(ibr.bom_id AS TEXT)) = $1
+            AND COALESCE(
+                  NULLIF(
+                    TRIM(CAST(ibr.erp_co_product_association AS TEXT)),
+                    ''
+                  ),
+                  '0'
+                ) = '1'
+        )
+        SELECT
+          pr.bom_id,
+          pr.item,
+          pr.location,
+          pr.qty,
+          cr.resource,
+          cr.routing_id,
+          cr.erp_co_product_association,
+          cr.erp_item_bom_routing_priority
+        FROM produced_rows pr
+        INNER JOIN coproduct_routing cr
+          ON cr.bom_id = pr.bom_id
+         AND UPPER(TRIM(CAST(cr.item AS TEXT))) =
+             UPPER(TRIM(CAST(pr.item AS TEXT)))
+        ORDER BY
+          pr.item,
+          cr.routing_id
+      `,
+        coProductParams
+      );
+
+      componentRows = archiveComponentResult.rows || [];
+      coProductRows = archiveCoProductResult.rows || [];
+
+      console.log("📦 Components from archive table:", componentRows.length);
+      console.log("🏭 Co-Products from archive table:", coProductRows.length);
+    }
 
     const itemsForDescription = [
       ...componentRows.map((row) => row.component_item),
@@ -1888,9 +1993,12 @@ router.get("/modify-existing-bom-details", async (req, res) => {
       .map(normalizeText)
       .filter(Boolean);
 
+    console.log("🗂️ Items for description enrichment:", itemsForDescription.length);
+
     const itemDescMap = await getItemDescMapFromItemMaster(
       itemsForDescription
     );
+    console.log("🗂️ Item descriptions fetched:", itemDescMap.size);
 
     const components = componentRows.map((row) => {
       const componentItem = normalizeText(row.component_item);
@@ -1957,6 +2065,12 @@ router.get("/modify-existing-bom-details", async (req, res) => {
       };
     });
 
+    console.log("✅ Final response for /modify-existing-bom-details:", {
+      bomId,
+      componentsCount: components.length,
+      coProductsCount: coProducts.length,
+    });
+
     return res.status(200).json({
       success: true,
       data: {
@@ -1970,7 +2084,9 @@ router.get("/modify-existing-bom-details", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("DB Error (modify-existing-bom-details):", error);
+    console.error("❌ DB Error (modify-existing-bom-details):", error.message);
+    console.error("   Full error:", error);
+    console.error("   Stack:", error.stack);
 
     return res.status(500).json({
       success: false,
@@ -2333,12 +2449,19 @@ router.get("/delete-existing-bom-records", async (req, res) => {
 
 
 router.get("/existing-bom-details", async (req, res) => {
+  console.log("\n✨ === /existing-bom-details ENDPOINT HIT ===");
+  console.log("📍 Incoming request at:", new Date().toISOString());
+  
   const client = await pool.connect();
+  console.log("✅ Database client connected");
 
   try {
     const bomId = String(req.query.bomId ?? "").trim();
+    console.log("🔍 /existing-bom-details called with bomId:", bomId);
+    console.log("📦 Query params:", req.query);
 
     if (!bomId) {
+      console.warn("❌ bomId is missing");
       return res.status(400).json({
         status: "ERROR",
         message: "bomId is required",
@@ -2478,20 +2601,58 @@ router.get("/existing-bom-details", async (req, res) => {
     const location = normalizeText(req.query.location) || parsed.location;
     const bomVersion = parsed.bomVersion;
 
-    const resourcesQuery = `
-      SELECT DISTINCT
-        routing_id
-      FROM ${pgRef(T.itemBomRouting)}
-      WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
-        AND TRIM(COALESCE(routing_id, '')) <> ''
-      ORDER BY routing_id
-    `;
+    console.log("📋 Parsed BOM details:", { bomId, producedItem, location, bomVersion });
 
-    const resourcesResult = await client.query(resourcesQuery, [bomId]);
+    const fetchRowsFromMainAndArchive = async ({
+      mainQuery,
+      archiveQuery,
+      params,
+      sorter,
+    }) => {
+      const [mainResult, archiveResult] = await Promise.all([
+        client.query(mainQuery, params),
+        client.query(archiveQuery, params),
+      ]);
+
+      const rows = [
+        ...(mainResult.rows || []),
+        ...(archiveResult.rows || []),
+      ];
+
+      if (typeof sorter === "function") {
+        rows.sort(sorter);
+      }
+
+      return rows;
+    };
+
+    const resourcesRows = await fetchRowsFromMainAndArchive({
+      mainQuery: `
+        SELECT DISTINCT
+          routing_id
+        FROM ${pgRef(T.itemBomRouting)}
+        WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+          AND TRIM(COALESCE(routing_id, '')) <> ''
+      `,
+      archiveQuery: `
+        SELECT DISTINCT
+          routing_id
+        FROM ${pgRef(T.itemBomRoutingOg)}
+        WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+          AND TRIM(COALESCE(routing_id, '')) <> ''
+      `,
+      params: [bomId],
+      sorter: (a, b) => normalizeText(a.routing_id).localeCompare(normalizeText(b.routing_id)),
+    });
+
+    console.log("🔧 Resources found:", resourcesRows.length);
+    if (resourcesRows.length) {
+      console.log("   Resources:", resourcesRows);
+    }
 
     const resourceMap = new Map();
 
-    (resourcesResult.rows || []).forEach((row, index) => {
+    resourcesRows.forEach((row, index) => {
       const routingId = normalizeText(row.routing_id);
       if (!routingId) return;
 
@@ -2509,40 +2670,74 @@ router.get("/existing-bom-details", async (req, res) => {
       }
     });
 
-    const componentsQuery = `
-      SELECT
-        rec_id,
-        item AS component_item,
-        erp_bom_quantity_consumed_per AS standard_usage
-      FROM ${pgRef(T.bomConsumed)}
-      WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
-      ORDER BY rec_id NULLS LAST, item
-    `;
+    const componentRows = await fetchRowsFromMainAndArchive({
+      mainQuery: `
+        SELECT
+          rec_id,
+          item AS component_item,
+          erp_bom_quantity_consumed_per AS standard_usage
+        FROM ${pgRef(T.bomConsumed)}
+        WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+      `,
+      archiveQuery: `
+        SELECT
+          rec_id,
+          item AS component_item,
+          erp_bom_quantity_consumed_per AS standard_usage
+        FROM ${pgRef(T.bomConsumedOg)}
+        WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+      `,
+      params: [bomId],
+      sorter: (a, b) => {
+        const byItem = normalizeText(a.component_item).localeCompare(normalizeText(b.component_item));
+        if (byItem !== 0) return byItem;
+        return normalizeText(a.rec_id).localeCompare(normalizeText(b.rec_id));
+      },
+    });
 
-    const componentsResult = await client.query(componentsQuery, [bomId]);
+    console.log("📦 Components found:", componentRows.length);
+    if (componentRows.length) {
+      console.log("   Component details:", componentRows.slice(0, 3));
+    }
 
-    const coProductsQuery = `
-      SELECT DISTINCT ON (UPPER(TRIM(ibr.item)))
-        COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
-        TRIM(ibr.item) AS co_product_item,
-        bp.erp_bom_qty_produced_per AS qty_produced_per
-      FROM ${pgRef(T.itemBomRouting)} ibr
-      LEFT JOIN ${pgRef(T.bomProduced)} bp
-        ON TRIM(COALESCE(bp.bom_id, '')) = TRIM(COALESCE(ibr.bom_id, ''))
-       AND TRIM(COALESCE(bp.item, '')) = TRIM(COALESCE(ibr.item, ''))
-      WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
-        AND COALESCE(ibr.erp_co_product_association, 0) = 1
-        AND TRIM(COALESCE(ibr.item, '')) <> TRIM($2)
-      ORDER BY UPPER(TRIM(ibr.item)), COALESCE(bp.rec_id, ibr.rec_id) NULLS LAST
-    `;
-
-    const coProductsResult = await client.query(coProductsQuery, [
-      bomId,
-      producedItem,
-    ]);
-
-    const componentRows = componentsResult.rows || [];
-    const coProductRows = coProductsResult.rows || [];
+    const coProductRows = await fetchRowsFromMainAndArchive({
+      mainQuery: `
+        SELECT
+          COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
+          TRIM(ibr.item) AS co_product_item,
+          bp.erp_bom_qty_produced_per AS qty_produced_per
+        FROM ${pgRef(T.itemBomRouting)} ibr
+        LEFT JOIN ${pgRef(T.bomProduced)} bp
+          ON TRIM(COALESCE(bp.bom_id, '')) = TRIM(COALESCE(ibr.bom_id, ''))
+         AND TRIM(COALESCE(bp.item, '')) = TRIM(COALESCE(ibr.item, ''))
+        WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
+          AND COALESCE(ibr.erp_co_product_association, 0) = 1
+          AND TRIM(COALESCE(ibr.item, '')) <> TRIM($2)
+      `,
+      archiveQuery: `
+        SELECT
+          COALESCE(bp_og.rec_id, ibr_og.rec_id) AS rec_id,
+          TRIM(ibr_og.item) AS co_product_item,
+          bp_og.erp_bom_qty_produced_per AS qty_produced_per
+        FROM ${pgRef(T.itemBomRoutingOg)} ibr_og
+        LEFT JOIN ${pgRef(T.bomProducedOg)} bp_og
+          ON TRIM(COALESCE(bp_og.bom_id, '')) = TRIM(COALESCE(ibr_og.bom_id, ''))
+         AND TRIM(COALESCE(bp_og.item, '')) = TRIM(COALESCE(ibr_og.item, ''))
+        WHERE TRIM(COALESCE(ibr_og.bom_id, '')) = TRIM($1)
+          AND COALESCE(ibr_og.erp_co_product_association, 0) = 1
+          AND TRIM(COALESCE(ibr_og.item, '')) <> TRIM($2)
+      `,
+      params: [bomId, producedItem],
+      sorter: (a, b) => {
+        const byItem = normalizeText(a.co_product_item).toUpperCase().localeCompare(normalizeText(b.co_product_item).toUpperCase());
+        if (byItem !== 0) return byItem;
+        return normalizeText(a.rec_id).localeCompare(normalizeText(b.rec_id));
+      },
+    });
+    console.log("🏭 Co-Products found:", coProductRows.length);
+    if (coProductRows.length) {
+      console.log("   Co-product details:", coProductRows.slice(0, 3));
+    }
 
     /**
      * Collect all items for GCP enrichment:
@@ -2624,6 +2819,13 @@ router.get("/existing-bom-details", async (req, res) => {
 
     const coProducts = Array.from(coProductMap.values());
 
+    console.log("✅ Final response for /existing-bom-details:", {
+      bomId,
+      resourcesCount: Array.from(resourceMap.values()).length,
+      componentsCount: components.length,
+      coProductsCount: coProducts.length,
+    });
+
     return res.json({
       status: "SUCCESS",
 
@@ -2647,7 +2849,9 @@ router.get("/existing-bom-details", async (req, res) => {
       coProducts,
     });
   } catch (error) {
-    console.error("DB Error (existing-bom-details):", error);
+    console.error("❌ DB Error (existing-bom-details):", error.message);
+    console.error("   Full error:", error);
+    console.error("   Stack:", error.stack);
 
     return res.status(500).json({
       status: "ERROR",
@@ -2668,17 +2872,49 @@ router.get("/existing-bom-details", async (req, res) => {
 
 
 router.get("/existing-bom-details-by-id/:id", async (req, res) => {
+  console.log("\n✨ === /existing-bom-details-by-id ENDPOINT HIT ===");
+  console.log("📍 Incoming request at:", new Date().toISOString());
+  
   const client = await pool.connect();
+  console.log("✅ Database client connected");
 
   try {
     const id = String(req.params.id ?? "").trim();
+    console.log("🔍 /existing-bom-details-by-id called with id:", id);
 
     if (!id) {
+      console.warn("❌ id is missing");
       return res.status(400).json({
         status: "ERROR",
         message: "id is required",
       });
     }
+
+    const normalizeText = (value) =>
+      value == null ? "" : String(value).trim();
+
+    const fetchRowsFromMainAndArchive = async ({
+      mainQuery,
+      archiveQuery,
+      params,
+      sorter,
+    }) => {
+      const [mainResult, archiveResult] = await Promise.all([
+        client.query(mainQuery, params),
+        client.query(archiveQuery, params),
+      ]);
+
+      const rows = [
+        ...(mainResult.rows || []),
+        ...(archiveResult.rows || []),
+      ];
+
+      if (typeof sorter === "function") {
+        rows.sort(sorter);
+      }
+
+      return rows;
+    };
 
     /**
      * Initial load:
@@ -2687,20 +2923,32 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
      * - item_desc from item_master
      * - item_release_flag from item_mrp_rls_flg.release
      */
-    const headerQuery = `
-      SELECT
-        bom_id,
-        location,
-        item AS produced_item
-      FROM ${pgRef(T.itemBomRouting)}
-      WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
-      ORDER BY bom_id
-      LIMIT 1
-    `;
+    const headerRows = await fetchRowsFromMainAndArchive({
+      mainQuery: `
+        SELECT
+          bom_id,
+          location,
+          item AS produced_item
+        FROM ${pgRef(T.itemBomRouting)}
+        WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+      `,
+      archiveQuery: `
+        SELECT
+          bom_id,
+          location,
+          item AS produced_item
+        FROM ${pgRef(T.itemBomRoutingOg)}
+        WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+      `,
+      params: [id],
+      sorter: (a, b) => normalizeText(a.bom_id).localeCompare(normalizeText(b.bom_id)),
+    });
 
-    const headerResult = await client.query(headerQuery, [id]);
+    const headerResult = { rows: headerRows };
+    console.log("📋 Header query result rows:", headerResult.rows?.length || 0);
 
     if (!headerResult.rows?.length) {
+      console.warn("❌ No BOM found for id:", id);
       return res.status(404).json({
         status: "ERROR",
         message: "No BOM found for given id",
@@ -2712,56 +2960,105 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
     const bomId = header.bom_id ?? "";
     const location = header.location ?? "";
     const producedItem = header.produced_item ?? "";
+    console.log("📋 Header data:", { bomId, location, producedItem });
 
-    const resourcesQuery = `
-      SELECT DISTINCT
-        resource
-      FROM ${pgRef(T.itemBomRouting)}
-      WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
-        AND TRIM(COALESCE(location, '')) = TRIM($2)
-        AND TRIM(COALESCE(item, '')) = TRIM($3)
-        AND TRIM(COALESCE(resource, '')) <> ''
-      ORDER BY resource
-    `;
+    const [resourcesResult, componentRows, coProductRows] = await Promise.all([
+      fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT DISTINCT
+            resource
+          FROM ${pgRef(T.itemBomRouting)}
+          WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+            AND TRIM(COALESCE(location, '')) = TRIM($2)
+            AND TRIM(COALESCE(item, '')) = TRIM($3)
+            AND TRIM(COALESCE(resource, '')) <> ''
+        `,
+        archiveQuery: `
+          SELECT DISTINCT
+            resource
+          FROM ${pgRef(T.itemBomRoutingOg)}
+          WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+            AND TRIM(COALESCE(location, '')) = TRIM($2)
+            AND TRIM(COALESCE(item, '')) = TRIM($3)
+            AND TRIM(COALESCE(resource, '')) <> ''
+        `,
+        params: [bomId, location, producedItem],
+        sorter: (a, b) => normalizeText(a.resource).localeCompare(normalizeText(b.resource)),
+      }),
+      fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT
+            rec_id,
+            item AS component_item,
+            erp_bom_quantity_consumed_per AS standard_usage
+          FROM ${pgRef(T.bomConsumed)}
+          WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+            AND TRIM(COALESCE(location, '')) = TRIM($2)
+            AND TRIM(COALESCE(produced_item, '')) = TRIM($3)
+        `,
+        archiveQuery: `
+          SELECT
+            rec_id,
+            item AS component_item,
+            erp_bom_quantity_consumed_per AS standard_usage
+          FROM ${pgRef(T.bomConsumedOg)}
+          WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
+            AND TRIM(COALESCE(location, '')) = TRIM($2)
+            AND TRIM(COALESCE(produced_item, '')) = TRIM($3)
+        `,
+        params: [bomId, location, producedItem],
+        sorter: (a, b) => {
+          const byItem = normalizeText(a.component_item).localeCompare(normalizeText(b.component_item));
+          if (byItem !== 0) return byItem;
+          return normalizeText(a.rec_id).localeCompare(normalizeText(b.rec_id));
+        },
+      }),
+      fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT
+            COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
+            ibr.item AS co_product_item,
+            bp.erp_bom_qty_produced_per AS qty_produced_per
+          FROM ${pgRef(T.itemBomRouting)} ibr
+          LEFT JOIN ${pgRef(T.bomProduced)} bp
+            ON TRIM(COALESCE(bp.bom_id, '')) = TRIM(COALESCE(ibr.bom_id, ''))
+           AND TRIM(COALESCE(bp.location, '')) = TRIM(COALESCE(ibr.location, ''))
+           AND TRIM(COALESCE(bp.item, '')) = TRIM(COALESCE(ibr.item, ''))
+          WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
+            AND TRIM(COALESCE(ibr.location, '')) = TRIM($2)
+            AND TRIM(COALESCE(ibr.item, '')) <> TRIM($3)
+            AND COALESCE(ibr.erp_co_product_association, 0) = 1
+        `,
+        archiveQuery: `
+          SELECT
+            COALESCE(bp_og.rec_id, ibr_og.rec_id) AS rec_id,
+            ibr_og.item AS co_product_item,
+            bp_og.erp_bom_qty_produced_per AS qty_produced_per
+          FROM ${pgRef(T.itemBomRoutingOg)} ibr_og
+          LEFT JOIN ${pgRef(T.bomProducedOg)} bp_og
+            ON TRIM(COALESCE(bp_og.bom_id, '')) = TRIM(COALESCE(ibr_og.bom_id, ''))
+           AND TRIM(COALESCE(bp_og.location, '')) = TRIM(COALESCE(ibr_og.location, ''))
+           AND TRIM(COALESCE(bp_og.item, '')) = TRIM(COALESCE(ibr_og.item, ''))
+          WHERE TRIM(COALESCE(ibr_og.bom_id, '')) = TRIM($1)
+            AND TRIM(COALESCE(ibr_og.location, '')) = TRIM($2)
+            AND TRIM(COALESCE(ibr_og.item, '')) <> TRIM($3)
+            AND COALESCE(ibr_og.erp_co_product_association, 0) = 1
+        `,
+        params: [bomId, location, producedItem],
+        sorter: (a, b) => {
+          const byItem = normalizeText(a.co_product_item).toUpperCase().localeCompare(normalizeText(b.co_product_item).toUpperCase());
+          if (byItem !== 0) return byItem;
+          return normalizeText(a.rec_id).localeCompare(normalizeText(b.rec_id));
+        },
+      }),
+    ]);
 
-    const componentsQuery = `
-      SELECT
-        rec_id,
-        item AS component_item,
-        erp_bom_quantity_consumed_per AS standard_usage
-      FROM ${pgRef(T.bomConsumed)}
-      WHERE TRIM(COALESCE(bom_id, '')) = TRIM($1)
-        AND TRIM(COALESCE(location, '')) = TRIM($2)
-        AND TRIM(COALESCE(produced_item, '')) = TRIM($3)
-      ORDER BY rec_id NULLS LAST, item
-    `;
-
-    const coProductsQuery = `
-      SELECT
-        COALESCE(bp.rec_id, ibr.rec_id) AS rec_id,
-        ibr.item AS co_product_item,
-        bp.erp_bom_qty_produced_per AS qty_produced_per
-      FROM ${pgRef(T.itemBomRouting)} ibr
-      LEFT JOIN ${pgRef(T.bomProduced)} bp
-        ON TRIM(COALESCE(bp.bom_id, '')) = TRIM(COALESCE(ibr.bom_id, ''))
-       AND TRIM(COALESCE(bp.location, '')) = TRIM(COALESCE(ibr.location, ''))
-       AND TRIM(COALESCE(bp.item, '')) = TRIM(COALESCE(ibr.item, ''))
-      WHERE TRIM(COALESCE(ibr.bom_id, '')) = TRIM($1)
-        AND TRIM(COALESCE(ibr.location, '')) = TRIM($2)
-        AND TRIM(COALESCE(ibr.item, '')) <> TRIM($3)
-        AND COALESCE(ibr.erp_co_product_association, 0) = 1
-      ORDER BY COALESCE(bp.rec_id, ibr.rec_id) NULLS LAST, ibr.item
-    `;
-
-    const [resourcesResult, componentsResult, coProductsResult] =
-      await Promise.all([
-        client.query(resourcesQuery, [bomId, location, producedItem]),
-        client.query(componentsQuery, [bomId, location, producedItem]),
-        client.query(coProductsQuery, [bomId, location, producedItem]),
-      ]);
-
-    const componentRows = componentsResult.rows || [];
-    const coProductRows = coProductsResult.rows || [];
+    console.log("🔧 Resources found:", resourcesResult.length);
+    console.log("📦 Components found:", componentRows.length);
+    console.log("🏭 Co-Products found:", coProductRows.length);
+    if (resourcesResult.length) console.log("   Resource rows:", resourcesResult.slice(0, 2));
+    if (componentRows.length) console.log("   Component rows:", componentRows.slice(0, 2));
+    if (coProductRows.length) console.log("   CoProduct rows:", coProductRows.slice(0, 2));
 
     /**
      * Collect all items that need GCP enrichment:
@@ -2791,6 +3088,7 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
      * }
      */
     const itemDetailsMap = await fetchItemMasterReleaseDetailsByItems(allItems);
+    console.log("🗓 Item details map size:", itemDetailsMap?.size || 0);
 
     const getItemDetails = (item) => {
       const key = String(item ?? "").trim().toUpperCase();
@@ -2805,6 +3103,16 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
     };
 
     const producedDetails = getItemDetails(producedItem);
+
+    console.log("✅ Final response for /existing-bom-details-by-id:", {
+      id,
+      bomId,
+      location,
+      producedItem,
+      resourcesCount: (resourcesResult.rows || []).length,
+      componentsCount: componentRows.length,
+      coProductsCount: coProductRows.length,
+    });
 
     return res.json({
       status: "SUCCESS",
@@ -2865,7 +3173,9 @@ router.get("/existing-bom-details-by-id/:id", async (req, res) => {
       }),
     });
   } catch (error) {
-    console.error("DB Error (existing-bom-details-by-id):", error);
+    console.error("❌ DB Error (existing-bom-details-by-id):", error.message);
+    console.error("   Full error:", error);
+    console.error("   Stack:", error.stack);
 
     return res.status(500).json({
       status: "ERROR",
@@ -8047,12 +8357,19 @@ router.get("/engineering-change-log", async (req, res) => {
 
 
 router.get("/engineering-changes-detail-add", async (req, res) => {
+  console.log("\n✨ === /engineering-changes-detail-add ENDPOINT HIT ===");
+  console.log("📍 Incoming request at:", new Date().toISOString());
+  console.log("📦 Query params:", req.query);
+  
   try {
     const engineeringChangeId = String(
       req.query.changeID || req.query.engineeringChangeId || ""
     ).trim();
 
+    console.log("🔍 Engineering Change ID:", engineeringChangeId);
+
     if (!engineeringChangeId) {
+      console.warn("❌ Engineering Change ID is missing");
       return res.status(400).json({
         error: "engineeringChangeId/changeID is required",
       });
@@ -8349,48 +8666,98 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
       const selectedResourcesUpper = selectedResources.map(upperText);
       const selectedRoutingIdsUpper = selectedRoutingIds.map(upperText);
 
-      const producedQuery = `
-        SELECT *
-        FROM ${pgRef(T.bomProduced)}
-        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-          AND ($2 = '' OR TRIM(CAST(location AS TEXT)) = $2)
-        ORDER BY load_datetime DESC NULLS LAST
-      `;
-
-      const consumedQuery = `
-        SELECT *
-        FROM ${pgRef(T.bomConsumed)}
-        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-          AND ($2 = '' OR TRIM(CAST(location AS TEXT)) = $2)
-        ORDER BY load_datetime DESC NULLS LAST
-      `;
-
-      const routingQuery = `
-        SELECT *
-        FROM ${pgRef(T.itemBomRouting)}
-        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-        ORDER BY load_datetime DESC NULLS LAST, TRIM(CAST(routing_id AS TEXT))
-      `;
-
-      const parameterQuery = `
-        SELECT *
-        FROM ${pgRef(T.bomParameters)}
-        WHERE TRIM(CAST(bom_id AS TEXT)) = $1
-        ORDER BY load_datetime DESC NULLS LAST
-      `;
-
-      const [producedResult, consumedResult, routingResult, parameterResult] =
-        await Promise.all([
-          pool.query(producedQuery, [bomId, effectiveLocation]),
-          pool.query(consumedQuery, [bomId, effectiveLocation]),
-          pool.query(routingQuery, [bomId]),
-          pool.query(parameterQuery, [bomId]),
+      const fetchRowsFromMainAndArchive = async ({
+        mainQuery,
+        archiveQuery,
+        params,
+      }) => {
+        const [mainResult, archiveResult] = await Promise.all([
+          pool.query(mainQuery, params),
+          pool.query(archiveQuery, params),
         ]);
 
-      const bomProducedRows = producedResult.rows || [];
-      const bomConsumedRows = consumedResult.rows || [];
-      const allRoutingRowsForBom = routingResult.rows || [];
-      const bomParametersRows = parameterResult.rows || [];
+        const rows = [
+          ...(mainResult.rows || []),
+          ...(archiveResult.rows || []),
+        ];
+
+        return rows.sort((a, b) => {
+          const aTime = a.load_datetime ?? a.created_at ?? a.created_on ?? a.change_date ?? "";
+          const bTime = b.load_datetime ?? b.created_at ?? b.created_on ?? b.change_date ?? "";
+          return String(bTime).localeCompare(String(aTime));
+        });
+      };
+
+      const producedRowsResult = await fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT *
+          FROM ${pgRef(T.bomProduced)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+            AND ($2 = '' OR TRIM(CAST(location AS TEXT)) = $2)
+        `,
+        archiveQuery: `
+          SELECT *
+          FROM ${pgRef(T.bomProducedOg)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+            AND ($2 = '' OR TRIM(CAST(location AS TEXT)) = $2)
+        `,
+        params: [bomId, effectiveLocation],
+      });
+
+      const consumedRowsResult = await fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT *
+          FROM ${pgRef(T.bomConsumed)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+            AND ($2 = '' OR TRIM(CAST(location AS TEXT)) = $2)
+        `,
+        archiveQuery: `
+          SELECT *
+          FROM ${pgRef(T.bomConsumedOg)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+            AND ($2 = '' OR TRIM(CAST(location AS TEXT)) = $2)
+        `,
+        params: [bomId, effectiveLocation],
+      });
+
+      const routingRowsResult = await fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT *
+          FROM ${pgRef(T.itemBomRouting)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+        `,
+        archiveQuery: `
+          SELECT *
+          FROM ${pgRef(T.itemBomRoutingOg)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+        `,
+        params: [bomId],
+      });
+
+      const parameterRowsResult = await fetchRowsFromMainAndArchive({
+        mainQuery: `
+          SELECT *
+          FROM ${pgRef(T.bomParameters)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+        `,
+        archiveQuery: `
+          SELECT *
+          FROM ${pgRef(T.bomParametersOg)}
+          WHERE TRIM(CAST(bom_id AS TEXT)) = $1
+        `,
+        params: [bomId],
+      });
+
+      const bomProducedRows = producedRowsResult || [];
+      const bomConsumedRows = consumedRowsResult || [];
+      const allRoutingRowsForBom = routingRowsResult || [];
+      const bomParametersRows = parameterRowsResult || [];
+
+      console.log(`📦 BOM ${bomId} data retrieved:`);
+      console.log(`   Produced rows: ${bomProducedRows.length}`);
+      console.log(`   Consumed rows: ${bomConsumedRows.length}`);
+      console.log(`   Routing rows: ${allRoutingRowsForBom.length}`);
+      console.log(`   Parameter rows: ${bomParametersRows.length}`);
 
       const itemBomRoutingRows = allRoutingRowsForBom.filter((row) => {
         const rowRoutingId = safeText(row.routing_id);
@@ -8675,8 +9042,16 @@ router.get("/engineering-changes-detail-add", async (req, res) => {
       createdRecords: groupedCreatedRecords,
       summaryLogRows: summaryRows,
     });
+
+    console.log("✅ Final response for /engineering-changes-detail-add:", {
+      engineeringChangeId,
+      createdRecordsCount: groupedCreatedRecords?.length || 0,
+      summaryRowsCount: summaryRows?.length || 0,
+    });
   } catch (error) {
-    console.error("DB Error (engineering-changes-detail-add):", error);
+    console.error("❌ DB Error (engineering-changes-detail-add):", error.message);
+    console.error("   Full error:", error);
+    console.error("   Stack:", error.stack);
     return res.status(500).json({
       error: "Failed to fetch engineering add detail",
       details: error.message,

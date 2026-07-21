@@ -74,6 +74,18 @@ app.use(
 
 let lastFetchTime = null;
 
+// 📍 Global Request Logging Middleware
+app.use((req, res, next) => {
+  console.log(`\n📡 [${new Date().toISOString()}] ${req.method} ${req.path}`);
+  if (Object.keys(req.query).length > 0) {
+    console.log("   Query:", req.query);
+  }
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log("   Body:", req.body);
+  }
+  next();
+});
+
 /* BigQuery APIs - GCP to UI */
 app.use("/api/bigquery/table", bigqueryRoutes);
 
@@ -88,10 +100,21 @@ app.use("/bom-explosion", bomExplosionRoute);
 app.use("/api/bom-explosion", bomExplosionRoute);
 
 /* BOM editing from existing records - PostgreSQL to UI */
+// 🧪 TEST ENDPOINT
+app.get("/api/tables/test", (req, res) => {
+  console.log("✅ /api/tables/test endpoint called");
+  return res.json({
+    status: "OK",
+    message: "Table routes are working",
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.use("/api/tables", tableRoutes);
 
 app.get("/health", (req, res) => {
-  return res.json({ status: "UP" });
+  console.log("✅ Health check called");
+  return res.json({ status: "UP", timestamp: new Date().toISOString() });
 });
 
 app.get("/", (req, res) => {
@@ -151,6 +174,30 @@ app.get("/api/engineering-changes/detail", (req, res) => {
     console.error("❌ PostgreSQL connection failed:", err.message);
   }
 })();
+
+// 🚨 Error Handling Middleware (MUST be last)
+app.use((err, req, res, next) => {
+  console.error("\n❌ === UNHANDLED ERROR ===");
+  console.error("Error Message:", err.message);
+  console.error("Error Stack:", err.stack);
+  console.error("Request URL:", req.url);
+  console.error("Request Method:", req.method);
+  
+  res.status(err.status || 500).json({
+    error: err.message,
+    details: err.stack,
+  });
+});
+
+// 404 Handler
+app.use((req, res) => {
+  console.warn(`⚠️ 404 Not Found: ${req.method} ${req.url}`);
+  res.status(404).json({
+    error: "Route not found",
+    path: req.url,
+    method: req.method,
+  });
+});
 
 /* Start Server */
 const PORT = process.env.PORT || 3000;
